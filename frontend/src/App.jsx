@@ -212,7 +212,7 @@ function Toasts(){
 
 function Login(){
  const {login}=useAuth();const [username,setUsername]=useState('');const [password,setPassword]=useState('');const [show,setShow]=useState(false);const [loading,setLoading]=useState(false);const [shake,setShake]=useState(false);
- const submit=async()=>{setLoading(true);try{await login(username,password)}catch(e){setShake(true);setTimeout(()=>setShake(false),500);showToast(e.response?.data?.error||(e.isApiResponseError||!e.response||e.response.status>=500?'Cannot reach server':'Login failed'),'error')}finally{setLoading(false)}};
+ const submit=async()=>{setLoading(true);try{await login(username,password)}catch(e){setShake(true);setTimeout(()=>setShake(false),500);showToast(e.response?.data?.error||(e.response?.status===429?'Too many login attempts. Please wait 15 minutes before trying again.':e.isApiResponseError||!e.response||e.response.status>=500?'Cannot reach server':'Login failed'),'error')}finally{setLoading(false)}};
  return <main className="login-page">
   <div className="login-orb orb-a"/><div className="login-orb orb-b"/>
   <motion.div className="login-brand" initial={{scale:.7,opacity:0}} animate={{scale:1,opacity:1}} transition={{duration:.7}}><motion.img src="/logo.png" alt="Sikka Fleet" animate={{filter:['drop-shadow(0 0 0 rgba(96,165,250,0)','drop-shadow(0 0 16px rgba(96,165,250,.8))','drop-shadow(0 0 0 rgba(96,165,250,0)']}} transition={{duration:2.5,repeat:Infinity}}/><h1>{'Welcome to Sikka Fleet'.split(' ').map((w,i)=><motion.span key={i} initial={{opacity:0,y:12}} animate={{opacity:1,y:0}} transition={{delay:.35+i*.12}}>{w}&nbsp;</motion.span>)}</h1></motion.div>

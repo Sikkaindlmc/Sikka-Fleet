@@ -514,7 +514,11 @@ async function updateGeofence(){
 }
 
 const {ipKeyGenerator}=rateLimit;
-const loginLimiter=rateLimit({windowMs:15*60*1000,max:5,standardHeaders:true,legacyHeaders:false,keyGenerator:(req)=>`${ipKeyGenerator(req.ip)}:${String(req.body?.username||'')}`});
+const loginLimiter=rateLimit({
+ windowMs:15*60*1000,max:5,standardHeaders:true,legacyHeaders:false,
+ keyGenerator:(req)=>`${ipKeyGenerator(req.ip)}:${String(req.body?.username||'')}`,
+ handler:(_req,res)=>res.status(429).json({error:'Too many login attempts. Please wait 15 minutes before trying again.'})
+});
 const aiChatLimiter=rateLimit({
  windowMs:60*1000,max:20,standardHeaders:true,legacyHeaders:false,
  keyGenerator:req=>String(req.user.sub),
