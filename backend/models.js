@@ -1,0 +1,189 @@
+const mongoose = require('mongoose');
+const {normalizeVehicleNumber}=require('./services/vehicleIdentity');
+
+const pagePermissionSchema=new mongoose.Schema({
+  view:{type:Boolean,default:false},
+  edit:{type:Boolean,default:false}
+},{_id:false});
+
+const permissionSchema = new mongoose.Schema({
+  dashboard:{type:pagePermissionSchema,default:()=>({view:true,edit:false})},
+  vehicleRegistry:{type:pagePermissionSchema,default:()=>({})},
+  plant:{type:pagePermissionSchema,default:()=>({})},
+  gpsTrack:{type:pagePermissionSchema,default:()=>({})},
+  users:{type:pagePermissionSchema,default:()=>({})},
+  sikkaAi:{type:pagePermissionSchema,default:()=>({})}
+},{_id:false});
+
+const userSchema=new mongoose.Schema({
+ fullName:{type:String,required:true},username:{type:String,required:true,unique:true,trim:true,lowercase:true},
+ passwordHash:{type:String,required:true,select:false},isAdmin:{type:Boolean,default:false},active:{type:Boolean,default:true},
+ permissions:{type:permissionSchema,default:()=>({})},lastLogin:{type:Date},failedAttempts:{type:Number,default:0},lockedUntil:{type:Date}
+},{timestamps:true});
+
+const vehicleGpsProviderSchema=new mongoose.Schema({
+ name:{type:String,enum:['Wheelseye','FleetX'],required:true},
+ vehicleId:String
+},{_id:false});
+
+const vehicleSchema=new mongoose.Schema({
+ vehicleNumber:{type:String,required:true,unique:true,set:normalizeVehicleNumber},
+ normalizedVehicleNumber:{type:String,required:true},
+ fleetType:{type:String,enum:['Own Fleet','Contract Fleet'],required:true},
+ gpsLink:{type:String,enum:['Wheelseye','FleetX'],required:true},
+ providerVehicleId:{type:String},gpsProviders:{type:[vehicleGpsProviderSchema],default:[]},
+ status:{type:String,enum:['Active','Inactive'],default:'Active'}
+},{timestamps:true});
+vehicleSchema.pre('validate',function(){
+ const normalized=normalizeVehicleNumber(this.vehicleNumber);
+ this.vehicleNumber=normalized;
+ this.normalizedVehicleNumber=normalized;
+});
+vehicleSchema.index({normalizedVehicleNumber:1},{unique:true,partialFilterExpression:{normalizedVehicleNumber:{$type:'string'}}});
+
+const plantSchema=new mongoose.Schema({
+ code:{type:String,trim:true,uppercase:true},plantId:{type:String,trim:true},name:{type:String,required:true,trim:true},
+ address:{type:String,trim:true},lat:{type:Number,required:true},lng:{type:Number,required:true},
+ radius:{type:Number,required:true,min:1},status:{type:String,enum:['Active','Inactive'],default:'Active'}
+},{timestamps:true});
+plantSchema.index({code:1},{unique:true,sparse:true});
+plantSchema.index({plantId:1},{unique:true,sparse:true});
+
+const liveSchema=new mongoose.Schema({
+ vehicleNumber:{type:String,required:true,unique:true,index:true,set:normalizeVehicleNumber},
+ normalizedVehicleNumber:{type:String,required:true},lat:Number,lng:Number,speed:{type:String},
+ ignition:{type:String,default:'N/A'},gpsTime:Date,syncedAt:Date,provider:{type:String,enum:['Wheelseye','FleetX']},
+ address:String,heading:Number,unregistered:{type:Boolean,default:false},stale:{type:Boolean,default:false},
+ lastGoodTime:Date,runningStatus:{type:String,enum:['Moving','Stopped','Idle','Unknown'],default:'Unknown'},
+ providerVehicleId:String,driverName:String,vehicleStatus:String,
+ readableLocation:String,locality:String,city:String,district:String,state:String,pincode:String,country:String,
+ geocodedAt:Date,addressLat:Number,addressLng:Number,addressIsCurrent:{type:Boolean,default:false},
+ geocodingProvider:{type:String,enum:['Google','OpenStreetMap','Provider','Coordinate']}
+},{timestamps:true});
+liveSchema.pre('validate',function(){
+ const normalized=normalizeVehicleNumber(this.vehicleNumber);
+ this.vehicleNumber=normalized;
+ this.normalizedVehicleNumber=normalized;
+});
+liveSchema.index({normalizedVehicleNumber:1},{unique:true,partialFilterExpression:{normalizedVehicleNumber:{$type:'string'}}});
+
+const historySchema=new mongoose.Schema({
+ vehicle:{type:String,required:true,index:true,set:normalizeVehicleNumber},
+ vehicleNumber:{type:String,set:value=>value?normalizeVehicleNumber(value):value},lat:Number,lng:Number,address:String,
+ readableLocation:String,locality:String,city:String,district:String,state:String,pincode:String,country:String,
+ geocodedAt:Date,addressLat:Number,addressLng:Number,addressIsCurrent:{type:Boolean,default:false},geocodingProvider:String,
+ providerVehicleId:String,driverName:String,vehicleStatus:String,
+ speed:{type:String},ignition:{type:String},gpsTime:{type:Date,index:true},provider:String,syncedAt:{type:Date,default:Date.now}
+});
+historySchema.index({vehicleNumber:1,gpsTime:1});
+historySchema.index({vehicleNumber:1,gpsTime:1,provider:1},{unique:true,sparse:true});
+
+const staySchema=new mongoose.Schema({
+ vehicle:{type:String,required:true,index:true,set:normalizeVehicleNumber},
+ normalizedVehicleNumber:{type:String,required:true},
+ plant:{type:mongoose.Schema.Types.ObjectId,ref:'Plant',required:true},
+ entryTime:{type:Date,required:true},exitTime:{type:Date}
+});
+staySchema.index({exitTime:1});
+staySchema.pre('validate',function(){
+ const normalized=normalizeVehicleNumber(this.vehicle);
+ this.vehicle=normalized;
+ this.normalizedVehicleNumber=normalized;
+});
+staySchema.index(
+ {normalizedVehicleNumber:1},
+ {unique:true,partialFilterExpression:{exitTime:null,normalizedVehicleNumber:{$type:'string'}}}
+);
+
+const planSchema=new mongoose.Schema({
+ vehicle:{type:String,required:true,index:true,set:normalizeVehicleNumber},plant:{type:mongoose.Schema.Types.ObjectId,ref:'Plant'},
+ planType:{type:String,enum:['Loading','Unloading','Maintenance','Waiting','Other'],required:true},
+ remarks:String,expectedDeparture:Date,createdBy:{type:String}
+},{timestamps:true});
+
+const providerStatusSchema=new mongoose.Schema({
+ provider:{type:String,unique:true},status:{type:String,enum:['Connected','Disconnected','Error'],default:'Disconnected'},
+ lastAttemptTime:Date,lastSuccessTime:Date,lastErrorMessage:String,lastErrorCode:Number,lastErrorTime:Date,vehicleCount:{type:Number,default:0},
+ vehiclesReceived:{type:Number,default:0},vehiclesNotResponding:{type:Number,default:0},
+ apiResponseStatus:Number
+},{timestamps:true});
+
+const syncLogSchema=new mongoose.Schema({
+ type:{type:String,enum:['auto','manual']},startedAt:{type:Date,default:Date.now},finishedAt:Date,
+ result:{type:Object},success:{type:Boolean,default:false}
+},{timestamps:true});
+syncLogSchema.index({type:1,startedAt:-1});
+syncLogSchema.index({success:1,finishedAt:-1});
+const gpsSyncLockSchema=new mongoose.Schema({
+ key:{type:String,required:true,unique:true},
+ owner:{type:String,required:true},
+ lockUntil:{type:Date,required:true},
+ acquiredAt:{type:Date,required:true}
+},{timestamps:true});
+
+const shareSchema=new mongoose.Schema({
+ vehicleNumber:{type:String,required:true,set:normalizeVehicleNumber},token:{type:String,required:true,unique:true},
+ expiresAt:{type:Date,required:true},revoked:{type:Boolean,default:false},createdBy:{type:String}
+},{timestamps:true});
+
+const appSettingSchema=new mongoose.Schema({key:{type:String,unique:true},value:String},{timestamps:true});
+const auditSchema=new mongoose.Schema({action:String,user:String,details:Object,ip:String},{timestamps:true});
+const geocodeCacheSchema=new mongoose.Schema({
+ key:{type:String,required:true,unique:true},
+ lat:{type:Number,required:true},
+ lng:{type:Number,required:true},
+ readableLocation:{type:String},
+ locality:String,
+ city:String,
+ district:String,
+ state:String,
+ pincode:String,
+ country:String,
+ provider:{type:String,enum:['Google','OpenStreetMap','Provider','Coordinate']},
+ geocodedAt:Date,
+ expiresAt:{type:Date,required:true}
+},{timestamps:true});
+geocodeCacheSchema.index({expiresAt:1},{expireAfterSeconds:0});
+const sessionSchema=new mongoose.Schema({
+ sessionId:{type:String,required:true,unique:true,index:true},
+ user:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true,index:true},
+ revoked:{type:Boolean,default:false},
+ expiresAt:{type:Date,required:true},
+ lastSeenAt:{type:Date,default:Date.now},
+ userAgent:String,
+ ip:String
+},{timestamps:true});
+sessionSchema.index({expiresAt:1},{expireAfterSeconds:0});
+const sikkaAiChatSchema=new mongoose.Schema({
+ userId:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true,index:true},
+ username:{type:String,required:true,index:true},
+ userFullName:{type:String,required:true},
+ fullName:{type:String,required:true},
+ role:{type:String,enum:['admin','user'],required:true},
+ sessionId:{type:String,required:true,index:true},
+ question:{type:String,required:true,maxlength:500},
+ answer:{type:mongoose.Schema.Types.Mixed,required:true},
+ askedAt:{type:Date,required:true},
+ answeredAt:{type:Date,required:true},
+ language:{type:String,enum:['en','hi'],default:'en'},
+ createdAt:{type:Date,required:true,default:Date.now},
+ expireAt:{type:Date,required:true}
+},{versionKey:false});
+sikkaAiChatSchema.index({expireAt:1},{expireAfterSeconds:0});
+sikkaAiChatSchema.index({userId:1,createdAt:-1});
+sikkaAiChatSchema.index({createdAt:-1});
+sikkaAiChatSchema.index({userId:1,askedAt:-1});
+sikkaAiChatSchema.index({askedAt:-1});
+
+module.exports={
+ User:mongoose.model('User',userSchema),Vehicle:mongoose.model('Vehicle',vehicleSchema),
+ Plant:mongoose.model('Plant',plantSchema),VehicleLiveStatus:mongoose.model('VehicleLiveStatus',liveSchema),
+ VehicleLocationHistory:mongoose.model('VehicleLocationHistory',historySchema),
+ VehiclePlantStay:mongoose.model('VehiclePlantStay',staySchema),VehiclePlan:mongoose.model('VehiclePlan',planSchema),
+ GpsProviderStatus:mongoose.model('GpsProviderStatus',providerStatusSchema),
+ SyncLog:mongoose.model('SyncLog',syncLogSchema),ShareLink:mongoose.model('ShareLink',shareSchema),
+ AppSetting:mongoose.model('AppSetting',appSettingSchema),AuditLog:mongoose.model('AuditLog',auditSchema),
+ GeocodeCache:mongoose.model('GeocodeCache',geocodeCacheSchema),
+ Session:mongoose.model('Session',sessionSchema),SikkaAiChat:mongoose.model('SikkaAiChat',sikkaAiChatSchema,'SikkaAiChat'),
+ GpsSyncLock:mongoose.model('GpsSyncLock',gpsSyncLockSchema)
+};

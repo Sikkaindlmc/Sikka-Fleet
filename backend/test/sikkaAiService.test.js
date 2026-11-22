@@ -1,0 +1,342 @@
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const service=require('../services/sikkaAiService');
+const models=require('../models');
+const historyRetention=require('../jobs/historyRetention');
+
+const now=new Date('2026-11-22T10:06:00.000Z');
+const chain=rows=>({
+ populate(){return this},
+ select(){return this},
+ sort(){return this},
+ limit(){return this},
+ lean(){return Promise.resolve(rows)}
+});
+const one=row=>({
+ populate(){return this},
+ select(){return this},
+ lean(){return Promise.resolve(row)}
+});
+const makeModels=(overrides={})=>({
+ Plant:{find:()=>chain([])},
+ Vehicle:{find:()=>chain([]),findOne:()=>one(null)},
+ VehiclePlantStay:{find:()=>chain([]),findOne:()=>one(null)},
+ VehicleLiveStatus:{find:()=>chain([]),findOne:()=>one(null)},
+ GpsProviderStatus:{find:()=>chain([])},
+ SyncLog:{findOne:()=>chain(null)},
+ ...overrides
+});
+
+test('parses Hindi yesterday in India time and rejects future dates and times',()=>{
+ const yesterday=service.parseDateRequest('UP14GT0100 ki kal ki history',now);
+ assert.equal(yesterday.start.toISOString(),'2026-11-20T18:30:00.000Z');
+ assert.equal(yesterday.future,false);
+ assert.equal(service.parseDateRequest('UP14GT0100 ki 23-11-2026 history',now).future,true);
+ assert.equal(service.parseDateRequest('Salt Plant 22-11-2026 at 4 PM availability',now).future,true);
+});
+
+test('parses inclusive DD-MM-YYYY history ranges in Asia/Kolkata',()=>{
+ const range=service.parseDateRequest('UP14GT0100 10-11-2026 se 15-11-2026 tak',now);
+ assert.equal(range.start.toISOString(),'2026-11-09T18:30:00.000Z');
+ assert.equal(range.end.toISOString(),'2026-11-15T18:29:59.999Z');
+});
+
+test('matches case-insensitive plant names with a minor spelling error',()=>{
+ const plant={_id:'salt-id',name:'Salt Plant'};
+ assert.equal(service.matchPlant('Slt plnt available vehicles',[plant]),plant);
+});
+
+test('normalizes lowercase, spaces, dashes and dots in vehicle-number questions',()=>{
+ assert.equal(service.extractVehicleNumber('up.14-ft.9150 Location'),'UP14FT9150');
+ assert.equal(service.extractVehicleNumber('UP 14 FT 9150 kahan hai'),'UP14FT9150');
+});
+
+test('detects credential-like prompts before history storage',()=>{
+ assert.equal(service.containsSensitiveInput('password=do-not-save-this'),true);
+ assert.equal(service.containsSensitiveInput('Authorization: Bearer abc123'),true);
+ assert.equal(service.containsSensitiveInput('Salt Plant available vehicles'),false);
+});
+
+test('chat records expire exactly seven days after creation and have a Mongo TTL index',()=>{
+ const createdAt=new Date('2026-11-22T10:06:00.000Z');
+ assert.equal(service.getChatExpiry(createdAt).toISOString(),'2026-11-29T10:06:00.000Z');
+ assert.equal(models.SikkaAiChat.collection.collectionName,'SikkaAiChat');
+ assert.ok(models.SikkaAiChat.schema.indexes().some(([index,options])=>index.expireAt===1&&options.expireAfterSeconds===0));
+ for(const field of ['userFullName','question','answer','askedAt','answeredAt']){
+  assert.ok(models.SikkaAiChat.schema.path(field),`${field} chat field should be persisted`);
+ }
+});
+
+test('answers plant availability with actual stay rows and a non-empty text reply',async()=>{
+ const plant={_id:'salt-id',name:'Salt Plant'};
+ const testModels=makeModels({
+  Plant:{find:()=>chain([plant])},
+  Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100'}]),findOne:()=>one({vehicleNumber:'UP14GT0100',status:'Active'})},
+  VehiclePlantStay:{find:()=>chain([{vehicle:'UP14GT0100',plant,entryTime:new Date('2026-11-22T07:06:00.000Z')}])}
+ });
+ const answer=await service.answerQuestion('Salt Plant Available Vehicle List',{models:testModels,now});
+ assert.equal(answer.type,'plantVehicles');
+ assert.equal(answer.text,'1 vehicle(s) are currently available at Salt Plant.');
+ assert.equal(answer.rows[0].vehicleNumber,'UP14GT0100');
+ assert.equal(answer.rows[0].stay,'3 h 0 m');
+});
+
+test('answers all-plants availability with grouped stays and outside vehicles',async()=>{
+ const salt={_id:'salt-id',name:'Salt Plant'};
+ const tea={_id:'tea-id',name:'Tea Plant'};
+ const testModels=makeModels({
+  Plant:{find:()=>chain([salt,tea])},
+  VehiclePlantStay:{find:()=>chain([
+   {vehicle:'UP14GT0100',plant:salt,entryTime:new Date('2026-11-22T07:06:00.000Z')}
+  ])},
+  Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100'},{vehicleNumber:'DL01AA1234'}])},
+  VehicleLiveStatus:{find:()=>chain([{vehicleNumber:'DL01AA1234'}])}
+ });
+ const answer=await service.answerQuestion('All plant available vehicles',{models:testModels,now});
+ assert.equal(answer.type,'plants');
+ assert.deepEqual(answer.plants.map(plant=>[plant.plantName,plant.count]),[['Salt Plant',1],['Tea Plant',0]]);
+ assert.deepEqual(answer.transit,{count:1,vehicles:['DL01AA1234']});
+});
+
+test('returns a Google Maps link and plant for current vehicle location',async()=>{
+ const plant={_id:'salt-id',name:'Salt Plant',lat:28.5,lng:77.4,radius:1000,status:'Active'};
+ const testModels=makeModels({
+  Plant:{find:()=>chain([plant])},
+  Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100'}]),findOne:()=>one({vehicleNumber:'UP14GT0100',status:'Active'})},
+  VehicleLiveStatus:{find:()=>chain([{
+   vehicleNumber:'UP14GT0100',readableLocation:'Dasna, Uttar Pradesh',speed:'28',ignition:'ON',
+   gpsTime:new Date('2026-11-22T09:30:00.000Z'),lat:28.5,lng:77.4
+  }]),findOne:()=>one({
+   vehicleNumber:'UP14GT0100',readableLocation:'Dasna, Uttar Pradesh',speed:'28',ignition:'ON',
+   gpsTime:new Date('2026-11-22T09:30:00.000Z'),lat:28.5,lng:77.4
+  })},
+  VehiclePlantStay:{find:()=>chain([{vehicle:'UP14GT0100',plant:{_id:'salt-id',name:'Salt Plant'},entryTime:new Date('2026-11-22T08:30:00.000Z')}])}
+ });
+ const answer=await service.answerQuestion('UP14GT0100 kahan hai',{models:testModels,now});
+ assert.equal(answer.type,'vehicle');
+ assert.equal(answer.location,'Dasna, Uttar Pradesh');
+ assert.equal(answer.plantName,'Salt Plant');
+ assert.equal(answer.map,'https://www.google.com/maps?q=28.5,77.4');
+});
+
+test('answers the exact UP14FT9150 Location phrasing from GPS snapshot data',async()=>{
+ const plant={_id:'salt-id',name:'Salt Plant',lat:28.5,lng:77.4,radius:1000,status:'Active'};
+ const answer=await service.answerQuestion('UP14FT9150 Location',{
+  models:makeModels({
+   Plant:{find:()=>chain([plant])},
+   Vehicle:{find:()=>chain([{vehicleNumber:'UP14FT9150'}]),findOne:()=>one({vehicleNumber:'UP14FT9150',status:'Active'})},
+   VehicleLiveStatus:{find:()=>chain([{
+    vehicleNumber:'UP14FT9150',address:'Dasna, Uttar Pradesh',speed:'31',ignition:'ON',
+    gpsTime:new Date('2026-11-22T09:30:00.000Z'),provider:'FleetX',lat:28.5,lng:77.4
+   }]),findOne:()=>one({
+    vehicleNumber:'UP14FT9150',address:'Dasna, Uttar Pradesh',speed:'31',ignition:'ON',
+    gpsTime:new Date('2026-11-22T09:30:00.000Z'),provider:'FleetX',lat:28.5,lng:77.4
+   })},
+   VehiclePlantStay:{find:()=>chain([{vehicle:'UP14FT9150',plant,entryTime:new Date('2026-11-22T08:30:00.000Z')}])}
+  }),now
+ });
+ assert.equal(answer.type,'vehicle');
+ assert.equal(answer.vehicleNumber,'UP14FT9150');
+ assert.equal(answer.location,'Dasna, Uttar Pradesh');
+ assert.equal(answer.provider,'FleetX');
+ assert.equal(answer.speed,'31');
+ assert.equal(answer.ignition,'ON');
+ assert.equal(answer.plantName,'Salt Plant');
+ assert.equal(answer.map,'https://www.google.com/maps?q=28.5,77.4');
+});
+
+test('answers vehicle history with readable data and Google map links',async()=>{
+ const record={gpsTime:new Date('2026-11-20T08:30:00.000Z'),address:'Dasna, UP',speed:'42',ignition:'ON',lat:28.5,lng:77.4};
+ const testModels=makeModels({
+  Plant:{find:()=>chain([])},
+  Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100'}]),findOne:()=>one({vehicleNumber:'UP14GT0100',status:'Active'})},
+  VehicleLocationHistory:{
+   find:()=>chain([record]),
+   countDocuments:async()=>1
+  }
+ });
+ const answer=await service.answerQuestion('UP14GT0100 10-11-2026 se 15-11-2026 tak',{models:testModels,now});
+ assert.equal(answer.type,'history');
+ assert.equal(answer.rows[0].address,'Dasna, UP');
+ assert.equal(answer.rows[0].speed,'42');
+ assert.equal(answer.rows[0].ignition,'ON');
+ assert.equal(answer.rows[0].map,'https://www.google.com/maps?q=28.5,77.4');
+ assert.ok(answer.historyRange);
+});
+
+test('answers kal history using yesterday in India time and blocks future queries',async()=>{
+ let filterUsed;
+ const historyModels=makeModels({
+  Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100'}]),findOne:()=>one({vehicleNumber:'UP14GT0100',status:'Active'})},
+  Plant:{find:()=>chain([])},
+  VehicleLocationHistory:{
+   find:filter=>{filterUsed=filter;return chain([{gpsTime:new Date('2026-11-21T08:30:00.000Z'),address:'Dasna',lat:28.5,lng:77.4}])},
+   countDocuments:async()=>1
+  }
+ });
+ const answer=await service.answerQuestion('UP14GT0100 ki kal ki history',{models:historyModels,now});
+ assert.equal(filterUsed.gpsTime.$gte.toISOString(),'2026-11-20T18:30:00.000Z');
+ assert.equal(filterUsed.gpsTime.$lte.toISOString(),'2026-11-21T18:29:59.999Z');
+ assert.equal(answer.type,'history');
+
+ let plantsRead=false;
+ const future=await service.answerQuestion('UP14GT0100 ki 23-11-2026 history',{
+  models:makeModels({Plant:{find:()=>{plantsRead=true;return chain([])}}}),now
+ });
+ assert.equal(future.text,'Future dates are not available.');
+ assert.equal(plantsRead,false);
+});
+
+test('returns a friendly fallback instead of an empty reply',async()=>{
+ const answer=await service.answerQuestion('Can you do something?',{models:makeModels(),now});
+ assert.match(answer.text,/I could not match that question to available fleet records/);
+ assert.ok(answer.text.length>0);
+});
+
+test('asks for a vehicle number and offers registered vehicle suggestions',async()=>{
+ const answer=await service.answerQuestion('Where is a vehicle now',{
+  models:makeModels({Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100'},{vehicleNumber:'DL01AA1234'}])}}),now
+ });
+ assert.equal(answer.type,'vehiclePrompt');
+ assert.equal(answer.text,'Which vehicle? Please enter its vehicle number.');
+ assert.deepEqual(answer.suggestions.map(item=>item.label),['UP14GT0100','DL01AA1234']);
+});
+
+test('distinguishes an unregistered vehicle from a registered vehicle with no live GPS',async()=>{
+ const unknown=await service.answerQuestion('ZZ99ZZ9999 Location',{models:makeModels(),now});
+ assert.equal(unknown.type,'vehicleNotFound');
+ assert.equal(unknown.text,'This vehicle number was not found in the registry.');
+
+ const lastRecord={
+  vehicleNumber:'UP14FT9150',gpsTime:new Date('2026-11-22T09:00:00.000Z'),
+  address:'Dasna, Uttar Pradesh',lat:28.5,lng:77.4,speed:'0',ignition:'OFF',provider:'FleetX'
+ };
+ const missingLiveModels=makeModels({
+  Vehicle:{find:filter=>chain(filter.status?[ ]:[{vehicleNumber:'UP14FT9150',status:'Active'}]),findOne:filter=>one(filter.status?{vehicleNumber:'UP14FT9150',status:'Active'}:null)},
+  VehicleLiveStatus:{find:()=>chain([]),findOne:()=>one(null)},
+  VehicleLocationHistory:{find:()=>chain([lastRecord])}
+ });
+ const missingLive=await service.answerQuestion('up.14-ft.9150 Location',{models:missingLiveModels,now});
+ assert.equal(missingLive.type,'vehicleMissing');
+ assert.match(missingLive.text,/Live GPS data for UP14FT9150 is not available/);
+ assert.match(missingLive.text,/Last known location: Dasna, Uttar Pradesh/);
+ assert.equal(missingLive.map,'https://www.google.com/maps?q=28.5,77.4');
+});
+
+test('unknown plant questions list actual plants as clickable suggestions',async()=>{
+ const answer=await service.answerQuestion('Which vehicles are available now in Plant 1',{
+  models:makeModels({Plant:{find:()=>chain([{_id:'salt',name:'Salt Plant'},{_id:'tea',name:'Tea Plant'}])}}),now
+ });
+ assert.equal(answer.type,'plantNotFound');
+ assert.match(answer.text,/Available plants: Salt Plant, Tea Plant/);
+ assert.deepEqual(answer.suggestions.map(item=>item.question),[
+  'Which vehicles are available at Salt Plant?','Which vehicles are available at Tea Plant?'
+ ]);
+});
+
+test('Plant availability now uses the same operational snapshot as dashboard counts',async()=>{
+ const salt={_id:'salt',name:'Salt Plant'};
+ const answer=await service.answerQuestion('Plant availability now',{
+  models:makeModels({
+   Plant:{find:()=>chain([salt])},
+   Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100'}])},
+   VehiclePlantStay:{find:()=>chain([{vehicle:'UP14GT0100',plant:salt,entryTime:new Date('2026-11-22T07:06:00.000Z')}])},
+   VehicleLiveStatus:{find:()=>chain([])}
+  }),now
+ });
+ assert.equal(answer.plants[0].count,1);
+ assert.equal(answer.plants[0].rows[0].stay,'3 h 0 m');
+});
+
+test('answers Hindi and Hinglish plant-exit questions using actual stay history',async()=>{
+ for(const question of [
+  'आज कितनी गाड़ियां प्लांट से बाहर गई हैं?',
+  'Aaj kitni gadi plant se bahar gayi hain?',
+  'How many vehicles went outside the plant today?'
+ ]){
+  let filter;
+  const answer=await service.answerQuestion(question,{
+   models:makeModels({
+    VehiclePlantStay:{find:value=>{filter=value;return chain([
+     {vehicle:'UP14GT0100',plant:{name:'Salt Plant'},exitTime:new Date('2026-11-22T09:00:00.000Z')}
+    ])}}
+   }),now
+  });
+  assert.equal(answer.type,'outsideHistory',question);
+  assert.equal(answer.total,1,question);
+  assert.ok(filter.exitTime.$gte>=service.getHistoryCutoff(now),question);
+  assert.equal(answer.language,question.startsWith('How')?'en':'hi');
+ }
+});
+
+test('rejects history older than 45 IST calendar days before reading records',async()=>{
+ let historyRead=false;
+ const answer=await service.answerQuestion('UP14GT0100 ki 07-10-2026 history',{
+  models:makeModels({VehicleLocationHistory:{find:()=>{historyRead=true;return chain([])}}}),now
+ });
+ assert.equal(answer.type,'historyLimit');
+ assert.equal(answer.text,service.HISTORY_LIMIT_REPLY);
+ assert.equal(historyRead,false);
+});
+
+test('limits historical plant occupancy reads to the requested IST time and 45-day window',async()=>{
+ const salt={_id:'salt',name:'Salt Plant',status:'Active'};
+ let filter;
+ const answer=await service.answerQuestion('Which vehicles were at Salt Plant on 18-11-2026 at 3 PM?',{
+  models:makeModels({
+   Plant:{find:()=>chain([salt])},
+   VehiclePlantStay:{find:value=>{filter=value;return chain([
+    {vehicle:'UP14GT0100',entryTime:new Date('2026-11-18T08:30:00.000Z')}
+   ])}}
+  }),now
+ });
+ assert.equal(answer.type,'plantVehicles');
+ assert.equal(answer.rows[0].vehicleNumber,'UP14GT0100');
+ assert.equal(filter.entryTime.$lte.toISOString(),'2026-11-18T09:30:00.000Z');
+ assert.equal(filter.entryTime.$gte.toISOString(),service.getHistoryCutoff(now).toISOString());
+});
+
+test('denies GPS data access when the user lacks GPS Track permission',async()=>{
+ let vehicleRead=false;
+ const answer=await service.answerQuestion('UP14GT0100 Location',{
+  models:makeModels({Vehicle:{find:()=>{vehicleRead=true;return chain([])}}}),
+  permissions:{gpsTrack:false},now
+ });
+ assert.equal(answer.type,'forbidden');
+ assert.equal(vehicleRead,false);
+});
+
+test('daily retention deletes only GPS and completed plant history older than 60 days',async()=>{
+ const filters=[];
+ const logs={info(){},error(){}};
+ const result=await historyRetention.cleanupHistory({
+  VehicleLocationHistory:{deleteMany:async filter=>{filters.push(['gps',filter]);return {deletedCount:2}}},
+  VehiclePlantStay:{deleteMany:async filter=>{filters.push(['stay',filter]);return {deletedCount:3}}}
+ },now,logs);
+ const expectedCutoff=new Date(now.getTime()-60*24*60*60*1000);
+ assert.equal(result.cutoff,expectedCutoff.toISOString());
+ assert.equal(result.vehicleLocationHistoryDeleted,2);
+ assert.equal(result.vehiclePlantStayDeleted,3);
+ assert.deepEqual(filters.map(([collection,filter])=>[collection,Object.keys(filter),filter.gpsTime?.$lt||filter.exitTime?.$lt]),[
+  ['gps',['gpsTime'],expectedCutoff],
+  ['stay',['exitTime'],expectedCutoff]
+ ]);
+});
+
+test('retention logs a collection error with execution context and continues cleanup',async()=>{
+ const errors=[];
+ let stayDeleted=false;
+ const logger={
+  info(){},
+  error(message,details){errors.push({message,details})}
+ };
+ const result=await historyRetention.cleanupHistory({
+  VehicleLocationHistory:{deleteMany:async()=>{throw new Error('history unavailable')}},
+  VehiclePlantStay:{deleteMany:async()=>{stayDeleted=true;return {deletedCount:1}}}
+ },now,logger);
+ assert.equal(result.errors[0].collection,'VehicleLocationHistory');
+ assert.equal(result.vehiclePlantStayDeleted,1);
+ assert.equal(stayDeleted,true);
+ assert.equal(errors[0].details.stack.includes('history unavailable'),true);
+ assert.equal(errors[0].details.cutoff,historyRetention.getHistoryCutoff(now).toISOString());
+});
