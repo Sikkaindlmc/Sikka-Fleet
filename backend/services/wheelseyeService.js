@@ -1,9 +1,11 @@
 const axios=require('axios');
 
-async function fetchLive(){
- const configuredUrl=process.env.WHEELSEYE_API_URL||'https://api.wheelseye.com/currentLoc';
+async function fetchLive({baseUrl}={}){
+ const environmentUrl=process.env.WHEELSEYE_API_URL||'https://api.wheelseye.com/currentLoc';
+ const configuredUrl=baseUrl||environmentUrl;
  const url=new URL(configuredUrl);
- const accessToken=process.env.WHEELSEYE_API_TOKEN||url.searchParams.get('accessToken');
+ const accessToken=process.env.WHEELSEYE_API_TOKEN||
+  new URL(environmentUrl).searchParams.get('accessToken')||url.searchParams.get('accessToken');
  url.searchParams.delete('accessToken');
  if(accessToken)url.searchParams.set('accessToken',accessToken);
  const response=await axios.get(url.toString(),{

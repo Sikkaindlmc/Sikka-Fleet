@@ -21,7 +21,8 @@ test('snapshot counts one registered vehicle once across provider/live/stay dupl
    {vehicleNumber:'UP14GT0100',fleetType:'Own Fleet',gpsLink:'Wheelseye',
     gpsProviders:[{name:'Wheelseye'},{name:'FleetX'}],updatedAt:new Date('2026-11-22T00:00:00Z')},
    {vehicleNumber:'DL01AA1234',fleetType:'Contract Fleet',gpsLink:'FleetX'},
-   {vehicleNumber:'MH02BB9876',fleetType:'Own Fleet',gpsLink:'Wheelseye'}
+   {vehicleNumber:'MH02BB9876',fleetType:'Own Fleet',gpsLink:'Wheelseye'},
+   {vehicleNumber:'KA03CC4567',fleetType:'Contract Fleet',gpsLink:'FleetX'}
   ])},
   VehiclePlantStay:{find:()=>chain([
    {vehicle:'UP14GT0100',plant:plantA,entryTime:new Date('2026-11-22T07:00:00Z')},
@@ -40,8 +41,10 @@ test('snapshot counts one registered vehicle once across provider/live/stay dupl
  };
 
  const snapshot=await getOperationalSnapshot(models,now);
- assert.equal(snapshot.registeredCount,3);
- assert.equal(snapshot.live.length,3);
+ assert.equal(snapshot.registeredCount,4);
+ assert.equal(snapshot.live.length,4);
+ assert.equal(snapshot.live.find(record=>record.vehicleNumber==='KA03CC4567').noGpsData,true);
+ assert.equal(snapshot.summary.notResponding,1);
  const truck=snapshot.live.find(record=>record.vehicleNumber==='UP14GT0100');
  assert.equal(truck.provider,'FleetX');
  assert.deepEqual(snapshot.plants.map(plant=>plant.count),[2,0]);

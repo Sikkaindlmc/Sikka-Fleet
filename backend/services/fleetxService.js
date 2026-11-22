@@ -219,14 +219,17 @@ function mapLiveRecords(payload,vehicleNumberHint=''){
  }).filter(record=>record.vehicleNumber&&Number.isFinite(record.lat)&&record.lat>=-90&&record.lat<=90&&Number.isFinite(record.lng)&&record.lng>=-180&&record.lng<=180&&record.gpsTime instanceof Date);
 }
 
-function fetchLive(){
- return request(process.env.FLEETX_API_URL||DEFAULT_LIVE_URL);
+function fetchLive(baseUrl){
+ return request(baseUrl||process.env.FLEETX_API_URL||DEFAULT_LIVE_URL);
 }
 
-function fetchLiveByNumber(vehicleNumber){
+function fetchLiveByNumber(vehicleNumber,baseUrl){
  const normalized=normalizeVehicleNumber(vehicleNumber);
  if(!normalized)throw new Error('A valid vehicle number is required for FleetX live lookup');
- const base=process.env.FLEETX_LIVE_BY_NUMBER_URL||DEFAULT_LIVE_BY_NUMBER_URL;
+ const derivedByNumberUrl=baseUrl
+  ?baseUrl.replace(/\/live\/?$/i,'/live/byNumber')
+  :DEFAULT_LIVE_BY_NUMBER_URL;
+ const base=process.env.FLEETX_LIVE_BY_NUMBER_URL||derivedByNumberUrl;
  return request(`${base.replace(/\/+$/,'')}/${encodeURIComponent(normalized)}`);
 }
 

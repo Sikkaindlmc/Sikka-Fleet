@@ -23,6 +23,11 @@ The backend environment is already configured in `backend/.env`. Keep this file 
 
 The GPS pages use Leaflet with OpenStreetMap tiles and need no map API key. Server-side reverse geocoding uses OpenStreetMap Nominatim, caches resolved addresses, and limits request frequency. Nominatim usage is subject to the OpenStreetMap Foundation's usage policy; set an identifying `NOMINATIM_USER_AGENT` in the backend environment.
 
+GPS Track settings store uploaded running/stopped map icons under `backend/uploads/`;
+MongoDB stores their file paths, not the image files. That folder may be erased on
+restart or redeploy by many hosting providers. Use persistent object storage (for
+example, an S3-compatible bucket) for production icon uploads.
+
 ## Start development
 
 ```powershell
@@ -32,12 +37,9 @@ npm run dev
 - Frontend: http://localhost:5173
 - Backend: http://localhost:5000
 
-Default administrator:
-
-- Username: `ajaysomra`
-- Password: `Somra@2012`
-
-Change the password from the Users page or by setting `ADMIN_PASSWORD` before the first database seed.
+The first administrator account is created from the private `ADMIN_USERNAME` and
+`ADMIN_PASSWORD` environment variables. Set a strong password before starting the
+backend for the first time. Do not put credentials in this README or commit them.
 
 ## Build and production
 

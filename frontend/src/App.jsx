@@ -293,9 +293,9 @@ function Dashboard(){
  return <>
  <div className="page-head"><div><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} onClick={sync}><RefreshCw size={18}/> Sync Now</AnimatedButton>}<div className="clock"><b>Next sync</b><span>{countdown}</span></div><div className="clock"><b>Last Sync</b><span>{fmt(data.lastSync)}</span></div></div></div>
  <div className="widget-grid">{data.plants.map((p,i)=><motion.button key={p.plant} className="plant-widget" onClick={()=>setPlantModal(p)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}} transition={{delay:i*.07}}><span className="widget-icon"><Factory/></span><div><small>{p.plant}</small><Count value={p.count}/></div></motion.button>)}
- <motion.button className="plant-widget transit" onClick={()=>setTransitModal(true)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}}><span className="widget-icon"><MapPinned/></span><div><small>Transit</small><Count value={data.transit.count}/><em>active vehicles</em></div></motion.button></div>
+ <motion.button className="plant-widget transit" onClick={()=>setTransitModal(true)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}}><span className="widget-icon"><MapPinned/></span><div><small>Outside</small><Count value={data.transit.count}/><em>active vehicles</em></div></motion.button></div>
  <Modal open={!!plantModal} onClose={()=>setPlantModal(null)} title={`${plantModal?.plant||''} - Vehicles`} size="lg"><PlantPopup plant={plantModal} canPlan={canManage} onPlan={r=>setPlanModal(r)}/></Modal>
- <Modal open={transitModal} onClose={()=>setTransitModal(false)} title="Transit Vehicles" size="lg"><Table headers={['Vehicle Number','Left Plant','Current Location','Speed','IGN','GPS time','GPS data','']} rows={data.transit.rows.map(r=>[r.vehicleNumber,r.leftPlant,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.lastGpsUpdatedAt),r.stale?'Stale':'Live',<AnimatedButton variant="blue" onClick={()=>window.location.assign('/gps')}>Track Now</AnimatedButton>])}/></Modal>
+ <Modal open={transitModal} onClose={()=>setTransitModal(false)} title="Outside Vehicles" size="lg"><Table headers={['Vehicle Number','Last Out Plant Name','Current Location','Speed','IGN','GPS time','GPS data','']} rows={data.transit.rows.map(r=>[r.vehicleNumber,r.leftPlant,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.lastGpsUpdatedAt),r.stale?'Stale':'Live',<AnimatedButton variant="blue" onClick={()=>window.location.assign('/gps')}>Track Now</AnimatedButton>])}/></Modal>
  <Modal open={!!planModal} onClose={()=>setPlanModal(null)} title={`Plan - ${planModal?.vehicleNumber||''}`} disableClose={planSaving}><div className="form-grid"><label>Plan Type<select value={plan.planType} onChange={e=>setPlan({...plan,planType:e.target.value})}>{['Loading','Unloading','Maintenance','Waiting','Other'].map(v=><option key={v}>{v}</option>)}</select></label><label>Expected Departure<input type="datetime-local" value={plan.expectedDeparture} onChange={e=>setPlan({...plan,expectedDeparture:e.target.value})}/></label><label className="span-2">Remarks<textarea value={plan.remarks} onChange={e=>setPlan({...plan,remarks:e.target.value})}/></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setPlanModal(null)} disabled={planSaving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={planSaving} onClick={savePlan}>Save Plan</AnimatedButton></div></Modal>
  </>
 }
@@ -314,19 +314,22 @@ function Skeleton(){return <div className="skeleton-grid">{[1,2,3,4].map(i=><mot
 function Vehicles(){
  const {user}=useAuth();
  const canManage=canEdit(user,'vehicleRegistry');
- const [data,setData]=useState({items:[],total:0,page:1,pages:1});const [search,setSearch]=useState('');const [status,setStatus]=useState('');const [fleet,setFleet]=useState('');const [provider,setProvider]=useState('');const [modal,setModal]=useState(false);const [edit,setEdit]=useState(null);const [deleteTarget,setDeleteTarget]=useState(null);const [deleting,setDeleting]=useState(false);const [unreg,setUnreg]=useState([]);const [form,setForm]=useState({vehicleNumber:'',fleetType:'Own Fleet',gpsLink:'Wheelseye',status:'Active'});const [saving,setSaving]=useState(false);
- const load=async()=>{try{const r=await axios.get('/vehicles',{params:{search,status,fleetType:fleet,provider,page:data.page,limit:20}});setData(r.data);const u=await axios.get('/unregistered');setUnreg(u.data)}catch(e){showToast('Failed to load vehicles','error')}};
+ const [data,setData]=useState({items:[],total:0,page:1,pages:1});const [search,setSearch]=useState('');const [status,setStatus]=useState('');const [fleet,setFleet]=useState('');const [provider,setProvider]=useState('');const [modal,setModal]=useState(false);const [edit,setEdit]=useState(null);const [deleteTarget,setDeleteTarget]=useState(null);const [deleting,setDeleting]=useState(false);const [unreg,setUnreg]=useState([]);const [form,setForm]=useState({vehicleNumber:'',fleetType:'Own Fleet',gpsLink:'Wheelseye',driver:'',mobile:'',plant:'',status:'Active'});const [saving,setSaving]=useState(false);const [pageLoading,setPageLoading]=useState(true);const [pageError,setPageError]=useState(null);
+ const load=async()=>{setPageLoading(true);try{const r=await axios.get('/vehicles',{params:{search,status,fleetType:fleet,provider,page:data.page,limit:20}});setData(r.data);const u=await axios.get('/unregistered');setUnreg(u.data);setPageError(null)}catch(e){setPageError(e);showToast('Failed to load vehicles','error')}finally{setPageLoading(false)}};
  useEffect(()=>{load()},[status,fleet,provider,data.page]);useEffect(()=>{const t=setTimeout(()=>load(),300);return()=>clearTimeout(t)},[search]);
- const open=(v=null)=>{setEdit(v);setForm(v?{vehicleNumber:v.vehicleNumber,fleetType:v.fleetType,gpsLink:v.gpsLink,status:v.status}:{vehicleNumber:'',fleetType:'Own Fleet',gpsLink:'Wheelseye',status:'Active'});setModal(true)};
+ const open=(v=null)=>{setEdit(v);setForm(v?{vehicleNumber:v.vehicleNumber,fleetType:v.fleetType,gpsLink:v.gpsLink,driver:v.driver||'',mobile:v.mobile||'',plant:v.plant||'',status:v.status}:{vehicleNumber:'',fleetType:'Own Fleet',gpsLink:'Wheelseye',driver:'',mobile:'',plant:'',status:'Active'});setModal(true)};
  const save=async()=>{setSaving(true);try{if(edit)await axios.put('/vehicles/'+edit._id,form);else await axios.post('/vehicles',form);showToast(edit?'Vehicle updated':'Vehicle added');setModal(false);load()}catch(e){showToast(e.response?.data?.error||'Save failed','error')}finally{setSaving(false)}};
+ const syncVehicle=async vehicle=>{try{const result=await axios.post('/vehicles/'+vehicle._id+'/sync');showToast(result.data.success?`GPS sync complete for ${vehicle.vehicleNumber}`:`GPS sync finished with issues for ${vehicle.vehicleNumber}`,result.data.success?'success':'error');await load()}catch(error){showToast(error.response?.data?.error||'Vehicle GPS sync failed','error')}};
  const remove=v=>setDeleteTarget(v);
  const confirmRemove=async()=>{if(!deleteTarget||deleting)return;setDeleting(true);try{await axios.delete('/vehicles/'+deleteTarget._id);showToast('Vehicle deleted');setDeleteTarget(null);await load()}catch(e){showToast(e.response?.data?.error||'Delete failed','error')}finally{setDeleting(false)}};
+ if(pageLoading)return <Skeleton/>;
+ if(pageError)return <ErrorPage title="Cannot reach server" details={pageError.message} onRetry={load}/>;
  return <><div className="page-head"><div><p className="eyebrow">Fleet master</p><h1>Vehicle Registry</h1></div>{canManage&&<AnimatedButton variant="green" onClick={()=>open()}><Plus/> Add New Vehicle</AnimatedButton>}</div>
- {canManage&&!!unreg.length&&<div className="unregistered"><b>{unreg.length} unregistered provider vehicle(s)</b>{unreg.slice(0,5).map(v=><button key={v.vehicleNumber} onClick={()=>{setForm({vehicleNumber:v.vehicleNumber,fleetType:'Own Fleet',gpsLink:v.provider,status:'Active'});setModal(true)}}>{v.vehicleNumber} <Plus size={14}/></button>)}</div>}
+ {canManage&&!!unreg.length&&<div className="unregistered"><b>{unreg.length} unregistered provider vehicle(s)</b>{unreg.slice(0,5).map(v=><button key={v.vehicleNumber} onClick={()=>{setForm({vehicleNumber:v.vehicleNumber,fleetType:'Own Fleet',gpsLink:v.provider,driver:'',mobile:'',plant:'',status:'Active'});setModal(true)}}>{v.vehicleNumber} <Plus size={14}/></button>)}</div>}
  <div className="filters"><div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={fleet} onChange={e=>setFleet(e.target.value)}><option value="">Fleet Type</option><option>Own Fleet</option><option>Contract Fleet</option></select><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">GPS Provider</option><option>Wheelseye</option><option>FleetX</option></select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="">Status</option><option>Active</option><option>Inactive</option></select></div>
- <Table headers={['Vehicle Number','Fleet Type','GPS Link','Status','Last GPS time',...(canManage?['']:[])]} rows={data.items.map(v=>[v.vehicleNumber,v.fleetType,[...new Set([v.gpsLink,...(v.gpsProviders||[]).map(link=>link.name)])].filter(Boolean).join(' + '),<span className={`badge ${v.status.toLowerCase()}`}>{v.status}</span>,fmt(v.lastGps),...(canManage?[<div className="row-actions"><AnimatedButton variant="blue" onClick={()=>open(v)}><Edit3 size={16}/></AnimatedButton><AnimatedButton variant="red" onClick={()=>remove(v)}><Trash2 size={16}/></AnimatedButton></div>]:[])])}/>
+ <Table headers={['Vehicle Number','Fleet Type','GPS Link','Driver','Mobile','Plant','Status','Last GPS time',...(canManage?['']:[])]} rows={data.items.map(v=>[v.vehicleNumber,v.fleetType,[...new Set([v.gpsLink,...(v.gpsProviders||[]).map(link=>link.name)])].filter(Boolean).join(' + '),v.driver||'-',v.mobile||'-',v.plant||'-',<span className={`badge ${v.status.toLowerCase()}`}>{v.status}</span>,fmt(v.lastGps),...(canManage?[<div className="row-actions"><AnimatedButton variant="orange" onClick={()=>syncVehicle(v)}>Sync GPS</AnimatedButton><AnimatedButton variant="blue" onClick={()=>open(v)}><Edit3 size={16}/></AnimatedButton><AnimatedButton variant="red" onClick={()=>remove(v)}><Trash2 size={16}/></AnimatedButton></div>]:[])])}/>
  <div className="pagination"><AnimatedButton variant="ghost" disabled={data.page<=1} onClick={()=>setData({...data,page:data.page-1})}>Previous</AnimatedButton><span>Page {data.page} of {data.pages||1}</span><AnimatedButton variant="ghost" disabled={data.page>=data.pages} onClick={()=>setData({...data,page:data.page+1})}>Next</AnimatedButton></div>
- <Modal open={modal} onClose={()=>setModal(false)} title={edit?'Edit Vehicle':'Add New Vehicle'} disableClose={saving}><div className="form-grid"><label>Vehicle Number<input value={form.vehicleNumber} onChange={e=>setForm({...form,vehicleNumber:e.target.value.toUpperCase()})}/></label><label>Fleet Type<select value={form.fleetType} onChange={e=>setForm({...form,fleetType:e.target.value})}><option>Own Fleet</option><option>Contract Fleet</option></select></label><label>GPS Link<select value={form.gpsLink} onChange={e=>setForm({...form,gpsLink:e.target.value})}><option>Wheelseye</option><option>FleetX</option></select></label><label>Status<select value={form.status} onChange={e=>setForm({...form,status:e.target.value})}><option>Active</option><option>Inactive</option></select></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setModal(false)} disabled={saving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={save}>Save</AnimatedButton></div></Modal>
+ <Modal open={modal} onClose={()=>setModal(false)} title={edit?'Edit Vehicle':'Add New Vehicle'} disableClose={saving}><div className="form-grid"><label>Vehicle Number<input value={form.vehicleNumber} onChange={e=>setForm({...form,vehicleNumber:e.target.value.toUpperCase()})}/></label><label>Fleet Type<select value={form.fleetType} onChange={e=>setForm({...form,fleetType:e.target.value})}><option>Own Fleet</option><option>Contract Fleet</option></select></label><label>GPS Provider<select value={form.gpsLink} onChange={e=>setForm({...form,gpsLink:e.target.value})}><option>Wheelseye</option><option>FleetX</option></select></label><label>Driver<input value={form.driver} onChange={e=>setForm({...form,driver:e.target.value})}/></label><label>Mobile<input type="tel" value={form.mobile} onChange={e=>setForm({...form,mobile:e.target.value})}/></label><label>Plant<input value={form.plant} onChange={e=>setForm({...form,plant:e.target.value})}/></label><label>Status<select value={form.status} onChange={e=>setForm({...form,status:e.target.value})}><option>Active</option><option>Inactive</option></select></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setModal(false)} disabled={saving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={save}>Save</AnimatedButton></div></Modal>
  <Modal open={Boolean(deleteTarget)} onClose={()=>{if(!deleting)setDeleteTarget(null)}} title="Delete Vehicle" disableClose={deleting}><p>Delete vehicle <b>{deleteTarget?.vehicleNumber}</b>? This action cannot be undone.</p><div className="modal-actions"><AnimatedButton variant="red" loading={deleting} onClick={confirmRemove}>Delete Vehicle</AnimatedButton><AnimatedButton variant="ghost" onClick={()=>setDeleteTarget(null)} disabled={deleting}>Cancel</AnimatedButton></div></Modal></>
 }
 
@@ -343,9 +346,13 @@ function Plants(){
  const [deleteTarget,setDeleteTarget]=useState(null);
  const [deleteText,setDeleteText]=useState('');
  const [deleting,setDeleting]=useState(false);
+ const [pageLoading,setPageLoading]=useState(true);
+ const [pageError,setPageError]=useState(null);
  const load=async()=>{
-  try{setItems((await axios.get('/plants')).data)}
-  catch(error){showToast(error.response?.data?.error||'Failed to load plants','error')}
+  setPageLoading(true);
+  try{setItems((await axios.get('/plants')).data);setPageError(null)}
+  catch(error){setPageError(error);showToast(error.response?.data?.error||'Failed to load plants','error')}
+  finally{setPageLoading(false)}
  };
  useEffect(()=>{load()},[]);
  const closeForm=()=>{if(saving)return;setModal(false);setEdit(null);setErrors({})};
@@ -385,7 +392,11 @@ function Plants(){
    setModal(false);setEdit(null);setErrors({});
    await load();
   }catch(error){
-   const message=error.response?.data?.error||'Plant could not be saved';
+   const responseMessage=error.response?.data?.error;
+   const serverUnavailable=error.isApiResponseError||!error.response||error.response.status>=500;
+   const message=typeof responseMessage==='string'&&responseMessage
+    ?responseMessage
+    :serverUnavailable?`Cannot reach server: ${error.message}`:`Plant could not be saved (HTTP ${error.response.status})`;
    if(error.response?.status===409)setErrors(current=>({...current,plantId:message}));
    showToast(message,'error');
   }finally{setSaving(false)}
@@ -403,10 +414,14 @@ function Plants(){
  };
  const closeDelete=()=>{if(!deleting){setDeleteTarget(null);setDeleteText('')}};
  const field=(key,label,type='text',props={})=><label className="plant-field" key={key}>{label}<input type={type} value={form[key]} onChange={event=>{setForm(current=>({...current,[key]:event.target.value}));setErrors(current=>({...current,[key]:''}))}} aria-invalid={Boolean(errors[key])} {...props}/>{errors[key]&&<small className="field-error">{errors[key]}</small>}</label>;
+ if(pageLoading)return <Skeleton/>;
+ if(pageError)return <ErrorPage title="Cannot reach server" details={pageError.message} onRetry={load}/>;
  return <>
   <div className="page-head"><div><p className="eyebrow">Locations</p><h1>Plant History</h1></div>{canManage&&<AnimatedButton variant="green" onClick={()=>open()}><Plus/> Add Plant</AnimatedButton>}</div>
-  <Table headers={['Plant ID','Plant Name','Address','Longitude','Latitude','Radius in Meter','Status',...(canManage?['Actions']:[])]} rows={items.map(plant=>[
-   plant.plantId||'-',plant.name,plant.address||'-',plant.lng,plant.lat,plant.radius,plant.status,
+  <Table headers={['Plant ID','Plant Name','Address','Longitude','Latitude','Radius in Meter','Vehicles Inside','Status',...(canManage?['Actions']:[])]} rows={items.map(plant=>[
+   plant.plantId||'-',plant.name,plant.address||'-',plant.lng,plant.lat,plant.radius,
+   plant.vehicles?.length?plant.vehicles.map(vehicle=><div key={vehicle.vehicleNumber}>{vehicle.vehicleNumber} · {vehicle.stayHours??0} h {vehicle.stayMinutes??0} m</div>):'No vehicles inside',
+   plant.status,
    ...(canManage?[<div className="row-actions" key="actions"><AnimatedButton variant="blue" onClick={()=>open(plant)}><Edit3 size={16}/> Edit</AnimatedButton><AnimatedButton variant="red" onClick={()=>{setDeleteTarget(plant);setDeleteText('')}}><Trash2 size={16}/> Delete</AnimatedButton></div>]:[])
   ])}/>
   <Modal open={modal} onClose={closeForm} title={edit?'Edit Plant':'Add Plant'} size="md" disableClose={saving}>
@@ -550,10 +565,10 @@ function OpenStreetMap({vehicles=[],selectedVehicleNumber,onSelect,settings={},s
 function Gps(){
  const {user}=useAuth();
  const canManage=canEdit(user,'gpsTrack');
- const [tab,setTab]=useState('tracking');const [data,setData]=useState({live:[],registeredVehicles:[],providers:[],syncStatus:{}});const [selected,setSelected]=useState(null);const [search,setSearch]=useState('');const [provider,setProvider]=useState('');const [running,setRunning]=useState('');
- const [settings,setSettings]=useState({});const [runningFile,setRunningFile]=useState(null);const [stoppedFile,setStoppedFile]=useState(null);const [saving,setSaving]=useState(false);const [shareUrl,setShareUrl]=useState('');
+ const [tab,setTab]=useState('tracking'); const [data,setData]=useState({live:[],registeredVehicles:[],providers:[],syncStatus:{}});const [selected,setSelected]=useState(null);const [search,setSearch]=useState('');const [provider,setProvider]=useState('');const [running,setRunning]=useState('');const [pageLoading,setPageLoading]=useState(true);const [pageError,setPageError]=useState(null);
+ const [settings,setSettings]=useState({});const [providerSettings,setProviderSettings]=useState([]);const [runningFile,setRunningFile]=useState(null);const [stoppedFile,setStoppedFile]=useState(null);const [saving,setSaving]=useState(false);const [shareUrl,setShareUrl]=useState('');
  const [syncing,setSyncing]=useState(false);const [syncCountdown,setSyncCountdown]=useState('--:--');
- const load=async()=>{try{const r=await axios.get('/tracking');setData(r.data);setSelected(current=>current?r.data.live.find(v=>v.vehicleNumber===current.vehicleNumber)||null:null);const s=await axios.get('/settings');setSettings(s.data)}catch(e){showToast('Failed to load GPS data','error')}};
+ const load=async()=>{try{const [r,s,p]=await Promise.all([axios.get('/tracking'),axios.get('/settings'),axios.get('/gps/settings')]);setData(r.data);setSelected(current=>current?r.data.live.find(v=>v.vehicleNumber===current.vehicleNumber)||null:null);setSettings(s.data);setProviderSettings(p.data);setPageError(null)}catch(e){setPageError(e);showToast('Failed to load GPS data','error')}finally{setPageLoading(false)}};
  useEffect(()=>{
   load();
   const interval=setInterval(load,60000);
@@ -596,16 +611,19 @@ function Gps(){
  const share=async(v)=>{try{const r=await axios.post('/share',{vehicleNumber:v.vehicleNumber});setShareUrl(location.origin+r.data.url);showToast('Share link created')}catch(e){showToast(e.response?.data?.error||'Share failed','error')}};
  const copyShareLink=async()=>{try{await navigator.clipboard.writeText(shareUrl);showToast('Share link copied')}catch{showToast('Copy is unavailable; select and copy the link','error')}};
  const saveIcons=async()=>{setSaving(true);const fd=new FormData();if(runningFile)fd.append('running',runningFile);if(stoppedFile)fd.append('stopped',stoppedFile);try{await axios.post('/settings/icons',fd);showToast('Icons saved');load()}catch(e){showToast(e.response?.data?.error||'Icon upload failed','error')}finally{setSaving(false)}};
+ const saveProviderSettings=async setting=>{setSaving(true);try{const response=await axios.put('/gps/settings/'+setting.provider,{enabled:setting.enabled,baseUrl:setting.baseUrl});setProviderSettings(items=>items.map(item=>item.provider===setting.provider?response.data:item));showToast(`${setting.provider} settings saved`)}catch(error){showToast(error.response?.data?.error||`${setting.provider} settings could not be saved`,'error')}finally{setSaving(false)}};
  const live=data.live.filter(v=>(!search||v.vehicleNumber.includes(search))&&(!provider||v.provider===provider)&&(!running||(running==='running'?(v.ignition==='ON'||(+v.speed>0)):(v.ignition==='OFF'||(+v.speed===0)))));
  const providerWidget=n=>{
   const p=data.providers.find(x=>x.provider===n)||{status:'Disconnected',vehicleCount:0};
   const status=typeof p.status==='string'?p.status:'Disconnected';
   const providerRecords=data.live.filter(v=>v.provider===n);
-  const count=providerRecords.filter(v=>!v.stale).length;
+  const count=providerRecords.filter(v=>!v.stale&&!v.noGpsData).length;
   const staleCount=providerRecords.filter(v=>v.stale).length;
   return <div className={`provider-widget ${status.toLowerCase()}`}><b>{n}</b><span className="badge">{status==='Error'?'Failed':status}</span><div><small>Registered</small><strong>{p.vehicleCount||0}</strong></div><div><small>Reporting</small><strong>{count}</strong></div><div><small>Failed vehicles</small><strong>{p.vehiclesNotResponding||0}</strong></div><div><small>Stale data</small><strong>{staleCount}</strong></div><div><small>Last successful sync (IST)</small><strong>{fmtIst(p.lastSuccessTime)}</strong></div>{status==='Error'&&<em>{p.lastErrorMessage||'Provider request failed'} ({p.lastErrorCode||'N/A'})</em>}</div>
  };
  const syncStatus=data.syncStatus||{};
+ if(pageLoading)return <Skeleton/>;
+ if(pageError)return <ErrorPage title="Cannot reach server" details={pageError.message} onRetry={load}/>;
  return <><div className="page-head"><div><p className="eyebrow">Live operations</p><h1>GPS Track</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} onClick={manualSync}><RefreshCw size={17}/> Manual Sync</AnimatedButton>}<AnimatedButton variant="ghost" onClick={load}><RefreshCw size={17}/> Refresh</AnimatedButton></div></div><div className="tabs"><AnimatedButton variant={tab==='tracking'?'blue':'ghost'} onClick={()=>setTab('tracking')}>Tracking</AnimatedButton><AnimatedButton variant={tab==='history'?'blue':'ghost'} onClick={()=>setTab('history')}>History</AnimatedButton>{canManage&&<AnimatedButton variant={tab==='setting'?'blue':'ghost'} onClick={()=>setTab('setting')}>Setting</AnimatedButton>}</div>
  {tab==='tracking'?<>
  <div className="gps-sync-status">
@@ -621,9 +639,21 @@ function Gps(){
  <div className="provider-grid">{providerWidget('Wheelseye')}{providerWidget('FleetX')}</div>
  {(syncStatus.lastCycleErrors?.length>0||syncStatus.lastCycleGeofenceError)&&<div className="gps-sync-errors"><b>Last synchronization issues</b>{syncStatus.lastCycleGeofenceError&&<p>Plant status update: {syncStatus.lastCycleGeofenceError}</p>}{syncStatus.lastCycleErrors?.length>0&&<ul>{syncStatus.lastCycleErrors.map((error,index)=><li key={`${error.provider}-${error.vehicleNumber||index}-${index}`}>{error.provider}{error.vehicleNumber?` / ${error.vehicleNumber}`:''}: {error.message||'Synchronization failed'}{error.code?` (code ${error.code})`:''}</li>)}</ul>}</div>}
  <div className="gps-layout"><div className="gps-map"><OpenStreetMap vehicles={live} selectedVehicleNumber={selected?.vehicleNumber} onSelect={setSelected} settings={settings}/></div>
- <div className="gps-list"><div className="filters"><div className="search-box"><Search/><input placeholder="Search" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">Provider</option><option>Wheelseye</option><option>FleetX</option></select><select value={running} onChange={e=>setRunning(e.target.value)}><option value="">Running Status</option><option value="running">Moving</option><option value="stopped">Stopped</option></select></div><Table headers={['Vehicle','Provider','Fleet Type','Running','IGN','Speed','GPS data','Live Location','Coordinates','Driver','GPS time',...(canManage?['']:[])]} rows={live.map(v=>[<button className="vehicle-select" onClick={()=>setSelected(v)}>{v.vehicleNumber}</button>,v.provider,v.fleetType||'-',v.runningStatus||'Unknown',<span className={`ignition ${/^on|^1|^true$/i.test(String(v.ignition))?'on':'off'}`}>{v.ignition}</span>,speedText(v),v.stale?'Stale':'Live',<LocationText location={v.location} current={v.addressIsCurrent}/>,`${v.lat}, ${v.lng}`,v.driverName||'-',fmt(v.gpsTime),...(canManage?[<AnimatedButton variant="blue" onClick={()=>share(v)}><Share2 size={16}/></AnimatedButton>]:[])])}/></div></div>
+ <div className="gps-list">
+  <div className="filters"><div className="search-box"><Search/><input placeholder="Search" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">Provider</option><option>Wheelseye</option><option>FleetX</option></select><select value={running} onChange={e=>setRunning(e.target.value)}><option value="">Running Status</option><option value="running">Moving</option><option value="stopped">Stopped</option></select></div>
+  <Table headers={['Vehicle','Provider','Fleet Type','Running','IGN','Speed','GPS data','Live Location','Coordinates','Driver','GPS time',...(canManage?['']:[])]} rows={live.map(v=>[<button className="vehicle-select" onClick={()=>setSelected(v)}>{v.vehicleNumber}</button>,v.provider,v.fleetType||'-',v.runningStatus||'Unknown',<span className={`ignition ${/^on|^1|^true$/i.test(String(v.ignition))?'on':'off'}`}>{v.ignition||'N/A'}</span>,speedText(v),v.noGpsData?'No GPS data':v.stale?'Stale':'Live',<LocationText location={v.location} current={v.addressIsCurrent}/>,v.noGpsData?'N/A':`${v.lat}, ${v.lng}`,v.driverName||v.driver||'-',fmt(v.gpsTime),...(canManage?[<AnimatedButton variant="blue" disabled={v.noGpsData} onClick={()=>share(v)}><Share2 size={16}/></AnimatedButton>]:[])])}/>
+ </div></div>
  <div className="gps-attribution">Address data may be provided by OpenStreetMap contributors.</div>
- </>:tab==='history'?<HistoryTab vehicles={data.registeredVehicles||[]}/>:canManage&&tab==='setting'?<div className="icon-settings"><IconUploader title="Running Vehicle icon" file={runningFile} setFile={setRunningFile} preview={settings.runningIcon}/><IconUploader title="Stopped Vehicle icon" file={stoppedFile} setFile={setStoppedFile} preview={settings.stoppedIcon}/><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>{setRunningFile(null);setStoppedFile(null)}}>Reset</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={saveIcons}>Save</AnimatedButton></div></div>:<HistoryTab vehicles={data.registeredVehicles||[]}/>}
+ </>:tab==='history'?<HistoryTab vehicles={data.registeredVehicles||[]}/>:canManage&&tab==='setting'?<div className="icon-settings">
+ <section className="gps-provider-settings"><h2>GPS provider settings</h2>{providerSettings.map(item=><div className="gps-provider-setting" key={item.provider}>
+  <h3>{item.provider}</h3>
+  <label><input type="checkbox" checked={item.enabled} onChange={event=>setProviderSettings(current=>current.map(setting=>setting.provider===item.provider?{...setting,enabled:event.target.checked}:setting))}/> Enabled</label>
+  <label>API base URL<input type="url" value={item.baseUrl} onChange={event=>setProviderSettings(current=>current.map(setting=>setting.provider===item.provider?{...setting,baseUrl:event.target.value}:setting))}/></label>
+  <p>Credentials are read from server environment variables: {item.credentialsReference}. They are not stored here.</p>
+  <p>Last sync: {item.lastSyncStatus} {item.lastSyncedAt?`· ${fmtIst(item.lastSyncedAt)}`:''}</p>{item.lastSyncError&&<p role="alert">{item.lastSyncError}</p>}
+  <AnimatedButton variant="blue" loading={saving} onClick={()=>saveProviderSettings(item)}>Save provider settings</AnimatedButton>
+ </div>)}</section>
+ <IconUploader title="Running Vehicle icon" file={runningFile} setFile={setRunningFile} preview={settings.runningIcon}/><IconUploader title="Stopped Vehicle icon" file={stoppedFile} setFile={setStoppedFile} preview={settings.stoppedIcon}/><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>{setRunningFile(null);setStoppedFile(null)}}>Reset</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={saveIcons}>Save icons</AnimatedButton></div></div>:<HistoryTab vehicles={data.registeredVehicles||[]}/>}
  <Modal open={Boolean(shareUrl)} onClose={()=>setShareUrl('')} title="Vehicle Share Link"><label className="plant-field">Share link<input value={shareUrl} readOnly onFocus={event=>event.target.select()}/></label><div className="modal-actions"><AnimatedButton variant="green" onClick={copyShareLink}>Copy Link</AnimatedButton><AnimatedButton variant="red" onClick={()=>setShareUrl('')}>Close</AnimatedButton></div></Modal>
  </>
 }
@@ -680,8 +710,10 @@ function UsersPage(){
  const [saving,setSaving]=useState(false);
  const [deleting,setDeleting]=useState(false);
  const [form,setForm]=useState({fullName:'',username:'',password:'',permissions:createDefaultPermissions()});
+ const [pageLoading,setPageLoading]=useState(true);
+ const [pageError,setPageError]=useState(null);
  const editingSelf=Boolean(edit&&edit.username.toLowerCase()===user.username.toLowerCase());
- const load=async()=>{try{setItems((await axios.get('/users')).data)}catch(error){showToast(error.response?.data?.error||'Failed to load users','error')}};
+ const load=async()=>{setPageLoading(true);try{setItems((await axios.get('/users')).data);setPageError(null)}catch(error){setPageError(error);showToast(error.response?.data?.error||'Failed to load users','error')}finally{setPageLoading(false)}};
  useEffect(()=>{load()},[]);
  const open=u=>{
   if(u?.isAdmin)return;
@@ -750,6 +782,8 @@ function UsersPage(){
  const strength=form.password.length>=12&&/[!@#$%^&*]/.test(form.password)?'Strong':form.password.length>=8?'Medium':form.password?'Weak':'';
  const permissionsReadOnly=editingSelf;
  const closeForm=()=>{if(!saving)setModal(false)};
+ if(pageLoading)return <Skeleton/>;
+ if(pageError)return <ErrorPage title="Cannot reach server" details={pageError.message} onRetry={load}/>;
  return <>
   <div className="page-head"><div><p className="eyebrow">Access control</p><h1>Users</h1></div>{canManage&&<AnimatedButton variant="green" onClick={()=>open()}><Plus/> Add User</AnimatedButton>}</div>
   <Table headers={['Full Name','Username','Status','Last login','Permissions',...(canManage?['']:[])]} rows={items.map(u=>[
@@ -803,31 +837,12 @@ function UsersPage(){
  </>
 }
 
-function createAiSessionId(){
- return globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function getStoredAiSessionId(username){
- const key=`sikka-ai-session:${username||'user'}`;
- try{
-  const existing=localStorage.getItem(key);
-  if(existing)return existing;
-  const next=createAiSessionId();
-  localStorage.setItem(key,next);
-  return next;
- }catch{return createAiSessionId()}
-}
-
-function storeAiSessionId(username,sessionId){
- try{localStorage.setItem(`sikka-ai-session:${username||'user'}`,sessionId)}catch{}
-}
-
 function AIChat({open,onClose}){
  const {user}=useAuth();
  const [messages,setMessages]=useState([]);
  const [text,setText]=useState('');
  const [loading,setLoading]=useState(false);
- const [sessionId,setSessionId]=useState(()=>getStoredAiSessionId(user?.username));
+ const [sessionId,setSessionId]=useState(null);
  const [latestLoading,setLatestLoading]=useState(false);
  const [latestError,setLatestError]=useState('');
  const [tab,setTab]=useState('chat');
@@ -855,9 +870,8 @@ function AIChat({open,onClose}){
   axios.get('/ai/latest').then(response=>{
    if(!active)return;
    const items=Array.isArray(response.data.items)?response.data.items:[];
-   const latestSessionId=response.data.sessionId||getStoredAiSessionId(user?.username);
+   const latestSessionId=response.data.sessionId||null;
    setSessionId(latestSessionId);
-   storeAiSessionId(user?.username,latestSessionId);
    setMessages(items.flatMap(chat=>{
     const answer=normalizeChatAnswer(chat.answer);
     const metadata={
@@ -887,6 +901,7 @@ function AIChat({open,onClose}){
   setLoading(true);
   try{
    const response=await axios.post('/ai/chat',{message:prompt,sessionId});
+   setSessionId(response.data.sessionId||sessionId);
    const answer=normalizeChatAnswer(response.data);
    const metadata={
     userFullName:response.data.userFullName||user?.fullName,
@@ -979,7 +994,6 @@ function AIChat({open,onClose}){
   const answer=normalizeChatAnswer(chat.answer);
   if(chat.sessionId){
    setSessionId(chat.sessionId);
-   storeAiSessionId(user?.username,chat.sessionId);
   }
   const metadata={
    userFullName:chat.userFullName||chat.fullName,

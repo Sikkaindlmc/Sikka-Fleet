@@ -101,10 +101,10 @@ async function getPlantAvailability(models,plant,now=new Date()){
 async function getActiveVehicle(models,vehicleNumber){
  const normalized=normalizeVehicleNumber(vehicleNumber);
  const exact=await models.Vehicle.findOne({vehicleNumber:normalized,status:'Active'})
-  .select('vehicleNumber normalizedVehicleNumber status fleetType gpsLink providerVehicleId gpsProviders createdAt updatedAt').lean();
+  .select('vehicleNumber normalizedVehicleNumber status fleetType gpsLink providerVehicleId gpsProviders driver mobile plant createdAt updatedAt').lean();
  if(exact)return {...exact,vehicleNumber:normalized};
  const matches=await models.Vehicle.find({status:'Active'})
-  .select('vehicleNumber normalizedVehicleNumber status fleetType gpsLink providerVehicleId gpsProviders createdAt updatedAt').lean();
+  .select('vehicleNumber normalizedVehicleNumber status fleetType gpsLink providerVehicleId gpsProviders driver mobile plant createdAt updatedAt').lean();
  const record=preferredVehicle(matches.filter(vehicle=>normalizeVehicleNumber(vehicle.vehicleNumber)===normalized));
  return record?{...record,vehicleNumber:normalized}:null;
 }
@@ -114,11 +114,11 @@ async function getCurrentVehicle(models,vehicleNumber,{includeInactive=false}={}
  if(!vehicle&&includeInactive){
   const normalized=normalizeVehicleNumber(vehicleNumber);
   const exact=await models.Vehicle.findOne({vehicleNumber:normalized})
-   .select('vehicleNumber normalizedVehicleNumber status fleetType gpsLink providerVehicleId gpsProviders createdAt updatedAt').lean();
+   .select('vehicleNumber normalizedVehicleNumber status fleetType gpsLink providerVehicleId gpsProviders driver mobile plant createdAt updatedAt').lean();
   if(exact)vehicle={...exact,vehicleNumber:normalized};
   else{
    const matches=await models.Vehicle.find({})
-    .select('vehicleNumber normalizedVehicleNumber status fleetType gpsLink providerVehicleId gpsProviders createdAt updatedAt').lean();
+    .select('vehicleNumber normalizedVehicleNumber status fleetType gpsLink providerVehicleId gpsProviders driver mobile plant createdAt updatedAt').lean();
    const record=preferredVehicle(matches.filter(item=>normalizeVehicleNumber(item.vehicleNumber)===normalized));
    vehicle=record?{...record,vehicleNumber:normalized}:null;
   }
@@ -141,7 +141,7 @@ async function getCurrentVehicle(models,vehicleNumber,{includeInactive=false}={}
 async function getOperationalSnapshot(models,now=new Date(),{includeMetadata=true}={}){
  const [plants,rawVehicles,rawStays,providers,lastSync]=await Promise.all([
   models.Plant.find({status:'Active'}).lean(),
-  models.Vehicle.find({status:'Active'}).select('vehicleNumber fleetType gpsLink providerVehicleId gpsProviders createdAt updatedAt').lean(),
+  models.Vehicle.find({status:'Active'}).select('vehicleNumber fleetType gpsLink providerVehicleId gpsProviders driver mobile plant createdAt updatedAt').lean(),
   models.VehiclePlantStay.find({exitTime:null}).populate('plant').lean(),
   includeMetadata?models.GpsProviderStatus.find().lean():Promise.resolve([]),
   includeMetadata?models.SyncLog.findOne().sort({startedAt:-1}).lean():Promise.resolve(null)
@@ -173,7 +173,7 @@ async function getOperationalSnapshot(models,now=new Date(),{includeMetadata=tru
    };
   });
   return {
-   plant:plant.name,plantCode:plant.code||'',plantId:plant.plantId||'',
+   _id:plant._id,plant:plant.name,plantCode:plant.code||'',plantId:plant.plantId||'',
    address:plant.address||'',updatedAt:plant.updatedAt,count:rows.length,rows
   };
  });
@@ -195,11 +195,20 @@ async function getOperationalSnapshot(models,now=new Date(),{includeMetadata=tru
   latitude:record.lat,longitude:record.lng,lastGpsUpdatedAt:record.gpsTime,
   speed:record.speed,ignition:record.ignition,provider:record.provider,stale:Boolean(record.stale)
  }));
- const trackingRows=live.map(record=>({
-  ...record,location:readableAddress(record),
-  fleetType:vehicleByNumber.get(vehicleNumberKey(record.vehicleNumber))?.fleetType||'Unregistered'
- }));
- const freshRows=trackingRows.filter(record=>!record.stale);
+ const trackingRows=vehicles.map(vehicle=>{
+  const record=liveByNumber.get(vehicleNumberKey(vehicle.vehicleNumber));
+  return record?{
+   ...record,location:readableAddress(record),fleetType:vehicle.fleetType,
+   driver:vehicle.driver||'',driverName:record.driverName||vehicle.driver||'',
+   mobile:vehicle.mobile||'',plant:vehicle.plant||''
+  }:{
+   vehicleNumber:vehicle.vehicleNumber,normalizedVehicleNumber:vehicleNumberKey(vehicle.vehicleNumber),
+   provider:vehicle.gpsLink,fleetType:vehicle.fleetType,driver:vehicle.driver||'',
+   mobile:vehicle.mobile||'',plant:vehicle.plant||'',speed:'N/A',ignition:'N/A',
+   runningStatus:'Unknown',location:null,stale:false,noGpsData:true
+  };
+ }).sort((a,b)=>a.vehicleNumber.localeCompare(b.vehicleNumber));
+ const freshRows=trackingRows.filter(record=>!record.stale&&!record.noGpsData);
  return {
   plants:groups,
   plantRecords:plants,

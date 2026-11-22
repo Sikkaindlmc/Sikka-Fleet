@@ -31,6 +31,11 @@ const vehicleSchema=new mongoose.Schema({
  normalizedVehicleNumber:{type:String,required:true},
  fleetType:{type:String,enum:['Own Fleet','Contract Fleet'],required:true},
  gpsLink:{type:String,enum:['Wheelseye','FleetX'],required:true},
+ driver:{type:String,trim:true},
+ mobile:{type:String,trim:true},
+ plant:{type:String,trim:true},
+ createdBy:{type:mongoose.Schema.Types.ObjectId,ref:'User'},
+ updatedBy:{type:mongoose.Schema.Types.ObjectId,ref:'User'},
  providerVehicleId:{type:String},gpsProviders:{type:[vehicleGpsProviderSchema],default:[]},
  status:{type:String,enum:['Active','Inactive'],default:'Active'}
 },{timestamps:true});
@@ -107,6 +112,15 @@ const providerStatusSchema=new mongoose.Schema({
  vehiclesReceived:{type:Number,default:0},vehiclesNotResponding:{type:Number,default:0},
  apiResponseStatus:Number
 },{timestamps:true});
+const gpsSettingSchema=new mongoose.Schema({
+ provider:{type:String,enum:['Wheelseye','FleetX'],required:true,unique:true},
+ enabled:{type:Boolean,default:true},
+ baseUrl:{type:String,trim:true},
+ credentialsReference:{type:String,required:true},
+ lastSyncStatus:{type:String,enum:['Connected','Disconnected','Error','Disabled'],default:'Disconnected'},
+ lastSyncError:{type:String,default:''},
+ lastSyncedAt:Date
+},{timestamps:true});
 
 const syncLogSchema=new mongoose.Schema({
  type:{type:String,enum:['auto','manual']},startedAt:{type:Date,default:Date.now},finishedAt:Date,
@@ -181,6 +195,7 @@ module.exports={
  VehicleLocationHistory:mongoose.model('VehicleLocationHistory',historySchema),
  VehiclePlantStay:mongoose.model('VehiclePlantStay',staySchema),VehiclePlan:mongoose.model('VehiclePlan',planSchema),
  GpsProviderStatus:mongoose.model('GpsProviderStatus',providerStatusSchema),
+ GpsSetting:mongoose.model('GpsSetting',gpsSettingSchema,'gps_settings'),
  SyncLog:mongoose.model('SyncLog',syncLogSchema),ShareLink:mongoose.model('ShareLink',shareSchema),
  AppSetting:mongoose.model('AppSetting',appSettingSchema),AuditLog:mongoose.model('AuditLog',auditSchema),
  GeocodeCache:mongoose.model('GeocodeCache',geocodeCacheSchema),

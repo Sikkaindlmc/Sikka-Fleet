@@ -44,6 +44,10 @@ const haversine=(a,b)=>{const R=6371000,toRad=x=>x*Math.PI/180;const dLat=toRad(
 const GPS_SYNC_LOCK_KEY='gps-sync';
 const GPS_SYNC_LOCK_TTL_MS=90000;
 const GPS_SYNC_LOCK_RENEW_MS=20000;
+const GPS_PROVIDER_DEFAULTS={
+ Wheelseye:{url:'https://api.wheelseye.com/currentLoc',environmentVariable:'WHEELSEYE_API_URL',credentialsReference:'WHEELSEYE_API_TOKEN'},
+ FleetX:{url:'https://api.fleetx.io/api/v1/analytics/live',environmentVariable:'FLEETX_API_URL',credentialsReference:'FLEETX_USERNAME, FLEETX_PASSWORD, FLEETX_BASIC_AUTH'}
+};
 let syncing=false,syncScheduler=null;
 
 const ADMIN_USERNAME=String(process.env.ADMIN_USERNAME||'').trim().toLowerCase();
@@ -79,6 +83,38 @@ function requireAdmin(req,res,next){
 
 function vehicleHasProvider(vehicle,provider){
  return vehicle.gpsLink===provider||(vehicle.gpsProviders||[]).some(link=>link.name===provider);
+}
+
+function defaultProviderUrl(provider){
+ const settings=GPS_PROVIDER_DEFAULTS[provider];
+ const url=new URL(process.env[settings.environmentVariable]||settings.url);
+ url.username='';
+ url.password='';
+ for(const key of [...url.searchParams.keys()])if(/token|secret|password|authorization|api.?key/i.test(key))url.searchParams.delete(key);
+ return url.toString();
+}
+
+async function seedGpsSettings(){
+ for(const [provider,defaults] of Object.entries(GPS_PROVIDER_DEFAULTS)){
+  await M.GpsSetting.findOneAndUpdate({provider},{$setOnInsert:{
+   provider,enabled:true,baseUrl:defaultProviderUrl(provider),
+   credentialsReference:defaults.credentialsReference,
+   lastSyncStatus:'Disconnected',lastSyncError:''
+  }},{upsert:true,new:true});
+ }
+}
+
+function validateProviderUrl(provider,value){
+ let url;
+ try{url=new URL(String(value||''))}
+ catch{return null}
+ if(url.protocol!=='https:'||url.username||url.password)return null;
+ const settings=GPS_PROVIDER_DEFAULTS[provider];
+ const configuredOrigin=new URL(process.env[settings.environmentVariable]||settings.url).origin;
+ const defaultOrigin=new URL(settings.url).origin;
+ if(url.origin!==configuredOrigin&&url.origin!==defaultOrigin)return null;
+ if([...url.searchParams.keys()].some(key=>/token|secret|password|authorization|api.?key/i.test(key)))return null;
+ return url.toString();
 }
 
 function getProviderVehicleId(vehicle,provider){
@@ -255,19 +291,34 @@ async function runSync(type='manual'){
   );
   const vehiclesByNumber=new Map(activeVehicles.map(vehicle=>[normalizeNumber(vehicle.vehicleNumber),vehicle]));
   const registeredNumbers=[...vehiclesByNumber.keys()];
+  const savedProviderSettings=await M.GpsSetting.find({}).lean();
+  const providerSettingsByName=new Map(savedProviderSettings.map(setting=>[setting.provider,setting]));
   const synchronizedRegisteredNumbers=new Set();
   const result={};
   const providers=[
-   {name:'Wheelseye',fetch:wheelseyeService.fetchLive},
-   {name:'FleetX',fetch:fleetxService.fetchLive,map:fleetxService.mapLiveRecords}
+   {name:'Wheelseye',fetch:baseUrl=>wheelseyeService.fetchLive({baseUrl})},
+   {name:'FleetX',fetch:baseUrl=>fleetxService.fetchLive(baseUrl),map:fleetxService.mapLiveRecords}
   ];
   for(const p of providers){
    if(lockLost)throw new Error('GPS sync stopped after losing the distributed lock');
+   const providerSettings=providerSettingsByName.get(p.name);
    const registered=activeVehicles.filter(vehicle=>vehicleHasProvider(vehicle,p.name));
    const registeredNumbers=registered.map(vehicle=>normalizeNumber(vehicle.vehicleNumber));
    const errorDetails=[];
+   if(providerSettings?.enabled===false){
+    const disabledAt=new Date();
+    await M.GpsProviderStatus.findOneAndUpdate({provider:p.name},{$set:{
+     status:'Disconnected',lastAttemptTime:disabledAt,vehicleCount:registered.length,
+     vehiclesReceived:0,vehiclesNotResponding:0,lastErrorMessage:'',lastErrorCode:null,lastErrorTime:null
+    }},{upsert:true});
+    await M.GpsSetting.updateOne({provider:p.name},{$set:{
+     lastSyncStatus:'Disabled',lastSyncError:'',lastSyncedAt:disabledAt
+    }});
+    result[p.name]={status:'Disabled',count:0,syncedCount:0,failedCount:0,message:'Provider is disabled'};
+    continue;
+   }
    try{
-    const response=await retryProviderRequest(p.name,p.fetch);
+    const response=await retryProviderRequest(p.name,()=>p.fetch(providerSettings?.baseUrl));
     let rows=p.map?p.map(response.data):flattenProvider(response.data,p.name);
     if(p.name==='FleetX'){
      const received=new Set(rows.map(row=>normalizeNumber(row.vehicleNumber)));
@@ -276,7 +327,7 @@ async function runSync(type='manual'){
       const vehicleNumber=normalizeNumber(vehicle.vehicleNumber);
       if(received.has(vehicleNumber))continue;
       try{
-       const fallback=await retryProviderRequest(p.name,()=>fleetxService.fetchLiveByNumber(vehicleNumber));
+       const fallback=await retryProviderRequest(p.name,()=>fleetxService.fetchLiveByNumber(vehicleNumber,providerSettings?.baseUrl));
        const fallbackRows=fleetxService.mapLiveRecords(fallback.data,vehicleNumber);
        const row=fallbackRows.find(item=>item.vehicleNumber===vehicleNumber);
        if(row){rows.push(row);received.add(row.vehicleNumber)}
@@ -299,8 +350,9 @@ async function runSync(type='manual'){
     const syncedNumbers=new Set(),receivedRegistered=new Set();
     for(const row of newestByNumber.values()){
      if(lockLost)throw new Error('GPS sync stopped after losing the distributed lock');
-     const vehicle=vehiclesByNumber.get(row.vehicleNumber)||null;
-     if(vehicle)receivedRegistered.add(row.vehicleNumber);
+     const vehicle=vehiclesByNumber.get(row.vehicleNumber);
+     if(!vehicle||!vehicleHasProvider(vehicle,p.name))continue;
+     receivedRegistered.add(row.vehicleNumber);
      const previousRecords=await M.VehicleLiveStatus.find({vehicleNumber:vehicleNumberRegex(row.vehicleNumber)})
       .sort({gpsTime:-1,syncedAt:-1}).lean();
      const previous=previousRecords[0]||null;
@@ -384,6 +436,9 @@ async function runSync(type='manual'){
      vehiclesReceived:receivedAssignedNumbers.length,vehiclesNotResponding:failedCount,
      apiResponseStatus:response.status||200
     }}, {upsert:true});
+    await M.GpsSetting.updateOne({provider:p.name},{$set:{
+     lastSyncStatus:'Connected',lastSyncError:'',lastSyncedAt:completedAt
+    }});
     result[p.name]={
      status:'Connected',count:syncedNumbers.size,syncedCount:syncedNumbers.size,
      failedCount,vehiclesReceived:receivedAssignedNumbers.length,
@@ -398,6 +453,9 @@ async function runSync(type='manual'){
       lastErrorCode:code,lastErrorTime:new Date(),vehicleCount:registered.length,
       vehiclesNotResponding:registered.length
      }},{upsert:true});
+     await M.GpsSetting.updateOne({provider:p.name},{$set:{
+      lastSyncStatus:'Error',lastSyncError:message,lastSyncedAt:new Date()
+     }});
     }catch(statusError){
      console.error(`[GPS sync] Could not persist ${p.name} failure status`,{
       message:statusError.message,stack:statusError.stack
@@ -425,7 +483,7 @@ async function runSync(type='manual'){
    console.error('[GPS sync] Plant geofence update failed',{message:geofenceError,stack:error.stack});
   }
   const finishedAt=new Date();
-  const successfulProviders=Object.values(result).filter(provider=>provider.status==='Connected').length;
+  const successfulProviders=Object.values(result).filter(provider=>['Connected','Disabled'].includes(provider.status)).length;
   const allProvidersSucceeded=successfulProviders===providers.length;
   const failedProviderCount=providers.length-successfulProviders;
   const totalVehiclesSynced=synchronizedRegisteredNumbers.size;
@@ -609,7 +667,12 @@ app.post('/api/vehicles',auth,permission('Vehicle Registry','edit'),[body('vehic
  if(!vehicleNumber)return res.status(400).json({error:'Enter a valid vehicle number'});
  if(await M.Vehicle.exists({vehicleNumber:match}))return res.status(409).json({error:'Duplicate vehicle number'});
  try{
-  const v=await M.Vehicle.create({vehicleNumber,normalizedVehicleNumber:vehicleNumber,fleetType:req.body.fleetType,gpsLink:req.body.gpsLink,status:req.body.status});
+  const v=await M.Vehicle.create({
+   vehicleNumber,normalizedVehicleNumber:vehicleNumber,
+   fleetType:req.body.fleetType,gpsLink:req.body.gpsLink,status:req.body.status,
+   driver:String(req.body.driver||'').trim(),mobile:String(req.body.mobile||'').trim(),
+   plant:String(req.body.plant||'').trim(),createdBy:req.user.sub,updatedBy:req.user.sub
+  });
   await M.VehicleLiveStatus.updateMany({vehicleNumber:match},{$set:{unregistered:false}});
   await audit('create_vehicle',req.user.sub,{vehicleNumber},req);
   res.status(201).json(v);
@@ -619,8 +682,10 @@ app.post('/api/vehicles',auth,permission('Vehicle Registry','edit'),[body('vehic
  }
 });
 app.put('/api/vehicles/:id',auth,permission('Vehicle Registry','edit'),async(req,res)=>{
- const d={...req.body};
- delete d.normalizedVehicleNumber;
+ const allowedFields=['vehicleNumber','fleetType','gpsLink','status','driver','mobile','plant'];
+ const d=Object.fromEntries(allowedFields.filter(key=>Object.prototype.hasOwnProperty.call(req.body,key)).map(key=>[key,req.body[key]]));
+ for(const key of ['driver','mobile','plant'])if(d[key]!==undefined)d[key]=String(d[key]||'').trim();
+ d.updatedBy=req.user.sub;
  if(d.vehicleNumber!==undefined){
   d.vehicleNumber=normalizeNumber(d.vehicleNumber);
   d.normalizedVehicleNumber=d.vehicleNumber;
@@ -641,6 +706,13 @@ app.put('/api/vehicles/:id',auth,permission('Vehicle Registry','edit'),async(req
  }
 });
 app.delete('/api/vehicles/:id',auth,permission('Vehicle Registry','edit'),async(req,res)=>{const v=await M.Vehicle.findByIdAndDelete(req.params.id);if(!v)return res.status(404).json({error:'Vehicle not found'});await audit('delete_vehicle',req.user.sub,{vehicleNumber:v.vehicleNumber},req);res.json({ok:true});});
+app.post('/api/vehicles/:id/sync',auth,syncPermission,async(req,res)=>{
+ const vehicle=await M.Vehicle.findById(req.params.id).select('vehicleNumber status');
+ if(!vehicle)return res.status(404).json({error:'Vehicle not found'});
+ if(vehicle.status!=='Active')return res.status(409).json({error:'Inactive vehicles are not synchronized'});
+ const result=await runSync('manual');
+ return res.status(result.started?200:409).json(result);
+});
 app.get('/api/unregistered',auth,permission('Vehicle Registry','view'),async(req,res)=>{
  const [vehicles,records]=await Promise.all([
   M.Vehicle.find({}).select('vehicleNumber').lean(),
@@ -653,7 +725,14 @@ app.get('/api/unregistered',auth,permission('Vehicle Registry','view'),async(req
  res.json(unique);
 });
 
-app.get('/api/plants',auth,permission('Plant','view'),async(req,res)=>res.json(await M.Plant.find().sort({name:1})));
+app.get('/api/plants',auth,permission('Plant','view'),async(req,res)=>{
+ const [plants,snapshot]=await Promise.all([
+  M.Plant.find().sort({name:1}),
+  fleetSnapshotService.getOperationalSnapshot(M)
+ ]);
+ const availability=new Map(snapshot.plants.map(plant=>[String(plant._id),plant.rows]));
+ res.json(plants.map(plant=>({...plant.toObject(),vehicles:availability.get(String(plant._id))||[]})));
+});
 const validatePlant=()=>[
  body('plantId').trim().notEmpty().withMessage('Plant ID is required'),
  body('name').trim().notEmpty().withMessage('Plant Name is required'),
@@ -828,6 +907,41 @@ app.delete('/api/users/:id',auth,permission('Users','edit'),async(req,res)=>{
 const uploadDirectory=path.join(__dirname,'uploads');
 fs.mkdirSync(uploadDirectory,{recursive:true});
 const upload=multer({storage:multer.diskStorage({destination:(q,f,c)=>c(null,uploadDirectory),filename:(q,f,c)=>c(null,Date.now()+'-'+f.originalname.replace(/[^a-z0-9._-]/gi,'_'))}),limits:{fileSize:1024*1024},fileFilter:(q,f,c)=>['image/png','image/svg+xml','image/webp'].includes(f.mimetype)?c(null,true):c(new Error('Invalid icon type'))});
+app.get('/api/gps/settings',auth,permission('GPS Track','view'),async(req,res)=>{
+ const [saved,providerStatuses]=await Promise.all([
+  M.GpsSetting.find().lean(),M.GpsProviderStatus.find().lean()
+ ]);
+ const settingsByProvider=new Map(saved.map(setting=>[setting.provider,setting]));
+ const statusesByProvider=new Map(providerStatuses.map(status=>[status.provider,status]));
+ res.json(Object.entries(GPS_PROVIDER_DEFAULTS).map(([provider,defaults])=>{
+  const setting=settingsByProvider.get(provider);
+  const status=statusesByProvider.get(provider);
+  return {
+   provider,enabled:setting?.enabled!==false,
+   baseUrl:setting?.baseUrl||defaultProviderUrl(provider),
+   credentialsReference:defaults.credentialsReference,
+   lastSyncStatus:setting?.lastSyncStatus||status?.status||'Disconnected',
+   lastSyncError:setting?.lastSyncError||status?.lastErrorMessage||'',
+   lastSyncedAt:setting?.lastSyncedAt||status?.lastSuccessTime||null
+  };
+ }));
+});
+app.put('/api/gps/settings/:provider',auth,permission('GPS Track','edit'),async(req,res)=>{
+ const provider=req.params.provider;
+ if(!Object.prototype.hasOwnProperty.call(GPS_PROVIDER_DEFAULTS,provider))return res.status(404).json({error:'GPS provider not found'});
+ if(typeof req.body.enabled!=='boolean')return res.status(400).json({error:'Provider enabled must be true or false'});
+ const baseUrl=validateProviderUrl(provider,req.body.baseUrl);
+ if(!baseUrl)return res.status(400).json({error:'Enter a valid HTTPS URL for this GPS provider without credentials or secret query parameters'});
+ const setting=await M.GpsSetting.findOneAndUpdate({provider},{$set:{
+  enabled:req.body.enabled,baseUrl,credentialsReference:GPS_PROVIDER_DEFAULTS[provider].credentialsReference
+ }},{upsert:true,new:true,runValidators:true});
+ await audit('edit_gps_provider_settings',req.user.sub,{provider,enabled:setting.enabled},req);
+ res.json({
+  provider:setting.provider,enabled:setting.enabled,baseUrl:setting.baseUrl,
+  credentialsReference:setting.credentialsReference,lastSyncStatus:setting.lastSyncStatus,
+  lastSyncError:setting.lastSyncError,lastSyncedAt:setting.lastSyncedAt
+ });
+});
 app.post('/api/settings/icons',auth,permission('GPS Track','edit'),upload.fields([{name:'running',maxCount:1},{name:'stopped',maxCount:1}]),async(req,res)=>{
  for(const key of ['running','stopped'])if(req.files[key])await M.AppSetting.findOneAndUpdate({key:`${key}Icon`},{$set:{value:'/uploads/'+req.files[key][0].filename}}, {upsert:true});
  await audit('edit_icons',req.user.sub,{},req);res.json(await M.AppSetting.find({key:/Icon$/}));
@@ -897,7 +1011,7 @@ app.post('/api/ai/chat',auth,permission('Sikka AI','view'),aiChatLimiter,
   }
   const answeredAt=new Date();
   const responseData={
-   ...answer,userFullName:req.user.fullName,askedAt,answeredAt,
+   ...answer,userFullName:req.user.fullName,sessionId,askedAt,answeredAt,
    ...(referenceCode?{referenceCode}:{}),historySaved:true
   };
   try{
@@ -1070,6 +1184,7 @@ async function start(){
   console.log('MongoDB Atlas connected successfully');
   await M.SikkaAiChat.createIndexes();
   await M.GpsSyncLock.createIndexes();
+  await seedGpsSettings();
   await seedAdmin();
   startGpsSyncScheduler();
   const dist=path.join(__dirname,'../frontend/dist');
