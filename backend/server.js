@@ -46,7 +46,7 @@ const GPS_SYNC_LOCK_TTL_MS=90000;
 const GPS_SYNC_LOCK_RENEW_MS=20000;
 let syncing=false,syncScheduler=null;
 
-const ADMIN_USERNAME=(process.env.ADMIN_USERNAME||'ajaysomra').toLowerCase();
+const ADMIN_USERNAME=String(process.env.ADMIN_USERNAME||'').trim().toLowerCase();
 function isAdminAccount(user){return Boolean(user?.isAdmin||user?.username?.toLowerCase()===ADMIN_USERNAME);}
 function signAccess(user,sessionId){const isAdmin=isAdminAccount(user);return jwt.sign({sub:user._id,perms:normalizePermissions(user.permissions,isAdmin),isAdmin,sid:sessionId},process.env.JWT_SECRET,{expiresIn:'15m'});}
 function signRefresh(user,sessionId){return jwt.sign({sub:user._id,tokenVersion:1,sid:sessionId},process.env.JWT_SECRET,{expiresIn:'30d'});}
@@ -87,10 +87,10 @@ function getProviderVehicleId(vehicle,provider){
 }
 
 async function seedAdmin(){
- const username=(process.env.ADMIN_USERNAME||'ajaysomra').toLowerCase();
+ const username=process.env.ADMIN_USERNAME.trim().toLowerCase();
  const existing=await M.User.findOne({username});
  if(!existing){
-  await M.User.create({fullName:'Administrator',username:process.env.ADMIN_USERNAME||'ajaysomra',passwordHash:await bcrypt.hash(process.env.ADMIN_PASSWORD||'Somra@2012',12),isAdmin:true,active:true,permissions:normalizePermissions({},true)});
+  await M.User.create({fullName:'Administrator',username:process.env.ADMIN_USERNAME,passwordHash:await bcrypt.hash(process.env.ADMIN_PASSWORD,12),isAdmin:true,active:true,permissions:normalizePermissions({},true)});
  }else{
   existing.isAdmin=true;existing.active=true;
   existing.permissions=normalizePermissions({},true);
@@ -1052,6 +1052,15 @@ function startGpsSyncScheduler(){
 }
 
 async function start(){
+ const missing=[];
+ if(!String(process.env.MONGO_URI||process.env.MONGODB_URI||'').trim())missing.push('MONGO_URI or MONGODB_URI');
+ for(const name of ['JWT_SECRET','ADMIN_USERNAME','ADMIN_PASSWORD']){
+  if(!String(process.env[name]||'').trim())missing.push(name);
+ }
+ if(missing.length){
+  console.error(`[startup] Missing required environment variables: ${missing.join(', ')}`);
+  process.exit(1);
+ }
  try{
   await mongoose.connect(process.env.MONGO_URI||process.env.MONGODB_URI,{dbName:process.env.MONGODB_DB_NAME});
   console.log('MongoDB Atlas connected successfully');
