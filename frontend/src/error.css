@@ -1,0 +1,12 @@
+.app-error-page{min-height:100vh;display:grid;place-items:center;padding:24px;background:#eef2f7;color:#172033}
+.app-error-card{width:min(560px,100%);padding:24px;border:1px solid #dbe2ea;border-radius:16px;background:#fff;box-shadow:0 12px 32px rgba(15,23,42,.12)}
+.app-error-card h1{margin:0 0 12px;font-size:24px}
+.app-error-card pre{margin:0 0 18px;white-space:pre-wrap;overflow-wrap:anywhere;color:#475569;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+.app-error-actions{display:flex;gap:10px;flex-wrap:wrap}
+.route-loading{min-height:180px;display:flex;align-items:center;justify-content:center;gap:12px;color:#475569}
+.route-loading.full-screen{min-height:100vh}
+.loading-spinner{width:24px;height:24px;border:3px solid #cbd5e1;border-top-color:#4f46e5;border-radius:50%;animation:route-spin .8s linear infinite}
+@keyframes route-spin{to{transform:rotate(360deg)}}
+:root[data-theme=dark] .app-error-page{background:#111827;color:#e5e7eb}
+:root[data-theme=dark] .app-error-card{background:#1f2937;border-color:#374151}
+:root[data-theme=dark] .app-error-card pre,:root[data-theme=dark] .route-loading{color:#cbd5e1}

@@ -1,4 +1,4 @@
-import React,{createContext,useContext,useEffect,useRef,useState} from 'react';
+import React,{createContext,useCallback,useContext,useEffect,useRef,useState,Suspense} from 'react';
 import {BrowserRouter,Routes,Route,Navigate,useNavigate,useLocation} from 'react-router-dom';
 import {motion,AnimatePresence} from 'framer-motion';
 import {createPortal} from 'react-dom';
@@ -10,11 +10,56 @@ import './index.css';
 import './permissions.css';
 import './chat.css';
 import './gps.css';
+import './error.css';
 
 axios.defaults.baseURL='/api';axios.defaults.withCredentials=true;
 let refreshPromise=null;
+function requestUrl(config){
+ const base=String(config?.baseURL||'').replace(/\/+$/,'');
+ const path=String(config?.url||'').replace(/^\/+/,'');
+ return `${base}/${path}`;
+}
+function invalidUserResponse(response,endpoint){
+ const error=new Error(`Invalid ${endpoint} response (HTTP ${response.status}) from ${requestUrl(response.config)}`);
+ error.config=response.config;
+ error.response=response;
+ error.isApiResponseError=true;
+ error.requestContextAdded=true;
+ return error;
+}
+function addRequestContext(error){
+ const response=error?.response;
+ if(response){
+  const contentType=String(response.headers?.['content-type']||'').toLowerCase();
+  const data=response.data;
+  const structuredBody=data!==null&&(Array.isArray(data)||typeof data==='object');
+  const htmlResponse=contentType.includes('text/html')||
+   (typeof data==='string'&&/^\s*<(?:!doctype|html|head|body)\b/i.test(data));
+  if(htmlResponse||!structuredBody)error.isApiResponseError=true;
+ }
+ if(error?.config&&!error.requestContextAdded){
+  error.message=`${error.message} (HTTP ${error.response?.status??'network'} ${requestUrl(error.config)})`;
+  error.requestContextAdded=true;
+ }
+ return error;
+}
 axios.interceptors.response.use(
- response=>response,
+ response=>{
+  const contentType=String(response.headers?.['content-type']||'').toLowerCase();
+  const data=response.data;
+  const structuredBody=data!==null&&(Array.isArray(data)||typeof data==='object');
+  const htmlResponse=contentType.includes('text/html')||
+   (typeof data==='string'&&/^\s*<(?:!doctype|html|head|body)\b/i.test(data));
+  if(structuredBody&&!htmlResponse)return response;
+  const url=requestUrl(response.config);
+  const error=new Error(`Expected a JSON API response, received ${contentType||'an invalid body'} (HTTP ${response.status}) from ${url}`);
+  error.name='ApiResponseError';
+  error.config=response.config;
+  error.response=response;
+  error.isApiResponseError=true;
+  error.requestContextAdded=true;
+  return Promise.reject(error);
+ },
  async error=>{
   const request=error.config;
   if(error.response?.status===401&&request&&!request._authRetried&&!request.url?.startsWith('/auth/')){
@@ -24,11 +69,12 @@ axios.interceptors.response.use(
     await refreshPromise;
     refreshPromise=null;
     return axios(request);
-   }catch{
+   }catch(refreshError){
     refreshPromise=null;
+    if(refreshError.response?.status===401)window.dispatchEvent(new CustomEvent('auth-session-expired'));
    }
   }
-  return Promise.reject(error);
+  return Promise.reject(addRequestContext(error));
  }
 );
 const Auth=createContext(null);
@@ -45,6 +91,7 @@ const fmtIst=d=>{
 };
 const speedText=vehicle=>vehicle?.speed==null||vehicle.speed==='N/A'?'N/A':vehicle.provider==='FleetX'?String(vehicle.speed):`${vehicle.speed} km/h`;
 const showToast=(text,type='success')=>window.dispatchEvent(new CustomEvent('toast',{detail:{text,type}}));
+const isAdminUser=user=>Boolean(user?.isAdmin||String(user?.role||'').toLowerCase()==='admin');
 const PERMISSION_PAGES=[
  {key:'dashboard',label:'Dashboard'},
  {key:'vehicleRegistry',label:'Vehicle Registry'},
@@ -61,8 +108,8 @@ const createDefaultPermissions=()=>({
  users:{view:false,edit:false},
  sikkaAi:{view:false,edit:false}
 });
-const canView=(user,key)=>Boolean(user?.isAdmin||key==='dashboard'||user?.permissions?.[key]?.view===true);
-const canEdit=(user,key)=>key!=='sikkaAi'&&Boolean(user?.isAdmin||user?.permissions?.[key]?.edit===true);
+const canView=(user,key)=>Boolean(isAdminUser(user)||key==='dashboard'||user?.permissions?.[key]?.view===true);
+const canEdit=(user,key)=>key!=='sikkaAi'&&Boolean(isAdminUser(user)||user?.permissions?.[key]?.edit===true);
 const summarizePermissions=permissions=>PERMISSION_PAGES.map(({key,label})=>{
  const access=permissions?.[key]||{};
  const level=key==='sikkaAi'?(access.view?'View':'None'):access.edit?'Edit':access.view?'View':'None';
@@ -71,6 +118,40 @@ const summarizePermissions=permissions=>PERMISSION_PAGES.map(({key,label})=>{
 const modalStack=[];
 let savedBodyOverflow='';
 let savedRootOverflow='';
+
+function ErrorPage({title,details,onRetry}){
+ return <main className="app-error-page" role="alert">
+  <section className="app-error-card">
+   <h1>{title}</h1>
+   {details&&<pre>{details}</pre>}
+   <div className="app-error-actions">
+    {onRetry&&<button type="button" className="animated-btn blue" onClick={onRetry}>Retry</button>}
+    <button type="button" className="animated-btn red" onClick={()=>window.location.reload()}>Reload</button>
+   </div>
+  </section>
+ </main>
+}
+
+class ErrorBoundary extends React.Component{
+ constructor(props){super(props);this.state={error:null}}
+ static getDerivedStateFromError(error){return {error}}
+ componentDidCatch(error,errorInfo){console.error('Application render error',error,errorInfo)}
+ render(){
+  if(this.state.error)return <ErrorPage title="Something went wrong" details={this.state.error.message||String(this.state.error)}/>;
+  return this.props.children;
+ }
+}
+
+function RouteLoading({fullScreen=false}){
+ return <div className={`route-loading ${fullScreen?'full-screen':''}`} role="status" aria-live="polite">
+  <span className="loading-spinner"/><span>Loading…</span>
+ </div>
+}
+
+function RoutedPage({children}){
+ const location=useLocation();
+ return <ErrorBoundary key={location.pathname}><Suspense fallback={<RouteLoading/>}>{children}</Suspense></ErrorBoundary>
+}
 
 function AnimatedButton({children,variant='blue',loading=false,disabled=false,className='',onClick,type='button',...props}){
  return <motion.button whileHover={!disabled&&!loading?{y:-2}:{}} whileTap={!disabled&&!loading?{scale:.97}:{}} type={type} disabled={disabled||loading}
@@ -131,7 +212,7 @@ function Toasts(){
 
 function Login(){
  const {login}=useAuth();const [username,setUsername]=useState('');const [password,setPassword]=useState('');const [show,setShow]=useState(false);const [loading,setLoading]=useState(false);const [shake,setShake]=useState(false);
- const submit=async()=>{setLoading(true);try{await login(username,password)}catch(e){setShake(true);setTimeout(()=>setShake(false),500);showToast(e.response?.data?.error||'Login failed','error')}finally{setLoading(false)}};
+ const submit=async()=>{setLoading(true);try{await login(username,password)}catch(e){setShake(true);setTimeout(()=>setShake(false),500);showToast(e.response?.data?.error||(e.isApiResponseError||!e.response||e.response.status>=500?'Cannot reach server':'Login failed'),'error')}finally{setLoading(false)}};
  return <main className="login-page">
   <div className="login-orb orb-a"/><div className="login-orb orb-b"/>
   <motion.div className="login-brand" initial={{scale:.7,opacity:0}} animate={{scale:1,opacity:1}} transition={{duration:.7}}><motion.img src="/logo.png" alt="Sikka Fleet" animate={{filter:['drop-shadow(0 0 0 rgba(96,165,250,0)','drop-shadow(0 0 16px rgba(96,165,250,.8))','drop-shadow(0 0 0 rgba(96,165,250,0)']}} transition={{duration:2.5,repeat:Infinity}}/><h1>{'Welcome to Sikka Fleet'.split(' ').map((w,i)=><motion.span key={i} initial={{opacity:0,y:12}} animate={{opacity:1,y:0}} transition={{delay:.35+i*.12}}>{w}&nbsp;</motion.span>)}</h1></motion.div>
@@ -144,7 +225,7 @@ function Login(){
 }
 
 function Guard({permission,children}){
- const {user}=useAuth();if(!user)return null;return canView(user,permission)?children:<NoAccess/>
+const {user}=useAuth();if(!user)return <Navigate to="/login" replace/>;return canView(user,permission)?children:<NoAccess/>
 }
 function NoAccess(){return <div className="empty-state"><X size={44}/><h2>No access</h2><p>You do not have permission to view this page.</p></div>}
 
@@ -157,8 +238,15 @@ function Layout(){
   <aside className={`sidebar ${drawer?'open':''}`}><div className="brand"><img src="/logo.png"/><strong>SIKKA FLEET</strong><AnimatedButton variant="ghost" className="drawer-close" onClick={()=>setDrawer(false)}><X/></AnimatedButton></div>
    <nav>{links.map(([name,to,Icon,key])=>canView(user,key)&&<NavLink key={name} to={to} name={name} icon={Icon} onClick={()=>setDrawer(false)}/>)}</nav>
   </aside>
-  <div className="workspace"><header className="topbar"><AnimatedButton variant="ghost" className="hamburger" onClick={()=>setDrawer(true)}><Menu/></AnimatedButton><div className="top-actions"><AnimatedButton variant="ghost" onClick={()=>setDark(!dark)}>{dark?<Sun size={18}/>:<Moon size={18}/>}</AnimatedButton>{canView(user,'sikkaAi')&&<AnimatedButton variant="orange" onClick={()=>setAi(true)}><Bot size={18}/> Sikka AI</AnimatedButton>}<span className="user-name">{user.fullName}</span><AnimatedButton variant="red" onClick={logout}><LogOut size={18}/> Logout</AnimatedButton></div></header>
-   <main className="content"><AnimatePresence mode="wait"><motion.div key={useLocation().pathname} initial={{opacity:0,x:18}} animate={{opacity:1,x:0}} exit={{opacity:0,x:-18}} transition={{duration:.22}}><Routes><Route path="/dashboard" element={<Guard permission="dashboard"><Dashboard/></Guard>}/><Route path="/vehicles" element={<Guard permission="vehicleRegistry"><Vehicles/></Guard>}/><Route path="/plants" element={<Guard permission="plant"><Plants/></Guard>}/><Route path="/gps" element={<Guard permission="gpsTrack"><Gps/></Guard>}/><Route path="/users" element={<Guard permission="users"><UsersPage/></Guard>}/><Route path="*" element={<Navigate to="/dashboard"/>}/></Routes></motion.div></AnimatePresence></main>
+  <div className="workspace"><header className="topbar"><AnimatedButton variant="ghost" className="hamburger" onClick={()=>setDrawer(true)}><Menu/></AnimatedButton><div className="top-actions"><AnimatedButton variant="ghost" onClick={()=>setDark(!dark)}>{dark?<Sun size={18}/>:<Moon size={18}/>}</AnimatedButton>{canView(user,'sikkaAi')&&<AnimatedButton variant="orange" onClick={()=>setAi(true)}><Bot size={18}/> Sikka AI</AnimatedButton>}<span className="user-name">{user?.fullName||user?.username||'User'}</span><AnimatedButton variant="red" onClick={logout}><LogOut size={18}/> Logout</AnimatedButton></div></header>
+   <main className="content"><AnimatePresence mode="wait"><motion.div key={useLocation().pathname} initial={{opacity:0,x:18}} animate={{opacity:1,x:0}} exit={{opacity:0,x:-18}} transition={{duration:.22}}><Routes>
+    <Route path="/dashboard" element={<RoutedPage><Guard permission="dashboard"><Dashboard/></Guard></RoutedPage>}/>
+    <Route path="/vehicles" element={<RoutedPage><Guard permission="vehicleRegistry"><Vehicles/></Guard></RoutedPage>}/>
+    <Route path="/plants" element={<RoutedPage><Guard permission="plant"><Plants/></Guard></RoutedPage>}/>
+    <Route path="/gps" element={<RoutedPage><Guard permission="gpsTrack"><Gps/></Guard></RoutedPage>}/>
+    <Route path="/users" element={<RoutedPage><Guard permission="users"><UsersPage/></Guard></RoutedPage>}/>
+    <Route path="*" element={<Navigate to="/dashboard" replace/>}/>
+   </Routes></motion.div></AnimatePresence></main>
   </div>
   {canView(user,'sikkaAi')&&<motion.button whileHover={{scale:1.06}} whileTap={{scale:.94}} className="ai-fab" onClick={()=>setAi(true)}><Bot/> Sikka AI</motion.button>}
   <AIChat open={ai} onClose={()=>setAi(false)}/>
@@ -166,11 +254,22 @@ function Layout(){
 }
 function NavLink({to,name,icon:Icon,onClick}){const loc=useLocation();const navigate=useNavigate();const active=loc.pathname===to||loc.pathname.startsWith(to+'/');return <button className={`nav-link ${active?'active':''}`} onClick={()=>{navigate(to);onClick?.()}}><Icon size={19}/><span>{name}</span></button>}
 
+function objectRows(value){return Array.isArray(value)?value.filter(item=>item&&typeof item==='object'&&!Array.isArray(item)):[]}
+function dashboardData(value){
+ const response=value&&typeof value==='object'&&!Array.isArray(value)?value:{};
+ const transit=response.transit&&typeof response.transit==='object'&&!Array.isArray(response.transit)?response.transit:{};
+ const count=value=>{const number=Number(value);return Number.isFinite(number)&&number>=0?number:0};
+ return {
+  ...response,
+  plants:objectRows(response.plants).map(plant=>({...plant,count:count(plant.count),rows:objectRows(plant.rows)})),
+  transit:{...transit,count:count(transit.count),rows:objectRows(transit.rows)}
+ };
+}
 function Dashboard(){
  const {user}=useAuth();
  const canManage=canEdit(user,'dashboard');
- const [data,setData]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);
- const load=async()=>{try{const r=await axios.get('/dashboard');setData(r.data)}catch(e){showToast(e.response?.data?.error||'Failed to load dashboard','error')}};
+ const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);
+ const load=async()=>{try{const r=await axios.get('/dashboard');setData(dashboardData(r.data));setLoadError(null)}catch(error){setData(null);setLoadError(error);showToast('Cannot reach server','error')}};
  useEffect(()=>{load()},[]);
  useEffect(()=>{const refresh=()=>load();window.addEventListener('gps-sync-complete',refresh);return()=>window.removeEventListener('gps-sync-complete',refresh)},[]);
  useEffect(()=>{if(!data?.nextSyncAt)return;const tick=()=>{const sec=Math.max(0,Math.floor((new Date(data.nextSyncAt)-new Date())/1000));setCountdown(`${String(Math.floor(sec/60)).padStart(2,'0')}:${String(sec%60).padStart(2,'0')}`)};tick();const i=setInterval(tick,1000);return()=>clearInterval(i)},[data?.nextSyncAt]);
@@ -189,6 +288,7 @@ function Dashboard(){
   }
  };
  const savePlan=async()=>{if(planSaving)return;setPlanSaving(true);try{await axios.post('/plans',{vehicle:planModal.vehicleNumber,plant:plantModal?.plant?._id,planType:plan.planType,remarks:plan.remarks,expectedDeparture:plan.expectedDeparture||undefined});showToast('Plan saved');setPlanModal(null);setPlan({planType:'Loading',remarks:'',expectedDeparture:''})}catch(e){showToast(e.response?.data?.error||'Failed to save plan','error')}finally{setPlanSaving(false)}};
+ if(loadError)return <ErrorPage title="Cannot reach server" details={loadError.message} onRetry={load}/>
  if(!data)return <Skeleton/>
  return <>
  <div className="page-head"><div><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} onClick={sync}><RefreshCw size={18}/> Sync Now</AnimatedButton>}<div className="clock"><b>Next sync</b><span>{countdown}</span></div><div className="clock"><b>Last Sync</b><span>{fmt(data.lastSync)}</span></div></div></div>
@@ -200,7 +300,7 @@ function Dashboard(){
  </>
 }
 function Count({value}){const [n,setN]=useState(0);useEffect(()=>{let cur=0;const step=Math.max(1,Math.ceil(value/20));const i=setInterval(()=>{cur=Math.min(value,cur+step);setN(cur);if(cur>=value)clearInterval(i)},25);return()=>clearInterval(i)},[value]);return <b>{n}</b>}
-function PlantPopup({plant,onPlan,canPlan}){const [search,setSearch]=useState('');if(!plant)return null;const rows=plant.rows.filter(r=>r.vehicleNumber.includes(search.toUpperCase())).sort((a,b)=>a.vehicleNumber.localeCompare(b.vehicleNumber));return <>{<div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div>}<Table headers={['Vehicle Number','Entry Time','Stay Hours','Current Location','Speed','IGN','GPS time','GPS data','Latest Plan',...(canPlan?['']:[])]} rows={rows.map(r=>[r.vehicleNumber,fmt(r.entryTime),`${r.stayHours} h ${r.stayMinutes} m`,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.gpsTime),r.hasGps?(r.stale?'Stale':'Live'):'No data',<PlanName vehicle={r.vehicleNumber}/>,...(canPlan?[<AnimatedButton variant="orange" onClick={()=>onPlan(r)}>Plan</AnimatedButton>]:[])])}/></>}
+function PlantPopup({plant,onPlan,canPlan}){const [search,setSearch]=useState('');if(!plant)return null;const rows=objectRows(plant.rows).filter(r=>String(r.vehicleNumber||'').includes(search.toUpperCase())).sort((a,b)=>String(a.vehicleNumber||'').localeCompare(String(b.vehicleNumber||'')));return <>{<div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div>}<Table headers={['Vehicle Number','Entry Time','Stay Hours','Current Location','Speed','IGN','GPS time','GPS data','Latest Plan',...(canPlan?['']:[])]} rows={rows.map(r=>[r.vehicleNumber||'N/A',fmt(r.entryTime),`${r.stayHours||0} h ${r.stayMinutes||0} m`,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.gpsTime),r.hasGps?(r.stale?'Stale':'Live'):'No data',<PlanName vehicle={r.vehicleNumber||''}/>,...(canPlan?[<AnimatedButton variant="orange" onClick={()=>onPlan(r)}>Plan</AnimatedButton>]:[])])}/></>}
 function PlanName({vehicle}){const [x,setX]=useState('');useEffect(()=>{axios.get('/plans/'+vehicle).then(r=>setX(r.data[0]?.planType||'-')).catch(()=>setX('-'))},[vehicle]);return <>{x||'...'}</>}
 function Table({headers,rows}){return <div className="table-wrap"><table><thead><tr>{headers.map((h,i)=><th key={i}>{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=><motion.tr key={i} initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} transition={{delay:i*.025}}>{r.map((c,j)=><td key={j}>{c}</td>)}</motion.tr>)}</tbody></table>{!rows.length&&<div className="no-rows">No data found</div>}</div>}
 function LocationText({location,current=true}){
@@ -1067,36 +1167,64 @@ function ChatMessage({message,onAskAgain,onLoadMoreHistory,loadingMoreHistory=fa
 }
 
 function AppRoutes(){
- const {user}=useAuth();
- if(!user)return <Login/>;
- return <BrowserRouter><Layout/></BrowserRouter>;
+ const {user,authLoading,authError,retryAuth}=useAuth();
+ const location=useLocation();
+ if(authLoading)return <RouteLoading fullScreen/>;
+ if(authError)return <ErrorPage title="Cannot reach server" details={authError.message} onRetry={retryAuth}/>;
+ if(!user)return location.pathname==='/login'?<Login/>:<Navigate to="/login" replace state={{from:location}}/>;
+ if(location.pathname==='/login')return <Navigate to="/dashboard" replace/>;
+ return <Layout/>;
 }
 
 function AuthProvider({children}){
- const [user,setUser]=useState(undefined);
+ const [user,setUser]=useState(null);
+ const [authLoading,setAuthLoading]=useState(true);
+ const [authError,setAuthError]=useState(null);
  const [deferred,setDeferred]=useState(null);
  const [offlineInstall,setOfflineInstall]=useState(false);
+ const restore=useCallback(async()=>{
+  setAuthLoading(true);
+  setAuthError(null);
+  try{
+   let response;
+   try{response=await axios.get('/auth/me')}
+   catch(error){
+    if(error.response?.status!==401)throw error;
+    await axios.post('/auth/refresh');
+    response=await axios.get('/auth/me');
+   }
+   const restoredUser=response.data?.user;
+   if(!restoredUser||typeof restoredUser!=='object'||Array.isArray(restoredUser))throw invalidUserResponse(response,'session');
+   setUser(restoredUser);
+  }catch(error){
+   setUser(null);
+   setAuthError(error.response?.status===401?null:error);
+  }finally{setAuthLoading(false)}
+ },[]);
  useEffect(()=>{
-   const restore=async()=>{
-    try{const r=await axios.get('/auth/me');setUser(r.data.user)}
-    catch{
-     try{await axios.post('/auth/refresh');const r=await axios.get('/auth/me');setUser(r.data.user)}
-     catch{setUser(null)}
-    }
-   };
-   restore();
+  const sessionExpired=()=>{setUser(null);setAuthError(null);setAuthLoading(false)};
+  window.addEventListener('auth-session-expired',sessionExpired);
   const prompt=e=>{e.preventDefault();setDeferred(e);setOfflineInstall(true)};
   window.addEventListener('beforeinstallprompt',prompt);
-   return()=>{window.removeEventListener('beforeinstallprompt',prompt)};
- },[]);
- const login=async(username,password)=>{const r=await axios.post('/auth/login',{username,password});setUser(r.data.user)};
+  restore();
+  return()=>{
+   window.removeEventListener('auth-session-expired',sessionExpired);
+   window.removeEventListener('beforeinstallprompt',prompt);
+  };
+ },[restore]);
+ const login=async(username,password)=>{
+  const response=await axios.post('/auth/login',{username,password});
+  const loggedInUser=response.data?.user;
+  if(!loggedInUser||typeof loggedInUser!=='object'||Array.isArray(loggedInUser))throw invalidUserResponse(response,'login');
+  setAuthError(null);
+  setUser(loggedInUser);
+ };
  const logout=async()=>{try{await axios.post('/auth/logout')}finally{setUser(null)}};
- if(user===undefined)return <Skeleton/>;
- return <Auth.Provider value={{user,login,logout}}>{children}
+ return <Auth.Provider value={{user,login,logout,authLoading,authError,retryAuth:restore}}>{children}
   {offlineInstall&&<div className="install-banner"><b>Install Sikka Fleet</b><AnimatedButton variant="blue" onClick={async()=>{if(deferred){await deferred.prompt();setDeferred(null);setOfflineInstall(false)}else showToast('Use Share > Add to Home Screen on iPhone')}}>Install App</AnimatedButton></div>}
  </Auth.Provider>;
 }
 
 export default function App(){
- return <><AuthProvider><AppRoutes/></AuthProvider><Toasts/></>
+ return <ErrorBoundary><BrowserRouter><AuthProvider><AppRoutes/><Toasts/></AuthProvider></BrowserRouter></ErrorBoundary>
 }

@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: sikka-fleet-backend
+    runtime: node
+    plan: 0.5c-512mb
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        sync: false
+      - key: NODE_ENV
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: WHEELSEYE_API_URL
+        sync: false
+      - key: WHEELSEYE_API_TOKEN
+        sync: false
+      - key: FLEETX_LOGIN_URL
+        sync: false
+      - key: FLEETX_API_URL
+        sync: false
+      - key: FLEETX_LIVE_BY_NUMBER_URL
+        sync: false
+      - key: FLEETX_GRANT_TYPE
+        sync: false
+      - key: FLEETX_USERNAME
+        sync: false
+      - key: FLEETX_PASSWORD
+        sync: false
+      - key: FLEETX_BASIC_AUTH
+        sync: false
+      - key: NOMINATIM_USER_AGENT
+        sync: false

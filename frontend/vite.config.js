@@ -24,7 +24,13 @@ export default defineConfig({
           {src:'/pwa-maskable-512.png',sizes:'512x512',type:'image/png',purpose:'maskable'}
         ]
       },
-      workbox:{navigateFallback:'/',navigateFallbackDenylist:[/^\/api\//]}
+      workbox:{
+        navigateFallback:'/',
+        navigateFallbackDenylist:[/^\/(?:api|uploads|share)(?:\/|$)/],
+        runtimeCaching:[
+          {urlPattern:/\/(?:api|uploads|share)(?:\/|$)/,handler:'NetworkOnly'}
+        ]
+      }
     })
   ],
   server:{
