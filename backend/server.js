@@ -29,9 +29,28 @@ const {
 const app=express();
 app.set('trust proxy',1);
 app.use(helmet({crossOriginResourcePolicy:false}));
-app.use(cors({origin:['https://fleet.sikkaind.com','http://localhost:5173'],credentials:true}));
+
+const allowedOrigins=[
+ 'https://fleet.sikkaind.com',
+ 'https://sikka-fleet.vercel.app',
+ 'http://localhost:5173',
+ 'http://localhost:5000',
+ ...(process.env.ALLOWED_ORIGINS?process.env.ALLOWED_ORIGINS.split(',').map(s=>s.trim()).filter(Boolean):[])
+];
+app.use(cors({
+ origin:(origin,callback)=>{
+  if(!origin)return callback(null,true);
+  if(allowedOrigins.includes(origin)||/^https:\/\/sikka-fleet.*\.vercel\.app$/.test(origin)){
+   return callback(null,true);
+  }
+  return callback(null,false);
+ },
+ credentials:true
+}));
+
 app.use(express.json({limit:'1mb'}));
 app.use(cookieParser());
+app.get('/',(_req,res)=>res.json({ok:true,service:'Sikka Fleet API'}));
 app.get('/api/health',(_req,res)=>res.json({ok:true}));
 app.use('/uploads',express.static(path.join(__dirname,'uploads')));
 
@@ -54,10 +73,13 @@ const ADMIN_USERNAME=String(process.env.ADMIN_USERNAME||'').trim().toLowerCase()
 function isAdminAccount(user){return Boolean(user?.isAdmin||user?.username?.toLowerCase()===ADMIN_USERNAME);}
 function signAccess(user,sessionId){const isAdmin=isAdminAccount(user);return jwt.sign({sub:user._id,perms:normalizePermissions(user.permissions,isAdmin),isAdmin,sid:sessionId},process.env.JWT_SECRET,{expiresIn:'15m'});}
 function signRefresh(user,sessionId){return jwt.sign({sub:user._id,tokenVersion:1,sid:sessionId},process.env.JWT_SECRET,{expiresIn:'30d'});}
-function cookieOpts(){return {httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'strict',path:'/'};}
+function cookieOpts(){return {httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:process.env.NODE_ENV==='production'?'none':'lax',path:'/'};}
 async function audit(action,user,details={},req){await M.AuditLog.create({action,user,details,ip:req?.ip}).catch(()=>{});}
 function auth(req,res,next){
- const token=req.cookies.accessToken;if(!token)return res.status(401).json({error:'Unauthorized'});
+ const authHeader=req.headers.authorization;
+ const bearerToken=authHeader&&authHeader.startsWith('Bearer ')?authHeader.slice(7).trim():null;
+ const token=req.cookies.accessToken||bearerToken;
+ if(!token)return res.status(401).json({error:'Unauthorized'});
  try{
   const claims=jwt.verify(token,process.env.JWT_SECRET);
   Promise.all([
@@ -123,16 +145,51 @@ function getProviderVehicleId(vehicle,provider){
 }
 
 async function seedAdmin(){
- const username=process.env.ADMIN_USERNAME.trim().toLowerCase();
+ const adminUser=String(process.env.ADMIN_USERNAME||'').trim();
+ if(!adminUser||!process.env.ADMIN_PASSWORD)return;
+ const username=adminUser.toLowerCase();
  const existing=await M.User.findOne({username});
  if(!existing){
-  await M.User.create({fullName:'Administrator',username:process.env.ADMIN_USERNAME,passwordHash:await bcrypt.hash(process.env.ADMIN_PASSWORD,12),isAdmin:true,active:true,permissions:normalizePermissions({},true)});
+  await M.User.create({fullName:'Administrator',username:adminUser,passwordHash:await bcrypt.hash(process.env.ADMIN_PASSWORD,12),isAdmin:true,active:true,permissions:normalizePermissions({},true)});
  }else{
   existing.isAdmin=true;existing.active=true;
   existing.permissions=normalizePermissions({},true);
   await existing.save();
  }
 }
+
+let initPromise=null;
+async function ensureInitialized(){
+ if(mongoose.connection.readyState>=1)return;
+ if(!initPromise){
+  initPromise=(async()=>{
+   const mongoUri=process.env.MONGO_URI||process.env.MONGODB_URI;
+   if(!mongoUri){
+    console.warn('[DB] Warning: MONGO_URI or MONGODB_URI is not set');
+    return;
+   }
+   await mongoose.connect(mongoUri,{dbName:process.env.MONGODB_DB_NAME});
+   console.log('MongoDB Atlas connected successfully');
+   await M.SikkaAiChat.createIndexes().catch(()=>{});
+   await M.GpsSyncLock.createIndexes().catch(()=>{});
+   await seedGpsSettings().catch(()=>{});
+   await seedAdmin().catch(()=>{});
+  })().catch(err=>{
+   initPromise=null;
+   throw err;
+  });
+ }
+ return initPromise;
+}
+
+app.use(async(req,_res,next)=>{
+ try{
+  await ensureInitialized();
+ }catch(err){
+  console.error('[DB init error]',err.message);
+ }
+ next();
+});
 
 function flattenProvider(payload,provider){
  const findRows=(value,depth=0)=>{
@@ -1121,13 +1178,15 @@ app.get('/api/ai/admin/chats',auth,permission('Sikka AI','view'),requireAdmin,as
  res.json({items,total,page,limit,pages:Math.ceil(total/limit),usernames:usernames.sort((a,b)=>a.localeCompare(b))});
 });
 
-cron.schedule('0 0 * * *',async()=>{
- try{
-  const result=await M.SikkaAiChat.deleteMany({expireAt:{$lte:new Date()}});
-  if(result.deletedCount)console.info(`Sikka AI daily cleanup removed ${result.deletedCount} expired chat(s).`);
- }catch(error){console.error('Sikka AI daily chat cleanup failed:',error)}
-},{timezone:'Asia/Kolkata'});
-cron.schedule('0 2 * * *',()=>historyRetention.cleanupHistory(M),{timezone:'Asia/Kolkata'});
+function startDailyJobs(){
+ cron.schedule('0 0 * * *',async()=>{
+  try{
+   const result=await M.SikkaAiChat.deleteMany({expireAt:{$lte:new Date()}});
+   if(result.deletedCount)console.info(`Sikka AI daily cleanup removed ${result.deletedCount} expired chat(s).`);
+  }catch(error){console.error('Sikka AI daily chat cleanup failed:',error)}
+ },{timezone:'Asia/Kolkata'});
+ cron.schedule('0 2 * * *',()=>historyRetention.cleanupHistory(M),{timezone:'Asia/Kolkata'});
+}
 
 app.use('/api',(req,res)=>res.status(404).json({error:'API endpoint not found'}));
 app.use('/api',(error,req,res,next)=>{
@@ -1176,21 +1235,24 @@ async function start(){
   if(!String(process.env[name]||'').trim())missing.push(name);
  }
  if(missing.length){
-  console.error(`[startup] Missing required environment variables: ${missing.join(', ')}`);
-  process.exit(1);
+  console.warn(`[startup] Missing environment variables: ${missing.join(', ')}`);
  }
  try{
-  await mongoose.connect(process.env.MONGO_URI||process.env.MONGODB_URI,{dbName:process.env.MONGODB_DB_NAME});
-  console.log('MongoDB Atlas connected successfully');
-  await M.SikkaAiChat.createIndexes();
-  await M.GpsSyncLock.createIndexes();
-  await seedGpsSettings();
-  await seedAdmin();
+  await ensureInitialized();
+  startDailyJobs();
   startGpsSyncScheduler();
   const dist=path.join(__dirname,'../frontend/dist');
-  if(process.env.NODE_ENV==='production'&&fs.existsSync(dist)){app.use(express.static(dist));app.use((req,res,next)=>{if(req.method==='GET'&&!req.path.startsWith('/api/')&&!req.path.startsWith('/share/'))return res.sendFile(path.join(dist,'index.html'));return next();});}
+  if(process.env.NODE_ENV==='production'&&fs.existsSync(dist)){
+   app.use(express.static(dist));
+   app.use((req,res,next)=>{if(req.method==='GET'&&!req.path.startsWith('/api/')&&!req.path.startsWith('/share/'))return res.sendFile(path.join(dist,'index.html'));return next();});
+  }
   const port=Number(process.env.PORT)||5000;
   app.listen(port,'0.0.0.0',()=>console.log(`SIKKA FLEET API running on 0.0.0.0:${port}`));
- }catch(e){console.error('Failed to start:',e.message);process.exit(1);}
+ }catch(e){console.error('Failed to start:',e.message);}
 }
-start();
+
+if(require.main===module){
+ start();
+}
+
+module.exports=app;

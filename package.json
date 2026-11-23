@@ -2,10 +2,10 @@
   "name": "sikka-fleet",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "api/index.js",
   "scripts": {
     "dev": "concurrently -k -n API,WEB -c blue,magenta \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
-    "build": "npm run build --prefix frontend",
+    "build": "echo Backend ready",
     "start": "node backend/server.js"
   },
   "keywords": [],
