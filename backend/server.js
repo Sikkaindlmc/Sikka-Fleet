@@ -20,7 +20,9 @@ const reverseGeocoding=require('./services/reverseGeocodingService');
 const wheelseyeService=require('./services/wheelseyeService');
 const fleetSnapshotService=require('./services/fleetSnapshotService');
 const sikkaAiService=require('./services/sikkaAiService');
+const {aiChatRequestValidators,getAiChatValidationError}=require('./services/aiChatValidation');
 const historyRetention=require('./jobs/historyRetention');
+const {backfillPlanActors}=require('./services/planActorBackfill');
 const {
  GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,getNextAutoSyncAt
 }=require('./services/gpsSyncSchedule');
@@ -175,6 +177,12 @@ async function ensureInitialized(){
    await M.GpsSyncLock.createIndexes().catch(()=>{});
    await seedGpsSettings().catch(()=>{});
    await seedAdmin().catch(()=>{});
+   try{
+    const updatedPlans=await backfillPlanActors(M);
+    if(updatedPlans)console.info(`[plans] Backfilled creator/updater details for ${updatedPlans} plan(s)`);
+   }catch(error){
+    console.error('[plans] Creator/updater backfill failed',error);
+   }
   })().catch(err=>{
    initPromise=null;
    throw err;
@@ -908,8 +916,51 @@ app.get('/api/history/:vehicle',auth,permission('GPS Track','view'),async(req,re
  res.json(rows.map(r=>({...r,location:readableAddress(r)})));
 });
 
-app.post('/api/plans',auth,permission('Dashboard','edit'),[body('vehicle').trim().notEmpty(),body('planType').isIn(['Loading','Unloading','Maintenance','Waiting','Other']),body('expectedDeparture').optional({checkFalsy:true}).isISO8601()],async(req,res)=>{if(!validationResult(req).isEmpty())return res.status(400).json({error:'Invalid plan'});const plan=await M.VehiclePlan.create(req.body);await audit('create_plan',req.user.sub,{vehicle:plan.vehicle},req);res.status(201).json(plan)});
-app.get('/api/plans/:vehicle',auth,permission('Dashboard','view'),async(req,res)=>res.json(await M.VehiclePlan.find({vehicle:normalizeNumber(req.params.vehicle)}).sort({createdAt:-1}).limit(20)));
+app.post('/api/plans',auth,permission('Dashboard','edit'),[body('vehicle').trim().notEmpty(),body('planType').isIn(['Loading','Unloading','Maintenance','Waiting','Other']),body('expectedDeparture').optional({checkFalsy:true}).isISO8601()],async(req,res)=>{if(!validationResult(req).isEmpty())return res.status(400).json({error:'Invalid plan'});const plan=await M.VehiclePlan.create({vehicle:req.body.vehicle,plant:req.body.plant,planType:req.body.planType,remarks:req.body.remarks,expectedDeparture:req.body.expectedDeparture,createdBy:req.user.sub,createdByUserId:req.user.sub,createdByName:req.user.fullName});await audit('create_plan',req.user.sub,{vehicle:plan.vehicle,plant:plan.plant},req);res.status(201).json(plan)});
+app.put('/api/plans/:id',auth,permission('Dashboard','edit'),[
+ body('planType').optional().isIn(['Loading','Unloading','Maintenance','Waiting','Other']),
+ body('remarks').optional({nullable:true}).isString(),
+ body('expectedDeparture').optional({checkFalsy:true}).isISO8601()
+],async(req,res)=>{
+ if(!mongoose.Types.ObjectId.isValid(req.params.id))return res.status(404).json({error:'Plan not found'});
+ if(!validationResult(req).isEmpty())return res.status(400).json({error:'Invalid plan'});
+ const updates={};
+ for(const key of ['planType','remarks','expectedDeparture']){
+  if(Object.prototype.hasOwnProperty.call(req.body,key))updates[key]=req.body[key];
+ }
+ if(!Object.keys(updates).length)return res.status(400).json({error:'No plan changes provided'});
+ updates.updatedByUserId=req.user.sub;
+ updates.updatedByName=req.user.fullName;
+ const plan=await M.VehiclePlan.findByIdAndUpdate(req.params.id,{$set:updates},{new:true,runValidators:true});
+ if(!plan)return res.status(404).json({error:'Plan not found'});
+ await audit('edit_plan',req.user.sub,{vehicle:plan.vehicle,plant:plan.plant},req);
+ res.json(plan);
+});
+app.get('/api/plans/:vehicle',auth,permission('Dashboard','view'),async(req,res)=>{
+ const filter={vehicle:normalizeNumber(req.params.vehicle)};
+ if(req.query.plant){
+  if(!mongoose.Types.ObjectId.isValid(req.query.plant))return res.status(400).json({error:'Invalid plant'});
+  filter.plant=req.query.plant;
+ }
+ const plans=await M.VehiclePlan.find(filter).sort({updatedAt:-1,createdAt:-1,_id:-1}).limit(20).lean();
+ const profileIds=[...new Set(plans.flatMap(plan=>[
+  plan.createdByUserId,plan.createdBy,plan.updatedByUserId
+ ]).map(id=>String(id||'')).filter(id=>mongoose.Types.ObjectId.isValid(id)))];
+ const profiles=profileIds.length?await M.User.find({_id:{$in:profileIds}}).select('_id fullName').lean():[];
+ const profileNames=new Map(profiles.map(profile=>[String(profile._id),profile.fullName]));
+ res.json(plans.map(plan=>{
+  const creatorId=String(plan.createdByUserId||plan.createdBy||'');
+  const updaterId=String(plan.updatedByUserId||'');
+  const createdByName=plan.createdByName||profileNames.get(creatorId)||null;
+  const updatedByName=plan.updatedByName||profileNames.get(updaterId)||null;
+  const hasBeenUpdated=Boolean(plan.updatedByUserId||plan.updatedByName)||
+   new Date(plan.updatedAt||0).getTime()>new Date(plan.createdAt||0).getTime();
+  return {
+   ...plan,createdByName,updatedByName,
+   createdByDisplayName:hasBeenUpdated?updatedByName:createdByName
+  };
+ }));
+});
 
 app.get('/api/users',auth,permission('Users','view'),async(req,res)=>{
  const users=await M.User.find().sort({fullName:1}).select('-passwordHash');
@@ -1002,12 +1053,12 @@ app.get('/share/:token',async(req,res)=>{const l=await M.ShareLink.findOne({toke
 
 function escapeRegex(value){return value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
 app.post('/api/ai/chat',auth,permission('Sikka AI','view'),aiChatLimiter,
- body('message').isString(),
- body('sessionId').optional().isString().trim().isLength({min:1,max:100}),
+ ...aiChatRequestValidators,
  async(req,res)=>{
-  if(!validationResult(req).isEmpty())return res.status(400).json({error:'Question must be text.'});
+  const validationError=getAiChatValidationError(req);
+  if(validationError)return res.status(400).json({error:validationError});
   const question=sikkaAiService.cleanChatQuestion(req.body.message);
-  if(!question)return res.status(400).json({error:'Sawal khaali nahi ho sakta.'});
+  if(!question.trim())return res.status(400).json({error:'Sawal khaali nahi ho sakta.'});
   const containsSensitiveInput=sikkaAiService.containsSensitiveInput(question);
   const savedQuestion=containsSensitiveInput?'[Sensitive content omitted]':question;
   const sessionId=String(req.body.sessionId||'').trim()||crypto.randomUUID();
@@ -1109,23 +1160,39 @@ app.get('/api/ai/history',auth,permission('Sikka AI','view'),async(req,res)=>{
 
 app.get('/api/ai/history/records',auth,permission('Sikka AI','view'),permission('GPS Track','view'),aiReadLimiter,async(req,res)=>{
  const vehicleNumber=normalizeNumber(req.query.vehicleNumber);
+ const allVehicles=req.query.allVehicles==='true';
  const from=new Date(String(req.query.from||''));
  const to=new Date(String(req.query.to||''));
  const now=new Date();
  const offset=Number(req.query.offset??0);
  const limit=Math.max(1,Math.min(20,Number(req.query.limit)||20));
- if(vehicleNumber.length<7||!Number.isFinite(from.getTime())||!Number.isFinite(to.getTime())||
-  !Number.isInteger(offset)||offset<0||offset>50000||from>to||to>now){
-  return res.status(400).json({error:'Invalid or future history range'});
+ if((!allVehicles&&vehicleNumber.length<7)||!Number.isFinite(from.getTime())||!Number.isFinite(to.getTime())||
+  !Number.isInteger(offset)||offset<0||offset>50000||from>to){
+  return res.status(400).json({error:'Invalid history range'});
  }
- const matcher=vehicleNumberRegex(vehicleNumber);
- if(!await M.Vehicle.exists({vehicleNumber:matcher,status:'Active'})){
-  return res.status(404).json({error:'Vehicle number was not found in the active registry.'});
- }
- const filter={$or:[{vehicleNumber:matcher},{vehicle:matcher}],gpsTime:{$gte:from,$lte:to}};
+ if(to>now)return res.status(400).json({error:sikkaAiService.FUTURE_HISTORY_REPLY});
  const cutoff=sikkaAiService.getHistoryCutoff(now);
  if(from<cutoff)return res.status(400).json({error:sikkaAiService.HISTORY_LIMIT_REPLY});
- filter.gpsTime.$gte=new Date(Math.max(from.getTime(),cutoff.getTime()));
+ let filter;
+ if(allVehicles){
+  const registered=await M.Vehicle.find({status:'Active'})
+   .select('vehicleNumber gpsLink gpsProviders').lean();
+  const vehicleNumbers=[...new Set(registered
+   .filter(sikkaAiService.hasGpsConfiguration)
+   .map(vehicle=>normalizeNumber(vehicle.vehicleNumber))
+   .filter(Boolean))];
+  if(!vehicleNumbers.length)return res.json({rows:[],total:0,offset,limit});
+  filter={
+   $or:[{vehicleNumber:{$in:vehicleNumbers}},{vehicle:{$in:vehicleNumbers}}],
+   gpsTime:{$gte:from,$lte:to}
+  };
+ }else{
+  const matcher=vehicleNumberRegex(vehicleNumber);
+  if(!await M.Vehicle.exists({vehicleNumber:matcher,status:'Active'})){
+   return res.status(404).json({error:'Vehicle number was not found in the active registry.'});
+  }
+  filter={$or:[{vehicleNumber:matcher},{vehicle:matcher}],gpsTime:{$gte:from,$lte:to}};
+ }
  const [records,total]=await Promise.all([
   M.VehicleLocationHistory.find(filter).sort({gpsTime:1}).skip(offset).limit(limit).lean(),
   M.VehicleLocationHistory.countDocuments(filter)

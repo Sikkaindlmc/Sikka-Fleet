@@ -3,14 +3,19 @@ const fleetSnapshotService=require('./fleetSnapshotService');
 const {
  normalizeVehicleNumber,groupByVehicleNumber,vehicleNumberRegex
 }=require('./vehicleIdentity');
+const {GPS_SYNC_INTERVAL_MS}=require('./gpsSyncSchedule');
 
 const DAY_MS=24*60*60*1000;
 const CHAT_TTL_MS=7*DAY_MS;
 const HISTORY_ACCESS_DAYS=45;
-const HISTORY_LIMIT_REPLY='Sorry, Sikka AI can access historical vehicle and plant records for the last 45 days only.';
+const HISTORY_LIMIT_REPLY='Requested date is outside the permitted 45-day GPS history period.';
+const FUTURE_HISTORY_REPLY='Future GPS history is not available. Sikka AI can only provide current GPS information and actual historical records from the last 45 days.';
 const TIME_ZONE='Asia/Kolkata';
+const GPS_PROVIDER='Wheelseye';
 const UNKNOWN_REPLY='I could not match that question to available fleet records.';
 const SENSITIVE_INPUT=/\b(password|passwd|passcode|secret|api[\s_-]?key|token|authorization|bearer|jwt)\b/i;
+const MONTHS=['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+const MONTH_PATTERN='january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec';
 const HINDI_WORDS=[
  [/गाड़ियों|गाड़ियां|गाड़ियाँ|गाड़ी|गाड़ी|गाड़ियां/gu,' gaadi '],
  [/वाहनों|वाहन/gu,' vehicle '],
@@ -126,6 +131,24 @@ function parseDateRequest(text,now=new Date()){
   const parsed=parseDateValue(match);
   if(parsed&&!explicit.some(item=>item.start.getTime()===parsed.start.getTime()))explicit.push(parsed);
  }
+ const {year:currentYear}=istParts(now);
+ const monthNumber=value=>{
+  const month=value.toLowerCase().slice(0,3);
+  return month==='sep'?9:MONTHS.indexOf(month)+1;
+ };
+ const addMonthDate=(dayValue,monthValue,yearValue)=>{
+  const year=Number(yearValue)||currentYear;
+  const month=monthNumber(monthValue);
+  const day=Number(dayValue);
+  const start=fromIstParts(year,month,day);
+  if(start&&!explicit.some(item=>item.start.getTime()===start.getTime()))explicit.push({year,month,day,start});
+ };
+ for(const match of text.matchAll(new RegExp(`\\b(\\d{1,2})\\s+(${MONTH_PATTERN})(?:\\s+(\\d{4}))?\\b`,'gi'))){
+  addMonthDate(match[1],match[2],match[3]);
+ }
+ for(const match of text.matchAll(new RegExp(`\\b(${MONTH_PATTERN})\\s+(\\d{1,2})(?:,?\\s+(\\d{4}))?\\b`,'gi'))){
+  addMonthDate(match[2],match[1],match[3]);
+ }
  const historyContext=/\b(history|route|past|back|yesterday|kal|pichle|pichhli|tha|thi|the|se|tak)\b/.test(query);
  let relativeOffset=null;
  let relativeFuture=false;
@@ -233,10 +256,115 @@ function validCoordinates(lat,lng){
   Number(lat)>=-90&&Number(lat)<=90&&Number(lng)>=-180&&Number(lng)<=180;
 }
 
+function hasGpsConfiguration(vehicle){
+ return vehicle?.gpsLink===GPS_PROVIDER||
+  (vehicle?.gpsProviders||[]).some(provider=>provider?.name===GPS_PROVIDER);
+}
+
+function isSupportedGpsRecord(record){
+ return !record?.provider||record.provider===GPS_PROVIDER;
+}
+
+function isCurrentGpsRecord(record,now){
+ const gpsTime=new Date(record?.gpsTime).getTime();
+ return Boolean(record&&!record.stale&&validCoordinates(record.lat,record.lng)&&
+  Number.isFinite(gpsTime)&&gpsTime<=now.getTime()&&
+  now.getTime()-gpsTime<=GPS_SYNC_INTERVAL_MS*2);
+}
+
+function latestGpsRecord(records,now){
+ return [...records].filter(record=>{
+  const gpsTime=new Date(record?.gpsTime).getTime();
+  return Number.isFinite(gpsTime)&&gpsTime<=now.getTime();
+ }).sort((a,b)=>
+  Number(validCoordinates(b.lat,b.lng))-Number(validCoordinates(a.lat,a.lng))||
+  new Date(b.gpsTime)-new Date(a.gpsTime)||
+  new Date(b.syncedAt||b.updatedAt||0)-new Date(a.syncedAt||a.updatedAt||0)
+ )[0]||null;
+}
+
+function distanceMeters(first,second){
+ const radians=value=>value*Math.PI/180;
+ const latDelta=radians(Number(second.lat)-Number(first.lat));
+ const lngDelta=radians(Number(second.lng)-Number(first.lng));
+ const value=Math.sin(latDelta/2)**2+
+  Math.cos(radians(Number(first.lat)))*Math.cos(radians(Number(second.lat)))*Math.sin(lngDelta/2)**2;
+ return 6371000*2*Math.atan2(Math.sqrt(value),Math.sqrt(1-value));
+}
+
+async function getAiGpsVehicleRows(models,now){
+ const [registered,liveRecords,plants,openStays]=await Promise.all([
+  models.Vehicle.find({status:'Active'})
+   .select('vehicleNumber gpsLink gpsProviders status').lean(),
+  models.VehicleLiveStatus.find({})
+   .select('vehicleNumber lat lng address readableLocation gpsTime syncedAt updatedAt stale provider speed ignition runningStatus vehicleStatus').lean(),
+  models.Plant.find({status:'Active'}).lean(),
+  models.VehiclePlantStay.find({exitTime:null}).populate('plant').lean()
+ ]);
+ const registeredByNumber=groupByVehicleNumber(registered);
+ const liveByNumber=groupByVehicleNumber(liveRecords,record=>record.vehicleNumber);
+ const staysByNumber=groupByVehicleNumber(openStays,stay=>stay.vehicle);
+ const cutoff=getHistoryCutoff(now);
+ const rows=[];
+ for(const [vehicleNumber,vehicles] of registeredByNumber){
+  const vehicle=vehicles[0];
+  const records=(liveByNumber.get(vehicleNumber)||[]).filter(isSupportedGpsRecord);
+  const lastGps=latestGpsRecord(records,now);
+  if(!hasGpsConfiguration(vehicle)&&!records.some(record=>record.provider||validCoordinates(record.lat,record.lng)))continue;
+  const current=isCurrentGpsRecord(lastGps,now);
+  const currentStays=staysByNumber.get(vehicleNumber)||[];
+  const candidatePlants=[];
+  let confirmedPlant=null;
+  if(current){
+   for(const plant of plants){
+    if(!validCoordinates(plant.lat,plant.lng)||!Number.isFinite(Number(plant.radius)))continue;
+    const insideGeofence=distanceMeters(lastGps,plant)<=Number(plant.radius);
+    if(!insideGeofence)continue;
+    const recordedStay=currentStays.find(stay=>String(stay.plant?._id||stay.plant)===String(plant._id));
+    if(recordedStay){
+     confirmedPlant=plant;
+     candidatePlants.push({plant,stay:recordedStay,confirmed:true});
+    }else candidatePlants.push({plant,stay:null,confirmed:false});
+   }
+  }
+  for(const stay of currentStays){
+   const plant=plants.find(item=>String(item._id)===String(stay.plant?._id||stay.plant));
+   if(plant&&!candidatePlants.some(item=>String(item.plant._id)===String(plant._id))){
+    candidatePlants.push({plant,stay,confirmed:false});
+   }
+  }
+  const provider=lastGps?.provider||vehicle.gpsLink||
+   (vehicle.gpsProviders||[]).find(item=>item?.name===GPS_PROVIDER)?.name||'N/A';
+  const status=current
+   ?lastGps.runningStatus||'GPS current'
+   :lastGps?'Stale':'GPS data unavailable';
+  const base={
+   vehicleNumber,provider,lat:lastGps?.lat??null,lng:lastGps?.lng??null,
+   location:lastGps?readableLocation(lastGps):null,
+   gpsTime:lastGps?.gpsTime||null,lastUpdate:lastGps?.syncedAt||lastGps?.updatedAt||null,
+   status,stale:Boolean(lastGps&&!current),currentGps:current,
+   plantName:confirmedPlant?.name||null,
+   availabilityStatus:confirmedPlant?'Available (confirmed)':candidatePlants.length?'Availability not confirmed':'Not confirmed at a plant'
+  };
+  rows.push({...base,candidatePlants:candidatePlants.map(item=>({
+   plantName:item.plant.name,
+   entryTime:item.stay&&new Date(item.stay.entryTime)>=cutoff?item.stay.entryTime:null,
+   confirmed:item.confirmed
+  }))});
+ }
+ return rows.sort((a,b)=>a.vehicleNumber.localeCompare(b.vehicleNumber));
+}
+
 function mapHistoryRecord(record){
  return {
+  vehicleNumber:record.vehicleNumber||record.vehicle,
   time:record.gpsTime,
+  lastUpdate:record.syncedAt||null,
   address:readableLocation(record),
+  lat:record.lat??null,
+  lng:record.lng??null,
+  provider:record.provider||'N/A',
+  status:record.vehicleStatus||'N/A',
   speed:record.speed??'N/A',
   ignition:record.ignition??'N/A',
   lat:record.lat,
@@ -251,7 +379,11 @@ function isAvailabilityQuestion(text){
 }
 
 function asksAllPlants(text){
- return /\b(all|every|sabhi|sab|saare|har)\b/.test(normalizeText(text));
+ const query=normalizeText(text);
+ return /\b(all|every|sabhi|sab|saare|har)\s+plants?\b/.test(query)||
+  /\b(each|every|har)\s+plants?\b/.test(query)||
+  /\bplantwise\b|\bplant wise\b/.test(query)||
+  /\b(inside|within)\s+(?:a\s+)?plant geofence\b/.test(query);
 }
 
 function isHistoryQuestion(text){
@@ -268,6 +400,13 @@ function isLocationQuestion(text){
 
 function isOutsideQuestion(text){
  return /\b(outside|transit|bahar)\b/.test(normalizeText(text));
+}
+
+function isGpsVehicleListQuestion(text){
+ const query=normalizeText(text);
+ return /\b(all|every|show|list|registered|give me|sabhi|sab|saare)\b/.test(query)&&
+  /\b(vehicle|vehicles|gadi|gaadi|gps)\b/.test(query)&&
+  !/\bplant\b/.test(query);
 }
 
 function isExitQuestion(text){
@@ -350,20 +489,20 @@ function accessDenied(language,source){
 }
 
 function cleanChatQuestion(value){
- return String(value||'').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g,' ').trim();
+ return String(value||'').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g,' ');
 }
 
 async function answerQuestion(question,{models=M,now=new Date(),previousLanguage,permissions}={}){
  const query=String(question||'').trim();
  const language=detectLanguage(query,previousLanguage);
- if(!query)return answerText(
+ if(!query.trim())return answerText(
   localized(language,'Please ask a question about a vehicle or plant.','कृपया किसी वाहन या प्लांट के बारे में सवाल पूछें।'),
   'clarification',{},language
  );
  const normalized=normalizeText(query);
  const dateRequest=parseDateRequest(query,now);
  if(dateRequest.future)return answerText(
-  localized(language,'Future dates are not available.','भविष्य की तारीख का डेटा उपलब्ध नहीं है।'),
+  localized(language,FUTURE_HISTORY_REPLY,'भविष्य की GPS हिस्ट्री उपलब्ध नहीं है। Sikka AI केवल वर्तमान GPS जानकारी और पिछले 45 दिनों के वास्तविक ऐतिहासिक रिकॉर्ड दे सकता है।'),
   'future',{},language
  );
  const vehicleNumber=extractVehicleNumber(query);
@@ -374,6 +513,7 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
  const outsideQuestion=isOutsideQuestion(query);
  const exitQuestion=outsideQuestion&&(isExitQuestion(query)||dateRequest.found);
  const historicalVehicle=Boolean(vehicleNumber&&(historyQuestion||dateRequest.found));
+ const allFleetHistoryQuestion=Boolean(!vehicleNumber&&historyQuestion&&isGpsVehicleListQuestion(query));
  const historicalPlant=Boolean(dateRequest.found&&hasPlantWord&&!vehicleNumber&&
   (availabilityQuestion||historyQuestion||/\b(who|which|was|were|count)\b/.test(normalized)));
  const locationQuestion=!historicalVehicle&&!historicalPlant&&
@@ -423,7 +563,8 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
  }
  if(isPlantDetailsQuestion(query)&&!hasPageAccess(permissions,'plant'))return accessDenied(language,'plant');
 
- if(!vehicleNumber&&(isLocationQuestion(query)||historyQuestion&&!hasPlantWord)){
+ if(!vehicleNumber&&!isGpsVehicleListQuestion(query)&&
+  (isLocationQuestion(query)||historyQuestion&&!hasPlantWord&&!allFleetHistoryQuestion)){
   if(!hasPageAccess(permissions,'gpsTrack'))return accessDenied(language,'gpsTrack');
   const vehicles=await models.Vehicle.find({status:'Active'}).select('vehicleNumber').lean();
   const suggestions=vehicleSuggestions(vehicles.map(vehicle=>vehicle.vehicleNumber),language,historyQuestion);
@@ -435,9 +576,22 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   );
  }
 
+ if(!vehicleNumber&&isGpsVehicleListQuestion(query)&&!historyQuestion){
+  if(!hasPageAccess(permissions,'gpsTrack'))return accessDenied(language,'gpsTrack');
+  const rows=(await getAiGpsVehicleRows(models,now)).map(({candidatePlants,...vehicle})=>vehicle);
+  return answerText(
+   localized(language,`${rows.length} registered GPS vehicle(s) found.`,`${rows.length} पंजीकृत GPS वाहन मिले।`),
+   'vehicleList',{rows,total:rows.length},language
+  );
+ }
+
  if(historicalVehicle){
-  const start=dateRequest.found?dateRequest.start:new Date(now.getTime()-7*DAY_MS);
-  const end=dateRequest.found?new Date(Math.min(dateRequest.end.getTime(),now.getTime())):now;
+  const start=dateRequest.hasTime?dateRequest.instant:
+   dateRequest.found?dateRequest.start:new Date(now.getTime()-7*DAY_MS);
+  const requestedEnd=dateRequest.hasTime
+   ?new Date(dateRequest.instant.getTime()+60000-1)
+   :dateRequest.found?dateRequest.end:now;
+  const end=new Date(Math.min(requestedEnd.getTime(),now.getTime()));
   if(isOlderThanAccessLimit(start,now))return answerText(HISTORY_LIMIT_REPLY,'historyLimit',{},language);
   const registered=await fleetSnapshotService.getActiveVehicle(models,vehicleNumber);
   if(!registered)return answerText(
@@ -446,12 +600,18 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   );
   const storedNumber=registered.vehicleNumber;
   const matcher=vehicleNumberRegex(storedNumber);
-  const vehicleFilter={$or:[{vehicleNumber:matcher},{vehicle:matcher}]};
+  const vehicleFilter={$or:[{vehicleNumber:matcher},{vehicle:matcher}],provider:{$in:[null,GPS_PROVIDER]}};
   const filter={...vehicleFilter,gpsTime:{$gte:start,$lte:end}};
   const [records,total]=await Promise.all([
    models.VehicleLocationHistory.find(filter).sort({gpsTime:1}).limit(20).lean(),
    models.VehicleLocationHistory.countDocuments(filter)
   ]);
+  if(!hasGpsConfiguration(registered)&&!records.some(record=>record.provider||validCoordinates(record.lat,record.lng))){
+   return answerText(
+    localized(language,'This registered vehicle has no configured GPS integration or GPS history.','इस पंजीकृत वाहन के लिए GPS integration या GPS इतिहास उपलब्ध नहीं है।'),
+    'vehicleUnavailable',{vehicleNumber},language
+   );
+  }
   if(!records.length)return answerText(
    localized(language,'No database history was found for this vehicle and date range.','इस वाहन और तारीख के लिए डेटाबेस में हिस्ट्री नहीं मिली।'),
    'history',{vehicleNumber,rows:[],total:0},language
@@ -462,13 +622,50 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   );
  }
 
+ if(allFleetHistoryQuestion){
+  if(!hasPageAccess(permissions,'gpsTrack'))return accessDenied(language,'gpsTrack');
+  const start=dateRequest.hasTime?dateRequest.instant:
+   dateRequest.found?dateRequest.start:new Date(now.getTime()-7*DAY_MS);
+  const requestedEnd=dateRequest.hasTime
+   ?new Date(dateRequest.instant.getTime()+60000-1)
+   :dateRequest.found?dateRequest.end:now;
+  const end=new Date(Math.min(requestedEnd.getTime(),now.getTime()));
+  if(isOlderThanAccessLimit(start,now))return answerText(HISTORY_LIMIT_REPLY,'historyLimit',{},language);
+  const gpsVehicles=await getAiGpsVehicleRows(models,now);
+  const vehicleNumbers=gpsVehicles.map(vehicle=>vehicle.vehicleNumber);
+  if(!vehicleNumbers.length)return answerText(
+   localized(language,'No registered GPS vehicles were found.','कोई पंजीकृत GPS वाहन नहीं मिला।'),
+   'history',{rows:[],total:0,historyRange:{from:start.toISOString(),to:end.toISOString()}},language
+  );
+  const filter={
+   $or:[{vehicleNumber:{$in:vehicleNumbers}},{vehicle:{$in:vehicleNumbers}}],
+   provider:{$in:[null,GPS_PROVIDER]},
+   gpsTime:{$gte:start,$lte:end}
+  };
+  const [records,total]=await Promise.all([
+   models.VehicleLocationHistory.find(filter).sort({gpsTime:1}).limit(20).lean(),
+   models.VehicleLocationHistory.countDocuments(filter)
+  ]);
+  return answerText(
+   localized(language,`${total} GPS history record(s) found for registered vehicles.`,`${total} GPS इतिहास रिकॉर्ड मिले।`),
+   'history',{rows:records.map(mapHistoryRecord),total,historyRange:{from:start.toISOString(),to:end.toISOString()}},language
+  );
+ }
+
  if(exitQuestion){
   if(!hasPageAccess(permissions,'dashboard'))return accessDenied(language,'dashboard');
   const istToday=istParts(now);
   const start=dateRequest.found?dateRequest.start:fromIstParts(istToday.year,istToday.month,istToday.day);
   const end=dateRequest.found?new Date(Math.min(dateRequest.end.getTime(),now.getTime())):now;
   if(isOlderThanAccessLimit(start,now))return answerText(HISTORY_LIMIT_REPLY,'historyLimit',{},language);
+  const gpsVehicles=await getAiGpsVehicleRows(models,now);
+  const vehicleNumbers=gpsVehicles.map(vehicle=>vehicle.vehicleNumber);
+  if(!vehicleNumbers.length)return answerText(
+   localized(language,'No registered GPS vehicles were found.','कोई पंजीकृत GPS वाहन नहीं मिला।'),
+   'outsideHistory',{rows:[],total:0},language
+  );
   const records=await models.VehiclePlantStay.find({
+   vehicle:{$in:vehicleNumbers},
    exitTime:{$gte:new Date(Math.max(start.getTime(),getHistoryCutoff(now).getTime())),$lte:end}
   }).populate('plant').sort({exitTime:1}).lean();
   const rows=records.map(record=>({vehicleNumber:record.vehicle,plantName:record.plant?.name||'N/A',exitTime:record.exitTime}));
@@ -496,6 +693,13 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   const filter={plant:plant._id,entryTime:{$gte:getHistoryCutoff(now),$lte:at}};
   if(dateRequest.hasTime)filter.$or=[{exitTime:{$exists:false}},{exitTime:null},{exitTime:{$gt:at}}];
   else filter.$or=[{exitTime:{$exists:false}},{exitTime:null},{exitTime:{$gt:dateRequest.start}}];
+  const gpsVehicles=await getAiGpsVehicleRows(models,now);
+  const vehicleNumbers=gpsVehicles.map(vehicle=>vehicle.vehicleNumber);
+  if(!vehicleNumbers.length)return answerText(
+   localized(language,'No registered GPS vehicles were found.','कोई पंजीकृत GPS वाहन नहीं मिला।'),
+   'plantVehicles',{plantName:plant.name,rows:[],total:0,historical:true},language
+  );
+  filter.vehicle={$in:vehicleNumbers};
   const stays=await models.VehiclePlantStay.find(filter).lean();
   const uniqueStays=[...groupByVehicleNumber(stays,stay=>stay.vehicle).values()]
    .map(records=>records.sort((a,b)=>new Date(a.entryTime)-new Date(b.entryTime))[0]);
@@ -511,30 +715,41 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
 
  if(outsideQuestion&&!exitQuestion){
   if(!hasPageAccess(permissions,'dashboard'))return accessDenied(language,'dashboard');
-  const snapshot=await fleetSnapshotService.getOperationalSnapshot(models,now,{includeMetadata:false});
-  const rows=snapshot.transit.rows.map(row=>row.vehicleNumber);
+  const vehicles=await getAiGpsVehicleRows(models,now);
+  const rows=vehicles.filter(vehicle=>vehicle.currentGps&&!vehicle.candidatePlants.length);
+  const unknown=vehicles.filter(vehicle=>!vehicle.currentGps);
   return answerText(
-   localized(language,`${rows.length} active vehicle(s) are outside plants now.`,`${rows.length} सक्रिय गाड़ियाँ अभी प्लांट के बाहर हैं।`),
-   'outside',{count:rows.length,vehicles:rows},language
+   localized(language,`${rows.length} registered GPS vehicle(s) are outside plant geofences; ${unknown.length} cannot be confirmed from current GPS data.`,`${rows.length} पंजीकृत GPS वाहन प्लांट geofence से बाहर हैं; ${unknown.length} की वर्तमान GPS जानकारी से पुष्टि नहीं हो सकी।`),
+   'outside',{count:rows.length,vehicles:rows.map(vehicle=>vehicle.vehicleNumber),unknown:unknown.map(vehicle=>vehicle.vehicleNumber)},language
   );
  }
 
  if(allPlantsQuestion&&availabilityQuestion){
   if(!hasPageAccess(permissions,'dashboard'))return accessDenied(language,'dashboard');
-  const snapshot=await fleetSnapshotService.getOperationalSnapshot(models,now,{includeMetadata:false});
-  const cutoff=getHistoryCutoff(now);
-  const groups=snapshot.plants.map(item=>({
-   plantName:item.plant,count:item.count,
-   rows:item.rows.map(row=>{
-    const safe=protectedStayFields(row,cutoff,language);
-    return {vehicleNumber:safe.vehicleNumber,entryTime:safe.entryTime,stayHours:safe.stayHours,stay:safe.stay};
-   })
-  }));
-  const transit=snapshot.transit.rows.map(row=>row.vehicleNumber);
+  if(!hasPageAccess(permissions,'gpsTrack'))return accessDenied(language,'gpsTrack');
+  const [plants,vehicles]=await Promise.all([
+   fleetSnapshotService.getActivePlantRecords(models),
+   getAiGpsVehicleRows(models,now)
+  ]);
+  const groups=plants.map(plant=>{
+   const candidates=vehicles.flatMap(vehicle=>
+    vehicle.candidatePlants.filter(candidate=>candidate.plantName===plant.name).map(candidate=>({
+     ...vehicle,entryTime:candidate.entryTime,
+     availabilityStatus:candidate.confirmed?'Available (confirmed)':'Availability not confirmed'
+    }))
+   );
+   const rows=candidates.filter(vehicle=>vehicle.availabilityStatus==='Available (confirmed)');
+   return {
+    plantName:plant.name,count:rows.length,rows,
+    unconfirmedRows:candidates.filter(vehicle=>vehicle.availabilityStatus!=='Available (confirmed)')
+   };
+  });
+  const transit=vehicles.filter(vehicle=>vehicle.currentGps&&!vehicle.candidatePlants.length);
+  const unknown=vehicles.filter(vehicle=>!vehicle.currentGps);
   const total=groups.reduce((sum,item)=>sum+item.count,0);
   return answerText(
-   localized(language,`${total} vehicle(s) are inside plants; ${snapshot.transit.count} are outside/transit.`,`प्लांटों में ${total} गाड़ियाँ हैं; ${snapshot.transit.count} बाहर/ट्रांजिट में हैं।`),
-   'plants',{plants:groups,transit:{count:snapshot.transit.count,vehicles:transit}},language
+   localized(language,`${total} vehicle(s) have confirmed plant availability; ${transit.length} are outside plant geofences and ${unknown.length} cannot be confirmed from current GPS data.`,`प्लांट में ${total} गाड़ियों की उपलब्धता की पुष्टि हुई; ${transit.length} geofence से बाहर हैं और ${unknown.length} की वर्तमान GPS जानकारी से पुष्टि नहीं हो सकी।`),
+   'plants',{plants:groups,transit:{count:transit.length,vehicles:transit.map(vehicle=>vehicle.vehicleNumber)},unknown:{count:unknown.length,vehicles:unknown.map(vehicle=>vehicle.vehicleNumber)}},language
   );
  }
 
@@ -554,6 +769,7 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
 
  if(availabilityQuestion&&hasPlantWord||/\bplant availability now\b/.test(normalized)){
   if(!hasPageAccess(permissions,'dashboard'))return accessDenied(language,'dashboard');
+  if(!hasPageAccess(permissions,'gpsTrack'))return accessDenied(language,'gpsTrack');
   const plants=await fleetSnapshotService.getActivePlantRecords(models);
   const plant=matchPlant(query,plants);
   if(!plant){
@@ -565,21 +781,27 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
     'plantNotFound',{availablePlants:plants.map(item=>item.name),suggestions},language
    );
   }
-  const result=await fleetSnapshotService.getPlantAvailability(models,plant,now);
-  const rows=result.rows.map(row=>{
-   const safe=protectedStayFields(row,getHistoryCutoff(now),language);
-   return {vehicleNumber:safe.vehicleNumber,entryTime:safe.entryTime,stayHours:safe.stayHours,stay:safe.stay};
-  });
+  const vehicles=await getAiGpsVehicleRows(models,now);
+  const candidates=vehicles.flatMap(vehicle=>vehicle.candidatePlants
+   .filter(candidate=>candidate.plantName===plant.name)
+   .map(candidate=>({
+    ...vehicle,entryTime:candidate.entryTime,
+    availabilityStatus:candidate.confirmed?'Available (confirmed)':'Availability not confirmed'
+   }))
+  );
+  const rows=candidates.filter(vehicle=>vehicle.availabilityStatus==='Available (confirmed)');
+  const unconfirmedRows=candidates.filter(vehicle=>vehicle.availabilityStatus!=='Available (confirmed)');
   return answerText(
-   localized(language,`${result.count} vehicle(s) are currently available at ${plant.name}.`,`${plant.name} में अभी ${result.count} गाड़ियाँ उपलब्ध हैं।`),
-   'plantVehicles',{plantName:plant.name,rows,total:result.count},language
+   localized(language,`${rows.length} vehicle(s) have confirmed availability at ${plant.name}; ${unconfirmedRows.length} vehicle(s) need GPS confirmation.`,`${plant.name} में ${rows.length} गाड़ियों की उपलब्धता की पुष्टि हुई; ${unconfirmedRows.length} गाड़ियों की GPS पुष्टि बाकी है।`),
+   'plantVehicles',{plantName:plant.name,rows,unconfirmedRows,total:rows.length},language
   );
  }
 
  if(vehicleNumber){
   if(!hasPageAccess(permissions,'gpsTrack'))return accessDenied(language,'gpsTrack');
   const includeInactive=hasPageAccess(permissions,'vehicleRegistry');
-  const {vehicle,live:liveRecord,stay}=await fleetSnapshotService.getCurrentVehicle(models,vehicleNumber,{includeInactive});
+  const {vehicle,live:rawLiveRecord,stay}=await fleetSnapshotService.getCurrentVehicle(models,vehicleNumber,{includeInactive});
+  const liveRecord=isSupportedGpsRecord(rawLiveRecord)?rawLiveRecord:null;
   if(!vehicle){
    const text=includeInactive
     ?localized(language,'This vehicle number was not found in the registry.','यह वाहन नंबर रजिस्ट्री में नहीं मिला।')
@@ -588,7 +810,7 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   }
   const cutoff=getHistoryCutoff(now);
   const liveTime=liveRecord?.gpsTime?new Date(liveRecord.gpsTime):null;
-  const liveIsRecent=Boolean(liveRecord&&liveTime&&liveTime>=cutoff&&liveTime<=now);
+  const liveIsRecent=isCurrentGpsRecord(liveRecord,now)&&liveTime>=cutoff;
   const live=liveIsRecent?liveRecord:null;
   let lastKnown=liveRecord&&liveIsRecent?liveRecord:null;
   if(!lastKnown){
@@ -598,6 +820,7 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
       {vehicleNumber:vehicleNumberRegex(vehicle.vehicleNumber)},
       {vehicle:vehicleNumberRegex(vehicle.vehicleNumber)}
      ]},
+     {provider:{$in:[null,GPS_PROVIDER]}},
      {gpsTime:{$gte:cutoff,$lte:now}}
     ]
    }).sort({gpsTime:-1}).limit(1).lean();
@@ -605,6 +828,13 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   }
   if(!live||live.stale){
    const record=lastKnown;
+   if(!hasGpsConfiguration(vehicle)&&!liveRecord?.provider&&!validCoordinates(liveRecord?.lat,liveRecord?.lng)&&
+    !record?.provider&&!validCoordinates(record?.lat,record?.lng)){
+    return answerText(
+     localized(language,'This registered vehicle has no configured GPS integration or GPS history.','इस पंजीकृत वाहन के लिए GPS integration या GPS इतिहास उपलब्ध नहीं है।'),
+     'vehicleUnavailable',{vehicleNumber},language
+    );
+   }
    const location=record?readableLocation(record):null;
    const gpsTime=record?.gpsTime||null;
    const map=record&&validCoordinates(record.lat,record.lng)
@@ -614,7 +844,9 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
     :localized(language,'Live GPS data for this vehicle is not available, and no last-known record was found in the permitted 45-day range.','इस वाहन का लाइव GPS डेटा उपलब्ध नहीं है और अनुमत 45 दिनों में पिछला रिकॉर्ड नहीं मिला।');
    return answerText(text,'vehicleMissing',{
     vehicleNumber,location,speed:record?.speed??'N/A',ignition:record?.ignition??'N/A',
-    gpsTime,provider:record?.provider||'N/A',plantName:stay?.plant?.name||'Outside/Transit',
+    gpsTime,provider:record?.provider||liveRecord?.provider||vehicle.gpsLink||'N/A',
+    plantName:'Availability not confirmed',nearestPlantName:stay?.plant?.name||null,
+    lastUpdate:record?.syncedAt||record?.updatedAt||null,
     lat:record?.lat??null,lng:record?.lng??null,map,stale:true
    },language);
   }
@@ -622,16 +854,26 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   const stayAllowed=stayDate&&stayDate>=cutoff;
   const stayDuration=stayAllowed?durationAt(stay.entryTime,now):null;
   const location=readableLocation(live);
-  const plantName=stay?.plant?.name||'Outside/Transit';
+  const plantConfirmed=Boolean(stay&&!stay.inferredFromGps);
+  const plantName=plantConfirmed?stay.plant.name:'Availability not confirmed';
+  let nearestPlantName=stay?.plant?.name||null;
+  if(/(?:\b(?:nearest|closest)\b|निकटतम|पास)/iu.test(query)&&validCoordinates(live.lat,live.lng)){
+   const plants=await fleetSnapshotService.getActivePlantRecords(models);
+   nearestPlantName=plants
+    .filter(plant=>validCoordinates(plant.lat,plant.lng))
+    .sort((a,b)=>distanceMeters(live,a)-distanceMeters(live,b))[0]?.name||null;
+  }
   const speed=live.speed==null?'N/A':String(live.speed);
   const ignition=live.ignition==null?'N/A':String(live.ignition);
   const map=validCoordinates(live.lat,live.lng)?`https://www.google.com/maps?q=${live.lat},${live.lng}`:null;
   const text=language==='hi'
-   ?`${vehicleNumber} की लोकेशन: ${location}। स्पीड: ${speed}; IGN: ${ignition}; GPS समय: ${live.gpsTime?new Date(live.gpsTime).toLocaleString('en-IN',{timeZone:TIME_ZONE}):'N/A'}; प्रदाता: ${live.provider||'N/A'}; प्लांट: ${plantName}${stayAllowed?`; प्रवेश: ${new Date(stay.entryTime).toLocaleString('en-IN',{timeZone:TIME_ZONE})}; ठहराव: ${formatDuration(stayDuration)}`:stay?' प्लांट में 45 दिनों से अधिक समय से है':''}${live.stale?' (डेटा पुराना है)':''}।`
-   :`${vehicleNumber} location: ${location}. Speed: ${speed}; ignition: ${ignition}; GPS time: ${live.gpsTime?new Date(live.gpsTime).toLocaleString('en-IN',{timeZone:TIME_ZONE}):'N/A'}; provider: ${live.provider||'N/A'}; plant: ${plantName}${stayAllowed?`; entry: ${new Date(stay.entryTime).toLocaleString('en-IN',{timeZone:TIME_ZONE})}; stay: ${formatDuration(stayDuration)}`:stay?' in plant for more than 45 days':''}${live.stale?' (stale)':''}.`;
+   ?`${vehicleNumber} की लोकेशन: ${location}। स्पीड: ${speed}; IGN: ${ignition}; GPS समय: ${live.gpsTime?new Date(live.gpsTime).toLocaleString('en-IN',{timeZone:TIME_ZONE}):'N/A'}; प्रदाता: ${live.provider||vehicle.gpsLink||'N/A'}; स्थिति: ${live.runningStatus||live.vehicleStatus||'Unknown'}; प्लांट: ${plantName}${!plantConfirmed&&nearestPlantName?`; निकटतम प्लांट: ${nearestPlantName}`:''}${stayAllowed?`; प्रवेश: ${new Date(stay.entryTime).toLocaleString('en-IN',{timeZone:TIME_ZONE})}; ठहराव: ${formatDuration(stayDuration)}`:stay?' प्लांट में 45 दिनों से अधिक समय से है':''}।`
+   :`${vehicleNumber} location: ${location}. Speed: ${speed}; ignition: ${ignition}; GPS time: ${live.gpsTime?new Date(live.gpsTime).toLocaleString('en-IN',{timeZone:TIME_ZONE}):'N/A'}; provider: ${live.provider||vehicle.gpsLink||'N/A'}; status: ${live.runningStatus||live.vehicleStatus||'Unknown'}; plant: ${plantName}${!plantConfirmed&&nearestPlantName?`; nearest plant: ${nearestPlantName}`:''}${stayAllowed?`; entry: ${new Date(stay.entryTime).toLocaleString('en-IN',{timeZone:TIME_ZONE})}; stay: ${formatDuration(stayDuration)}`:stay?' in plant for more than 45 days':''}.`;
   return answerText(text,'vehicle',{
-   vehicleNumber,location,speed,ignition,gpsTime:live.gpsTime||null,provider:live.provider||'N/A',
-   plantName,entryTime:stayAllowed?stay.entryTime:null,
+   vehicleNumber,location,speed,ignition,gpsTime:live.gpsTime||null,
+   lastUpdate:live.syncedAt||live.updatedAt||null,provider:live.provider||vehicle.gpsLink||'N/A',
+   plantName,nearestPlantName,plantConfirmed,status:live.runningStatus||live.vehicleStatus||'Unknown',
+   entryTime:stayAllowed?stay.entryTime:null,
    stay:stayDuration?formatDuration(stayDuration):stay?'45+ days':null,
    stayHours:stayDuration?.hours??null,lat:live.lat,lng:live.lng,map,stale:Boolean(live.stale)
   },language);
@@ -663,6 +905,6 @@ function parseAdminDate(value,endOfDay=false){
 
 module.exports={
  answerQuestion,cleanChatQuestion,containsSensitiveInput,detectLanguage,extractVehicleNumber,getChatExpiry,
- getHistoryCutoff,HISTORY_LIMIT_REPLY,mapHistoryRecord,matchPlant,parseAdminDate,
+ getHistoryCutoff,HISTORY_LIMIT_REPLY,FUTURE_HISTORY_REPLY,hasGpsConfiguration,mapHistoryRecord,matchPlant,parseAdminDate,
  parseDateRequest,UNKNOWN_REPLY
 };

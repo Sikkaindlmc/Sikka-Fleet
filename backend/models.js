@@ -103,7 +103,10 @@ staySchema.index(
 const planSchema=new mongoose.Schema({
  vehicle:{type:String,required:true,index:true,set:normalizeVehicleNumber},plant:{type:mongoose.Schema.Types.ObjectId,ref:'Plant'},
  planType:{type:String,enum:['Loading','Unloading','Maintenance','Waiting','Other'],required:true},
- remarks:String,expectedDeparture:Date,createdBy:{type:String}
+ remarks:String,expectedDeparture:Date,
+ createdBy:{type:String},
+ createdByUserId:{type:mongoose.Schema.Types.ObjectId,ref:'User'},createdByName:String,
+ updatedByUserId:{type:mongoose.Schema.Types.ObjectId,ref:'User'},updatedByName:String
 },{timestamps:true});
 
 const providerStatusSchema=new mongoose.Schema({

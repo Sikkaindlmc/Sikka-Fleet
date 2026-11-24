@@ -90,6 +90,33 @@ const fmtIst=d=>{
  const values=Object.fromEntries(parts.filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
  return `${values.day}-${values.month}-${values.year} ${values.hour}:${values.minute}:${values.second} ${String(values.dayPeriod||'').toUpperCase()}`;
 };
+const indiaDateTimeLocal=value=>{
+ const date=new Date(value);
+ if(!Number.isFinite(date.getTime()))return '';
+ const parts=new Intl.DateTimeFormat('en-CA',{
+  timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit',
+  hour:'2-digit',minute:'2-digit',hourCycle:'h23'
+ }).formatToParts(date);
+ const values=Object.fromEntries(parts.filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
+ return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}`;
+};
+const indiaDateTimeIso=value=>{
+ if(!value)return undefined;
+ const normalized=value.length===16?`${value}:00`:value;
+ const date=new Date(`${normalized}+05:30`);
+ return Number.isFinite(date.getTime())?date.toISOString():undefined;
+};
+const formatPlanDeparture=value=>{
+ if(!value)return 'Not set';
+ const date=new Date(value);
+ if(!Number.isFinite(date.getTime()))return 'Not set';
+ const parts=new Intl.DateTimeFormat('en-GB',{
+  timeZone:'Asia/Kolkata',day:'2-digit',month:'short',year:'numeric',
+  hour:'2-digit',minute:'2-digit',hour12:true
+ }).formatToParts(date);
+ const values=Object.fromEntries(parts.filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
+ return `${values.day}-${values.month}-${values.year} ${values.hour}:${values.minute} ${String(values.dayPeriod||'').toUpperCase()}`;
+};
 const speedText=vehicle=>vehicle?.speed==null||vehicle.speed==='N/A'?'N/A':`${vehicle.speed} km/h`;
 const showToast=(text,type='success')=>window.dispatchEvent(new CustomEvent('toast',{detail:{text,type}}));
 const isAdminUser=user=>Boolean(user?.isAdmin||String(user?.role||'').toLowerCase()==='admin');
@@ -269,7 +296,7 @@ function dashboardData(value){
 function Dashboard(){
  const {user}=useAuth();
  const canManage=canEdit(user,'dashboard');
- const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);
+ const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
  const loadInFlight=useRef(false);
  const load=async(silent=false)=>{
   if(loadInFlight.current)return;
@@ -303,21 +330,52 @@ function Dashboard(){
   }
  };
  const syncStatus=data?.syncStatus||{};
- const savePlan=async()=>{if(planSaving)return;setPlanSaving(true);try{await axios.post('/plans',{vehicle:planModal.vehicleNumber,plant:plantModal?.plant?._id,planType:plan.planType,remarks:plan.remarks,expectedDeparture:plan.expectedDeparture||undefined});showToast('Plan saved');setPlanModal(null);setPlan({planType:'Loading',remarks:'',expectedDeparture:''})}catch(e){showToast(e.response?.data?.error||'Failed to save plan','error')}finally{setPlanSaving(false)}};
+ const openPlan=(vehicle,existingPlan=null)=>{
+  setPlanModal({...vehicle,planId:existingPlan?._id||null});
+  setPlan({
+   planType:existingPlan?.planType||'Loading',
+   remarks:existingPlan?.remarks||'',
+   expectedDeparture:existingPlan?.expectedDeparture
+    ?indiaDateTimeLocal(existingPlan.expectedDeparture)
+    :indiaDateTimeLocal(new Date())
+  });
+ };
+ const savePlan=async()=>{
+  if(planSaving||!planModal)return;
+  setPlanSaving(true);
+  const payload={
+   vehicle:planModal.vehicleNumber,
+   plant:plantModal?._id,
+   planType:plan.planType,
+   remarks:plan.remarks,
+   expectedDeparture:indiaDateTimeIso(plan.expectedDeparture)
+  };
+  try{
+   if(planModal.planId)await axios.put('/plans/'+planModal.planId,payload);
+   else await axios.post('/plans',payload);
+   showToast(planModal.planId?'Plan updated':'Plan saved');
+   setPlanModal(null);
+   setPlan({planType:'Loading',remarks:'',expectedDeparture:''});
+   setPlansVersion(version=>version+1);
+   await load(true);
+  }catch(e){showToast(e.response?.data?.error||'Failed to save plan','error')}
+  finally{setPlanSaving(false)}
+ };
  if(loadError)return <ErrorPage title="Cannot reach server" details={loadError.message} onRetry={load}/>
  if(!data)return <Skeleton/>
  return <>
  <div className="page-head"><div><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} onClick={sync}><RefreshCw size={18}/> Sync Now</AnimatedButton>}<div className="clock dashboard-sync-clock"><b>Next sync</b><span>{countdown}</span></div><div className="clock dashboard-status-clock"><b>GPS sync</b><span role="status">{syncStatus.status||'Loading status'}</span>{syncStatus.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div><div className="clock dashboard-sync-clock"><b>Last Sync</b><span>{fmt(data.lastSync)}</span></div></div></div>
  <div className="widget-grid">{data.plants.map((p,i)=><motion.button key={p.plant} className="plant-widget" onClick={()=>setPlantModal(p)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}} transition={{delay:i*.07}}><span className="widget-icon"><Factory/></span><div><small>{p.plant}</small><Count value={p.count}/></div></motion.button>)}
  <motion.button className="plant-widget transit" onClick={()=>setTransitModal(true)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}}><span className="widget-icon"><MapPinned/></span><div><small>Outside</small><Count value={data.transit.count}/><em>active vehicles</em></div></motion.button></div>
- <Modal open={!!plantModal} onClose={()=>setPlantModal(null)} title={`${plantModal?.plant||''} - Vehicles`} size="lg"><PlantPopup plant={plantModal} canPlan={canManage} onPlan={r=>setPlanModal(r)}/></Modal>
+ <Modal open={!!plantModal} onClose={()=>setPlantModal(null)} title={`${plantModal?.plant||''} - Vehicles`} size="lg"><PlantPopup plant={plantModal} canPlan={canManage} plansVersion={plansVersion} onPlan={openPlan} onViewPlan={setPlanDetails}/></Modal>
  <Modal open={transitModal} onClose={()=>setTransitModal(false)} title="Outside Vehicles" size="lg"><Table headers={['Vehicle Number','Last Out Plant Name','Current Location','Speed','IGN','GPS time','GPS data','']} rows={data.transit.rows.map(r=>[r.vehicleNumber,r.leftPlant,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.lastGpsUpdatedAt),r.stale?'Stale':'Live',<AnimatedButton variant="blue" onClick={()=>window.location.assign('/gps')}>Track Now</AnimatedButton>])}/></Modal>
- <Modal open={!!planModal} onClose={()=>setPlanModal(null)} title={`Plan - ${planModal?.vehicleNumber||''}`} disableClose={planSaving}><div className="form-grid"><label>Plan Type<select value={plan.planType} onChange={e=>setPlan({...plan,planType:e.target.value})}>{['Loading','Unloading','Maintenance','Waiting','Other'].map(v=><option key={v}>{v}</option>)}</select></label><label>Expected Departure<input type="datetime-local" value={plan.expectedDeparture} onChange={e=>setPlan({...plan,expectedDeparture:e.target.value})}/></label><label className="span-2">Remarks<textarea value={plan.remarks} onChange={e=>setPlan({...plan,remarks:e.target.value})}/></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setPlanModal(null)} disabled={planSaving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={planSaving} onClick={savePlan}>Save Plan</AnimatedButton></div></Modal>
+ <Modal open={!!planDetails} onClose={()=>setPlanDetails(null)} title="Latest Plan Details" size="sm"><dl className="plan-details"><dt>Plan Type</dt><dd>{planDetails?.planType||'-'}</dd><dt>Expected Departure</dt><dd>{formatPlanDeparture(planDetails?.expectedDeparture)}</dd><dt>Created By</dt><dd>{planDetails?.createdByDisplayName||'Unavailable'}</dd><dt>Remarks</dt><dd className="plan-details-remarks">{planDetails?.remarks||'-'}</dd></dl><div className="modal-actions"><AnimatedButton variant="green" onClick={()=>setPlanDetails(null)}>Close</AnimatedButton></div></Modal>
+ <Modal open={!!planModal} onClose={()=>setPlanModal(null)} title={`${planModal?.planId?'Edit':'Plan'} - ${planModal?.vehicleNumber||''}`} disableClose={planSaving}><div className="form-grid"><label>Plan Type<select value={plan.planType} onChange={e=>setPlan({...plan,planType:e.target.value})}>{['Loading','Unloading','Maintenance','Waiting','Other'].map(v=><option key={v}>{v}</option>)}</select></label><label>Expected Departure (Asia/Kolkata)<input type="datetime-local" value={plan.expectedDeparture} onChange={e=>setPlan({...plan,expectedDeparture:e.target.value})}/></label><label className="span-2">Remarks<textarea value={plan.remarks} onChange={e=>setPlan({...plan,remarks:e.target.value})}/></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setPlanModal(null)} disabled={planSaving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={planSaving} onClick={savePlan}>{planModal?.planId?'Update Plan':'Save Plan'}</AnimatedButton></div></Modal>
  </>
 }
 function Count({value}){const [n,setN]=useState(0);useEffect(()=>{let cur=0;const step=Math.max(1,Math.ceil(value/20));const i=setInterval(()=>{cur=Math.min(value,cur+step);setN(cur);if(cur>=value)clearInterval(i)},25);return()=>clearInterval(i)},[value]);return <b>{n}</b>}
-function PlantPopup({plant,onPlan,canPlan}){const [search,setSearch]=useState('');if(!plant)return null;const rows=objectRows(plant.rows).filter(r=>String(r.vehicleNumber||'').includes(search.toUpperCase())).sort((a,b)=>String(a.vehicleNumber||'').localeCompare(String(b.vehicleNumber||'')));return <>{<div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div>}<Table headers={['Vehicle Number','Entry Time','Stay Hours','Current Location','Speed','IGN','GPS time','GPS data','Latest Plan',...(canPlan?['']:[])]} rows={rows.map(r=>[r.vehicleNumber||'N/A',fmt(r.entryTime),`${r.stayHours||0} h ${r.stayMinutes||0} m`,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.gpsTime),r.hasGps?(r.stale?'Stale':'Live'):'No data',<PlanName vehicle={r.vehicleNumber||''}/>,...(canPlan?[<AnimatedButton variant="orange" onClick={()=>onPlan(r)}>Plan</AnimatedButton>]:[])])}/></>}
-function PlanName({vehicle}){const [x,setX]=useState('');useEffect(()=>{axios.get('/plans/'+vehicle).then(r=>setX(r.data[0]?.planType||'-')).catch(()=>setX('-'))},[vehicle]);return <>{x||'...'}</>}
+function PlantPopup({plant,onPlan,canPlan,plansVersion,onViewPlan}){const [search,setSearch]=useState('');const [latestPlans,setLatestPlans]=useState({});const reportPlan=useCallback((key,plan)=>setLatestPlans(current=>({...current,[key]:plan})),[]);if(!plant)return null;const rows=objectRows(plant.rows).filter(r=>String(r.vehicleNumber||'').includes(search.toUpperCase())).sort((a,b)=>String(a.vehicleNumber||'').localeCompare(String(b.vehicleNumber||'')));return <>{<div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div>}<Table headers={['Vehicle Number','Entry Time','Stay Hours','Current Location','Speed','IGN','GPS time','GPS data','Latest Plan',...(canPlan?['']:[])]} rows={rows.map(r=>{const planKey=`${plant._id}:${r.vehicleNumber||''}`;return [r.vehicleNumber||'N/A',fmt(r.entryTime),`${r.stayHours||0} h ${r.stayMinutes||0} m`,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.gpsTime),r.hasGps?(r.stale?'Stale':'Live'):'No data',<PlanName vehicle={r.vehicleNumber||''} plantId={plant._id} planKey={planKey} refreshKey={plansVersion} onViewPlan={onViewPlan} onLoaded={reportPlan}/>,...(canPlan?[<div className="row-actions"><AnimatedButton variant="orange" onClick={()=>onPlan(r)}>Plan</AnimatedButton>{latestPlans[planKey]&&<AnimatedButton variant="blue" onClick={()=>onPlan(r,latestPlans[planKey])}>Edit</AnimatedButton>}</div>]:[])];})}/></>}
+function PlanName({vehicle,plantId,planKey,refreshKey,onViewPlan,onLoaded}){const [plan,setPlan]=useState(undefined);useEffect(()=>{let active=true;setPlan(undefined);onLoaded(planKey,undefined);axios.get('/plans/'+encodeURIComponent(vehicle),{params:{plant:plantId}}).then(r=>{if(active){const latest=r.data[0]||null;setPlan(latest);onLoaded(planKey,latest)}}).catch(()=>{if(active){setPlan(null);onLoaded(planKey,null)}});return()=>{active=false}},[vehicle,plantId,planKey,refreshKey,onLoaded]);if(plan===undefined)return <>...</>;if(!plan)return <>-</>;return <div className="latest-plan"><b>{plan.planType}</b><AnimatedButton variant="blue" className="latest-plan-view" onClick={()=>onViewPlan(plan)}>View</AnimatedButton></div>}
 function Table({headers,rows}){return <div className="table-wrap"><table><thead><tr>{headers.map((h,i)=><th key={i}>{h}</th>)}</tr></thead><tbody>{rows.map((r,i)=><motion.tr key={i} initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} transition={{delay:i*.025}}>{r.map((c,j)=><td key={j}>{c}</td>)}</motion.tr>)}</tbody></table>{!rows.length&&<div className="no-rows">No data found</div>}</div>}
 function LocationText({location,current=true}){
  const readableLocation=typeof location==='string'&&!/^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/.test(location)?location.trim():'';
@@ -330,10 +388,10 @@ function Skeleton(){return <div className="skeleton-grid">{[1,2,3,4].map(i=><mot
 function Vehicles(){
  const {user}=useAuth();
  const canManage=canEdit(user,'vehicleRegistry');
- const [data,setData]=useState({items:[],total:0,page:1,pages:1});const [search,setSearch]=useState('');const [status,setStatus]=useState('');const [fleet,setFleet]=useState('');const [provider,setProvider]=useState('');const [modal,setModal]=useState(false);const [edit,setEdit]=useState(null);const [deleteTarget,setDeleteTarget]=useState(null);const [deleting,setDeleting]=useState(false);const [unreg,setUnreg]=useState([]);const [form,setForm]=useState({vehicleNumber:'',fleetType:'Own Fleet',gpsLink:'Wheelseye',driver:'',mobile:'',plant:'',status:'Active'});const [saving,setSaving]=useState(false);const [pageLoading,setPageLoading]=useState(true);const [pageError,setPageError]=useState(null);
+ const [data,setData]=useState({items:[],total:0,page:1,pages:1});const [search,setSearch]=useState('');const [status,setStatus]=useState('');const [fleet,setFleet]=useState('');const [provider,setProvider]=useState('');const [modal,setModal]=useState(false);const [edit,setEdit]=useState(null);const [deleteTarget,setDeleteTarget]=useState(null);const [deleting,setDeleting]=useState(false);const [unreg,setUnreg]=useState([]);const [form,setForm]=useState({vehicleNumber:'',fleetType:'Own Fleet',gpsLink:'Wheelseye',status:'Active'});const [saving,setSaving]=useState(false);const [pageLoading,setPageLoading]=useState(true);const [pageError,setPageError]=useState(null);
  const load=async()=>{setPageLoading(true);try{const r=await axios.get('/vehicles',{params:{search,status,fleetType:fleet,provider,page:data.page,limit:20}});setData(r.data);const u=await axios.get('/unregistered');setUnreg(u.data);setPageError(null)}catch(e){setPageError(e);showToast('Failed to load vehicles','error')}finally{setPageLoading(false)}};
  useEffect(()=>{load()},[status,fleet,provider,data.page]);useEffect(()=>{const t=setTimeout(()=>load(),300);return()=>clearTimeout(t)},[search]);
- const open=(v=null)=>{setEdit(v);setForm(v?{vehicleNumber:v.vehicleNumber,fleetType:v.fleetType,gpsLink:v.gpsLink,driver:v.driver||'',mobile:v.mobile||'',plant:v.plant||'',status:v.status}:{vehicleNumber:'',fleetType:'Own Fleet',gpsLink:'Wheelseye',driver:'',mobile:'',plant:'',status:'Active'});setModal(true)};
+ const open=(v=null)=>{setEdit(v);setForm(v?{vehicleNumber:v.vehicleNumber,fleetType:v.fleetType,gpsLink:v.gpsLink,status:v.status}:{vehicleNumber:'',fleetType:'Own Fleet',gpsLink:'Wheelseye',status:'Active'});setModal(true)};
  const save=async()=>{setSaving(true);try{if(edit)await axios.put('/vehicles/'+edit._id,form);else await axios.post('/vehicles',form);showToast(edit?'Vehicle updated':'Vehicle added');setModal(false);load()}catch(e){showToast(e.response?.data?.error||'Save failed','error')}finally{setSaving(false)}};
  const syncVehicle=async vehicle=>{try{const result=await axios.post('/vehicles/'+vehicle._id+'/sync');showToast(result.data.success?`GPS sync complete for ${vehicle.vehicleNumber}`:`GPS sync finished with issues for ${vehicle.vehicleNumber}`,result.data.success?'success':'error');await load()}catch(error){showToast(error.response?.data?.error||'Vehicle GPS sync failed','error')}};
  const remove=v=>setDeleteTarget(v);
@@ -341,11 +399,11 @@ function Vehicles(){
  if(pageLoading)return <Skeleton/>;
  if(pageError)return <ErrorPage title="Cannot reach server" details={pageError.message} onRetry={load}/>;
  return <><div className="page-head"><div><p className="eyebrow">Fleet master</p><h1>Vehicle Registry</h1></div>{canManage&&<AnimatedButton variant="green" onClick={()=>open()}><Plus/> Add New Vehicle</AnimatedButton>}</div>
- {canManage&&!!unreg.length&&<div className="unregistered"><b>{unreg.length} unregistered provider vehicle(s)</b>{unreg.slice(0,5).map(v=><button key={v.vehicleNumber} onClick={()=>{setForm({vehicleNumber:v.vehicleNumber,fleetType:'Own Fleet',gpsLink:v.provider,driver:'',mobile:'',plant:'',status:'Active'});setModal(true)}}>{v.vehicleNumber} <Plus size={14}/></button>)}</div>}
+ {canManage&&!!unreg.length&&<div className="unregistered"><b>{unreg.length} unregistered provider vehicle(s)</b>{unreg.slice(0,5).map(v=><button key={v.vehicleNumber} onClick={()=>{setEdit(null);setForm({vehicleNumber:v.vehicleNumber,fleetType:'Own Fleet',gpsLink:v.provider,status:'Active'});setModal(true)}}>{v.vehicleNumber} <Plus size={14}/></button>)}</div>}
  <div className="filters"><div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={fleet} onChange={e=>setFleet(e.target.value)}><option value="">Fleet Type</option><option>Own Fleet</option><option>Contract Fleet</option></select><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">GPS Provider</option><option>Wheelseye</option></select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="">Status</option><option>Active</option><option>Inactive</option></select></div>
  <Table headers={['Vehicle Number','Fleet Type','GPS Link','Driver','Mobile','Plant','Status','Last GPS time',...(canManage?['']:[])]} rows={data.items.map(v=>[v.vehicleNumber,v.fleetType,[...new Set([v.gpsLink,...(v.gpsProviders||[]).map(link=>link.name)])].filter(Boolean).join(' + '),v.driver||'-',v.mobile||'-',v.plant||'-',<span className={`badge ${v.status.toLowerCase()}`}>{v.status}</span>,fmt(v.lastGps),...(canManage?[<div className="row-actions"><AnimatedButton variant="orange" onClick={()=>syncVehicle(v)}>Sync GPS</AnimatedButton><AnimatedButton variant="blue" onClick={()=>open(v)}><Edit3 size={16}/></AnimatedButton><AnimatedButton variant="red" onClick={()=>remove(v)}><Trash2 size={16}/></AnimatedButton></div>]:[])])}/>
  <div className="pagination"><AnimatedButton variant="ghost" disabled={data.page<=1} onClick={()=>setData({...data,page:data.page-1})}>Previous</AnimatedButton><span>Page {data.page} of {data.pages||1}</span><AnimatedButton variant="ghost" disabled={data.page>=data.pages} onClick={()=>setData({...data,page:data.page+1})}>Next</AnimatedButton></div>
- <Modal open={modal} onClose={()=>setModal(false)} title={edit?'Edit Vehicle':'Add New Vehicle'} disableClose={saving}><div className="form-grid"><label>Vehicle Number<input value={form.vehicleNumber} onChange={e=>setForm({...form,vehicleNumber:e.target.value.toUpperCase()})}/></label><label>Fleet Type<select value={form.fleetType} onChange={e=>setForm({...form,fleetType:e.target.value})}><option>Own Fleet</option><option>Contract Fleet</option></select></label><label>GPS Provider<select value={form.gpsLink} onChange={e=>setForm({...form,gpsLink:e.target.value})}><option>Wheelseye</option></select></label><label>Driver<input value={form.driver} onChange={e=>setForm({...form,driver:e.target.value})}/></label><label>Mobile<input type="tel" value={form.mobile} onChange={e=>setForm({...form,mobile:e.target.value})}/></label><label>Plant<input value={form.plant} onChange={e=>setForm({...form,plant:e.target.value})}/></label><label>Status<select value={form.status} onChange={e=>setForm({...form,status:e.target.value})}><option>Active</option><option>Inactive</option></select></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setModal(false)} disabled={saving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={save}>Save</AnimatedButton></div></Modal>
+ <Modal open={modal} onClose={()=>setModal(false)} title={edit?'Edit Vehicle':'Add New Vehicle'} disableClose={saving}><div className="form-grid"><label>Vehicle Number<input value={form.vehicleNumber} onChange={e=>setForm({...form,vehicleNumber:e.target.value.toUpperCase()})}/></label><label>Fleet Type<select value={form.fleetType} onChange={e=>setForm({...form,fleetType:e.target.value})}><option>Own Fleet</option><option>Contract Fleet</option></select></label><label>GPS Provider<select value={form.gpsLink} onChange={e=>setForm({...form,gpsLink:e.target.value})}><option>Wheelseye</option></select></label><label>Status<select value={form.status} onChange={e=>setForm({...form,status:e.target.value})}><option>Active</option><option>Inactive</option></select></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setModal(false)} disabled={saving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={save}>Save</AnimatedButton></div></Modal>
  <Modal open={Boolean(deleteTarget)} onClose={()=>{if(!deleting)setDeleteTarget(null)}} title="Delete Vehicle" disableClose={deleting}><p>Delete vehicle <b>{deleteTarget?.vehicleNumber}</b>? This action cannot be undone.</p><div className="modal-actions"><AnimatedButton variant="red" loading={deleting} onClick={confirmRemove}>Delete Vehicle</AnimatedButton><AnimatedButton variant="ghost" onClick={()=>setDeleteTarget(null)} disabled={deleting}>Cancel</AnimatedButton></div></Modal></>
 }
 
@@ -876,6 +934,7 @@ function AIChat({open,onClose}){
  const [adminData,setAdminData]=useState({items:[],pages:1,total:0,usernames:[]});
  const [adminError,setAdminError]=useState('');
  const messagesRef=useRef(null);
+ const sendInFlightRef=useRef(false);
  const isAdmin=Boolean(user?.isAdmin);
 
  useEffect(()=>{
@@ -908,15 +967,18 @@ function AIChat({open,onClose}){
  },[open,user?.username,user?.fullName]);
 
  const send=async(question=text)=>{
-  const prompt=String(question||'').trim();
-  if(!prompt||loading)return;
+  const prompt=String(question??'');
+  if(!prompt.trim()||sendInFlightRef.current)return;
+  sendInFlightRef.current=true;
   const userMessageId=`user-${Date.now()}`;
   setMessages(current=>[...current,{id:userMessageId,from:'user',text:prompt,userFullName:user?.fullName}]);
   setText('');
   setTab('chat');
   setLoading(true);
   try{
-   const response=await axios.post('/ai/chat',{message:prompt,sessionId});
+   const payload={message:prompt};
+   if(typeof sessionId==='string'&&sessionId.trim())payload.sessionId=sessionId;
+   const response=await axios.post('/ai/chat',payload,{headers:{'Content-Type':'application/json'}});
    setSessionId(response.data.sessionId||sessionId);
    const answer=normalizeChatAnswer(response.data);
    const metadata={
@@ -947,7 +1009,7 @@ function AIChat({open,onClose}){
     ...current.map(item=>item.id===userMessageId?{...item,...metadata}:item),
     {id:`answer-${Date.now()}`,from:'bot',question:prompt,...metadata,text:message||'Data nahi mila.'}
    ]);
-  }finally{setLoading(false)}
+  }finally{sendInFlightRef.current=false;setLoading(false)}
  };
 
  useEffect(()=>{
@@ -999,7 +1061,8 @@ function AIChat({open,onClose}){
   setHistoryRowsLoading(true);
   try{
    const response=await axios.get('/ai/history/records',{params:{
-    vehicleNumber:message.vehicleNumber,from:range.from,to:range.to,offset:message.rows?.length||0,limit:20
+    ...(message.vehicleNumber?{vehicleNumber:message.vehicleNumber}:{allVehicles:true}),
+    from:range.from,to:range.to,offset:message.rows?.length||0,limit:20
    }});
    setMessages(current=>current.map(item=>item.id===message.id?{...item,rows:[...(item.rows||[]),...(response.data.rows||[])]}:item));
   }catch(error){showToast(error.response?.data?.error||'Vehicle history load nahi hui.','error')}
@@ -1135,8 +1198,8 @@ function ChatMessage({message,onAskAgain,onLoadMoreHistory,loadingMoreHistory=fa
  const answer=message.from==='bot'?normalizeChatAnswer(message):null;
  const language=answer?.language||message.language||'en';
  const labels=language==='hi'
-  ?{vehicle:'गाड़ी',location:'लोकेशन',coordinates:'निर्देशांक',speed:'स्पीड',ignition:'IGN',gpsTime:'GPS समय',provider:'प्रदाता',plant:'प्लांट',entry:'प्रवेश',stay:'ठहराव',map:'मैप खोलें',more:'और दिखाएं',outside:'बाहर/ट्रांजिट',records:'रिकॉर्ड'}
-  :{vehicle:'Vehicle',location:'Location',coordinates:'Coordinates',speed:'Speed',ignition:'IGN',gpsTime:'GPS time',provider:'Provider',plant:'Plant',entry:'Entry',stay:'Stay',map:'Open map',more:'Show more',outside:'Outside/Transit',records:'records'};
+  ?{vehicle:'गाड़ी',location:'लोकेशन',coordinates:'निर्देशांक',speed:'स्पीड',ignition:'IGN',gpsTime:'GPS समय',lastUpdate:'अंतिम अपडेट',provider:'प्रदाता',plant:'प्लांट',entry:'प्रवेश',stay:'ठहराव',status:'स्थिति',map:'मैप खोलें',more:'और दिखाएं',outside:'बाहर/ट्रांजिट',records:'रिकॉर्ड',unknown:'पुष्टि नहीं हुई'}
+  :{vehicle:'Vehicle',location:'Location',coordinates:'Coordinates',speed:'Speed',ignition:'IGN',gpsTime:'GPS time',lastUpdate:'Last update',provider:'Provider',plant:'Plant',entry:'Entry',stay:'Stay',status:'Status',map:'Open map',more:'Show more',outside:'Outside/Transit',records:'records',unknown:'Availability not confirmed'};
  const rows=answer?.rows||[];
  const showRows=rows.slice(0,visibleRows);
  const timestamp=message.from==='user'
@@ -1150,16 +1213,25 @@ function ChatMessage({message,onAskAgain,onLoadMoreHistory,loadingMoreHistory=fa
     <b>{answer.plantName} · {answer.total??rows.length} {chatText(language,'vehicles','गाड़ियाँ')}</b>
     <div className="chat-answer-table">
      {rows.map((row,index)=><div className="chat-answer-row" key={`${row.vehicleNumber}-${index}`}>
-      <strong>{row.vehicleNumber}</strong><span>{labels.entry}: {formatChatDate(row.entryTime)}</span><span>{labels.stay}: {row.stay||`${row.stayHours||0} h`}</span>
+      <strong>{row.vehicleNumber}</strong><span>{labels.location}: {row.location||chatText(language,'Readable address unavailable','पता उपलब्ध नहीं')}</span><span>{labels.coordinates}: {row.lat??'N/A'}, {row.lng??'N/A'}</span><span>{labels.gpsTime}: {formatChatDate(row.gpsTime)}</span><span>{labels.lastUpdate}: {formatChatDate(row.lastUpdate)}</span><span>{labels.provider}: {row.provider||'N/A'}</span><span>{labels.status}: {row.availabilityStatus||row.status||labels.unknown}</span>
      </div>)}
     </div>
+   </div>}
+   {answer.type==='plantVehicles'&&answer.unconfirmedRows?.length>0&&<div className="chat-answer-card">
+    <b>{labels.unknown} · {answer.unconfirmedRows.length}</b>
+    <div className="chat-answer-table">{answer.unconfirmedRows.map((row,index)=><div className="chat-answer-row" key={`unconfirmed-${row.vehicleNumber}-${index}`}><strong>{row.vehicleNumber}</strong><span>{labels.location}: {row.location||chatText(language,'Readable address unavailable','पता उपलब्ध नहीं')}</span><span>{labels.coordinates}: {row.lat??'N/A'}, {row.lng??'N/A'}</span><span>{labels.gpsTime}: {formatChatDate(row.gpsTime)}</span><span>{labels.lastUpdate}: {formatChatDate(row.lastUpdate)}</span><span>{labels.status}: {row.availabilityStatus}</span></div>)}</div>
    </div>}
    {answer.type==='plants'&&<div className="chat-answer-groups">
     {(answer.plants||[]).map(plant=><section className="chat-answer-card" key={plant.plantName}>
      <b>{plant.plantName} · {plant.count}</b>
-     {plant.rows?.length>0&&<div className="chat-answer-table">{plant.rows.map((row,index)=><div className="chat-answer-row" key={`${row.vehicleNumber}-${index}`}><strong>{row.vehicleNumber}</strong><span>{labels.entry}: {formatChatDate(row.entryTime)}</span><span>{labels.stay}: {row.stay}</span></div>)}</div>}
+     {plant.rows?.length>0&&<div className="chat-answer-table">{plant.rows.map((row,index)=><div className="chat-answer-row" key={`${row.vehicleNumber}-${index}`}><strong>{row.vehicleNumber}</strong><span>{labels.location}: {row.location||chatText(language,'Readable address unavailable','पता उपलब्ध नहीं')}</span><span>{labels.coordinates}: {row.lat??'N/A'}, {row.lng??'N/A'}</span><span>{labels.gpsTime}: {formatChatDate(row.gpsTime)}</span><span>{labels.lastUpdate}: {formatChatDate(row.lastUpdate)}</span><span>{labels.status}: {row.availabilityStatus}</span></div>)}</div>}
+     {plant.unconfirmedRows?.length>0&&<><b>{labels.unknown}</b><div className="chat-answer-table">{plant.unconfirmedRows.map((row,index)=><div className="chat-answer-row" key={`plant-unknown-${row.vehicleNumber}-${index}`}><strong>{row.vehicleNumber}</strong><span>{labels.location}: {row.location||chatText(language,'Readable address unavailable','पता उपलब्ध नहीं')}</span><span>{labels.coordinates}: {row.lat??'N/A'}, {row.lng??'N/A'}</span><span>{labels.gpsTime}: {formatChatDate(row.gpsTime)}</span><span>{labels.lastUpdate}: {formatChatDate(row.lastUpdate)}</span><span>{labels.status}: {row.availabilityStatus}</span></div>)}</div></>}
     </section>)}
     <section className="chat-answer-card"><b>{labels.outside} · {answer.transit?.count||0}</b>{answer.transit?.vehicles?.length>0&&<span>{answer.transit.vehicles.join(', ')}</span>}</section>
+    {answer.unknown?.count>0&&<section className="chat-answer-card"><b>{labels.unknown} · {answer.unknown.count}</b><span>{answer.unknown.vehicles.join(', ')}</span></section>}
+   </div>}
+   {answer.type==='vehicleList'&&rows.length>0&&<div className="chat-answer-table chat-history-results">
+    {rows.map((row,index)=><div className="chat-history-result" key={`${row.vehicleNumber}-${index}`}><strong>{labels.vehicle}: {row.vehicleNumber}</strong><span>{labels.location}: {row.location||chatText(language,'Readable address unavailable','पता उपलब्ध नहीं')}</span><span>{labels.coordinates}: {row.lat??'N/A'}, {row.lng??'N/A'}</span><span>{labels.provider}: {row.provider} · {labels.gpsTime}: {formatChatDate(row.gpsTime)} · {labels.lastUpdate}: {formatChatDate(row.lastUpdate)}</span><span>{labels.status}: {row.status}</span></div>)}
    </div>}
    {answer.type==='outside'&&<div className="chat-answer-card"><b>{labels.outside} · {answer.count||0}</b>{answer.vehicles?.length>0&&<span>{answer.vehicles.join(', ')}</span>}</div>}
    {answer.type==='outsideHistory'&&rows.length>0&&<div className="chat-answer-table chat-history-results">
@@ -1173,14 +1245,15 @@ function ChatMessage({message,onAskAgain,onLoadMoreHistory,loadingMoreHistory=fa
     {rows.map(row=><div className="chat-history-result" key={row.provider}><strong>{row.provider} · {row.status}</strong><span>{chatText(language,'Last success','आखिरी सफलता')}: {formatChatDate(row.lastSuccessTime)}</span><span>{chatText(language,'Vehicles','गाड़ियाँ')}: {row.vehicleCount??0} · {chatText(language,'Not responding','जवाब नहीं दे रहीं')}: {row.vehiclesNotResponding??0}</span></div>)}
    </div>}
    {(answer.type==='vehicle'||answer.type==='vehicleMissing')&&answer.location&&<div className="chat-answer-card chat-vehicle-card">
-    <span><b>{labels.vehicle}:</b> {answer.vehicleNumber}</span><span><b>{labels.location}:</b> {answer.location}</span><span><b>{labels.coordinates}:</b> {answer.lat??'N/A'}, {answer.lng??'N/A'}</span><span><b>{labels.speed}:</b> {answer.speed}</span><span><b>{labels.ignition}:</b> {answer.ignition}</span><span><b>{labels.gpsTime}:</b> {formatChatDate(answer.gpsTime)}</span><span><b>{labels.provider}:</b> {answer.provider}</span><span><b>{labels.plant}:</b> {answer.plantName}</span>
+    <span><b>{labels.vehicle}:</b> {answer.vehicleNumber}</span><span><b>{labels.location}:</b> {answer.location}</span><span><b>{labels.coordinates}:</b> {answer.lat??'N/A'}, {answer.lng??'N/A'}</span><span><b>{labels.speed}:</b> {answer.speed}</span><span><b>{labels.ignition}:</b> {answer.ignition}</span><span><b>{labels.gpsTime}:</b> {formatChatDate(answer.gpsTime)}</span><span><b>{labels.lastUpdate}:</b> {formatChatDate(answer.lastUpdate)}</span><span><b>{labels.provider}:</b> {answer.provider}</span><span><b>{labels.plant}:</b> {answer.plantName}</span><span><b>{labels.status}:</b> {answer.status|| (answer.stale?'Stale':'Unknown')}</span>
+    {answer.nearestPlantName&&<span>{chatText(language,'Nearest plant','निकटतम प्लांट')}: {answer.nearestPlantName} · {answer.plantConfirmed?'Confirmed':labels.unknown}</span>}
     {answer.entryTime&&<span><b>{labels.entry}:</b> {formatChatDate(answer.entryTime)} · {labels.stay}: {answer.stay}</span>}
     {answer.stale&&<em>{chatText(language,'GPS data is stale.','GPS डेटा पुराना है।')}</em>}
     {answer.map&&<a className="chat-map-link" href={answer.map} target="_blank" rel="noreferrer">{labels.map}</a>}
    </div>}
    {answer.type==='history'&&rows.length>0&&<div className="chat-answer-table chat-history-results">
     {showRows.map((row,index)=><div className="chat-history-result" key={`${row.time}-${index}`}>
-     <strong>{formatChatDate(row.time)}</strong><span>{row.address}</span><span>{labels.speed}: {row.speed} · {labels.ignition}: {row.ignition}</span>
+     <strong>{row.vehicleNumber?`${row.vehicleNumber} · `:''}{formatChatDate(row.time)}</strong><span>{row.address}</span><span>{labels.coordinates}: {row.lat??'N/A'}, {row.lng??'N/A'} · {labels.provider}: {row.provider||'N/A'}</span><span>{labels.lastUpdate}: {formatChatDate(row.lastUpdate)} · {labels.speed}: {row.speed} · {labels.ignition}: {row.ignition} · {labels.status}: {row.status}</span>
      {row.map&&<a className="chat-map-link" href={row.map} target="_blank" rel="noreferrer">{labels.map}</a>}
     </div>)}
     {visibleRows<rows.length&&<button type="button" className="chat-more" onClick={()=>setVisibleRows(count=>count+20)}>{labels.more}</button>}
