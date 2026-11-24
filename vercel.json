@@ -1,5 +1,8 @@
 {
   "version": 2,
+  "buildCommand": "npm run build",
+  "outputDirectory": "frontend/dist",
+  "framework": null,
   "rewrites": [
     {
       "source": "/api/:path*",
@@ -14,8 +17,8 @@
       "destination": "/api/index.js?__sikka_path=/share/:path*"
     },
     {
-      "source": "/",
-      "destination": "/api/index.js?__sikka_path=/"
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }

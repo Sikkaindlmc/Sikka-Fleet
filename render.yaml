@@ -28,19 +28,7 @@ services:
         sync: false
       - key: WHEELSEYE_API_TOKEN
         sync: false
-      - key: FLEETX_LOGIN_URL
-        sync: false
-      - key: FLEETX_API_URL
-        sync: false
-      - key: FLEETX_LIVE_BY_NUMBER_URL
-        sync: false
-      - key: FLEETX_GRANT_TYPE
-        sync: false
-      - key: FLEETX_USERNAME
-        sync: false
-      - key: FLEETX_PASSWORD
-        sync: false
-      - key: FLEETX_BASIC_AUTH
+      - key: NOMINATIM_URL
         sync: false
       - key: NOMINATIM_USER_AGENT
-        sync: false
+        value: SIKKA-FLEET/1.0

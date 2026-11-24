@@ -1,5 +1,5 @@
-const axios=require('axios');
 const M=require('../models');
+const axios=require('axios');
 const inFlight=new Map();
 let nominatimQueue=Promise.resolve();
 let lastNominatimRequest=0;
@@ -16,44 +16,52 @@ function isCoordinateText(value){
  return typeof value==='string'&&/^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/.test(value);
 }
 
+function getNominatimEndpoint(value=process.env.NOMINATIM_URL){
+ if(!String(value||'').trim())return null;
+ const endpoint=new URL(String(value).trim());
+ const localHosts=['localhost','127.0.0.1','[::1]'];
+ const localDevelopment=process.env.NODE_ENV!=='production'&&endpoint.protocol==='http:'&&localHosts.includes(endpoint.hostname);
+ if(endpoint.protocol!=='https:'&&!localDevelopment){
+  throw new Error('NOMINATIM_URL must use HTTPS, except for a local development server');
+ }
+ if(/(^|\.)openstreetmap\.(org|de)$/i.test(endpoint.hostname)){
+  throw new Error('Public Nominatim endpoints are disabled; configure a self-hosted instance');
+ }
+ return endpoint.toString();
+}
+
 function joinAddress(parts){
  return parts.filter((value,index,array)=>value&&array.findIndex(v=>v===value)===index).join(', ');
 }
 
 function parseNominatim(payload){
  if(!payload?.display_name)return null;
- const a=payload.address||{};
- const locality=a.suburb||a.neighbourhood||a.hamlet||a.village||a.town||a.city_district||'';
- const city=a.city||a.town||a.village||a.municipality||a.county||'';
- const district=a.district||a.county||'';
- const state=a.state||a.region||'';
- const pincode=a.postcode||'';
- const country=a.country||'';
+ const address=payload.address||{};
+ const locality=address.suburb||address.neighbourhood||address.hamlet||address.village||address.town||address.city_district||'';
+ const city=address.city||address.town||address.village||address.municipality||address.county||'';
+ const district=address.district||address.county||'';
+ const state=address.state||address.region||'';
+ const pincode=address.postcode||'';
+ const country=address.country||'';
  return {
-  readableLocation:joinAddress([locality,a.road||a.pedestrian||a.residential||'',city,district,state,pincode,country])||payload.display_name,
+  readableLocation:joinAddress([locality,address.road||address.pedestrian||address.residential||'',city,district,state,pincode,country])||payload.display_name,
   locality,city,district,state,pincode,country,provider:'OpenStreetMap'
  };
 }
 
 async function nominatimReverse(lat,lng){
+ const endpoint=getNominatimEndpoint();
+ if(!endpoint)return null;
  const execute=async()=>{
   const wait=Math.max(0,1000-(Date.now()-lastNominatimRequest));
   if(wait)await new Promise(resolve=>setTimeout(resolve,wait));
   lastNominatimRequest=Date.now();
-  for(let attempt=0;attempt<2;attempt++){
-   try{
-    const response=await axios.get('https://nominatim.openstreetmap.org/reverse',{
-     params:{lat,lon:lng,format:'jsonv2',addressdetails:1,'accept-language':'en'},
-     timeout:10000,
-     headers:{'User-Agent':process.env.NOMINATIM_USER_AGENT||'SIKKA-FLEET/1.0','Accept-Language':'en'}
-    });
-    return parseNominatim(response.data);
-   }catch(error){
-    if(attempt===1)return null;
-    await new Promise(resolve=>setTimeout(resolve,1000));
-   }
-  }
-  return null;
+  const response=await axios.get(endpoint,{
+   params:{lat,lon:lng,format:'jsonv2',addressdetails:1,'accept-language':'en'},
+   timeout:10000,
+   headers:{'User-Agent':process.env.NOMINATIM_USER_AGENT||'SikkaFleet/1.0','Accept-Language':'en'}
+  });
+  return parseNominatim(response.data);
  };
  const pending=nominatimQueue.then(execute,execute);
  nominatimQueue=pending.then(()=>undefined,()=>undefined);
@@ -100,11 +108,7 @@ async function resolve(lat,lng,{providerAddress,providerFields={},previous}={}){
  const resolving=(async()=>{
   const resolved=await nominatimReverse(Number(lat),Number(lng));
   if(!resolved&&previous?.readableLocation&&!isCoordinateText(previous.readableLocation)){
-   return {
-    ...previous,
-    provider:previous.geocodingProvider||previous.provider||'Provider',
-    isCurrent:false
-   };
+   return {...previous,provider:previous.geocodingProvider||previous.provider||'Provider',isCurrent:false};
   }
   if(!resolved)return null;
   resolved.geocodedAt=new Date();
@@ -116,4 +120,4 @@ async function resolve(lat,lng,{providerAddress,providerFields={},previous}={}){
  finally{inFlight.delete(key)}
 }
 
-module.exports={resolve,validCoordinates,coordinateKey,parseNominatim,isCoordinateText};
+module.exports={resolve,validCoordinates,coordinateKey,isCoordinateText,getNominatimEndpoint,parseNominatim};

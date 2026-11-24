@@ -11,8 +11,8 @@ test('normalizes vehicle identity consistently across case and separators',()=>{
 test('groups provider records by normalized vehicle identity',()=>{
  const groups=groupByVehicleNumber([
   {vehicleNumber:'UP 14 GT 0100',provider:'Wheelseye'},
-  {vehicleNumber:'up14-gt.0100',provider:'FleetX'},
-  {vehicleNumber:'DL01AA1234',provider:'FleetX'}
+  {vehicleNumber:'up14-gt.0100',provider:'Wheelseye'},
+  {vehicleNumber:'DL01AA1234',provider:'Wheelseye'}
  ]);
 
  assert.equal(groups.get('UP14GT0100').length,2);

@@ -18,10 +18,12 @@ const M=require('./models');
 const {normalizePermissions,hasPermission}=require('./permissions');
 const reverseGeocoding=require('./services/reverseGeocodingService');
 const wheelseyeService=require('./services/wheelseyeService');
-const fleetxService=require('./services/fleetxService');
 const fleetSnapshotService=require('./services/fleetSnapshotService');
 const sikkaAiService=require('./services/sikkaAiService');
 const historyRetention=require('./jobs/historyRetention');
+const {
+ GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,getNextAutoSyncAt
+}=require('./services/gpsSyncSchedule');
 const {
  normalizeVehicleNumber:normalizeNumber,groupByVehicleNumber,vehicleNumberRegex
 }=require('./services/vehicleIdentity');
@@ -35,12 +37,12 @@ const allowedOrigins=[
  'https://sikka-fleet.vercel.app',
  'http://localhost:5173',
  'http://localhost:5000',
- ...(process.env.ALLOWED_ORIGINS?process.env.ALLOWED_ORIGINS.split(',').map(s=>s.trim()).filter(Boolean):[])
+ ...(process.env.ALLOWED_ORIGINS?process.env.ALLOWED_ORIGINS.split(',').map(s=>s.trim()).filter(origin=>origin&&origin!=='*'):[])
 ];
 app.use(cors({
  origin:(origin,callback)=>{
   if(!origin)return callback(null,true);
-  if(allowedOrigins.includes(origin)||/^https:\/\/sikka-fleet.*\.vercel\.app$/.test(origin)){
+  if(allowedOrigins.includes(origin)||/^https:\/\/sikka-fleet(?:-[a-z0-9-]+)?\.vercel\.app$/.test(origin)){
    return callback(null,true);
   }
   return callback(null,false);
@@ -64,8 +66,7 @@ const GPS_SYNC_LOCK_KEY='gps-sync';
 const GPS_SYNC_LOCK_TTL_MS=90000;
 const GPS_SYNC_LOCK_RENEW_MS=20000;
 const GPS_PROVIDER_DEFAULTS={
- Wheelseye:{url:'https://api.wheelseye.com/currentLoc',environmentVariable:'WHEELSEYE_API_URL',credentialsReference:'WHEELSEYE_API_TOKEN'},
- FleetX:{url:'https://api.fleetx.io/api/v1/analytics/live',environmentVariable:'FLEETX_API_URL',credentialsReference:'FLEETX_USERNAME, FLEETX_PASSWORD, FLEETX_BASIC_AUTH'}
+ Wheelseye:{url:'https://api.wheelseye.com/currentLoc',environmentVariable:'WHEELSEYE_API_URL',credentialsReference:'WHEELSEYE_API_TOKEN'}
 };
 let syncing=false,syncScheduler=null;
 
@@ -160,7 +161,7 @@ async function seedAdmin(){
 
 let initPromise=null;
 async function ensureInitialized(){
- if(mongoose.connection.readyState>=1)return;
+ if(mongoose.connection.readyState===1)return;
  if(!initPromise){
   initPromise=(async()=>{
    const mongoUri=process.env.MONGO_URI||process.env.MONGODB_URI;
@@ -182,11 +183,14 @@ async function ensureInitialized(){
  return initPromise;
 }
 
-app.use(async(req,_res,next)=>{
+app.use(async(req,res,next)=>{
  try{
   await ensureInitialized();
  }catch(err){
   console.error('[DB init error]',err.message);
+  if(req.path.startsWith('/api/')||req.path.startsWith('/uploads/')||req.path.startsWith('/share/')){
+   return res.status(503).json({error:'Database temporarily unavailable'});
+  }
  }
  next();
 });
@@ -241,11 +245,6 @@ function flattenProvider(payload,provider){
  }).filter(x=>x.vehicleNumber&&reverseGeocoding.validCoordinates(x.lat,x.lng)&&Number.isFinite(x.gpsTime.getTime()));
 }
 
-function getNextAutoSyncAt(now=new Date()){
- const interval=30*60*1000;
- return new Date((Math.floor(now.getTime()/interval)+1)*interval);
-}
-
 function isRetryableProviderError(error){
  const status=Number(error.response?.status||error.statusCode||0);
  return [408,425,429].includes(status)||status>=500||
@@ -271,6 +270,47 @@ async function retryProviderRequest(provider,request){
  throw new Error(`${provider} request failed after retries`);
 }
 
+async function getGpsSyncStatus(now=new Date()){
+ const [lastCycle,lastSuccessfulSync,lastManualSync,lastAutoSync,activeLock,gpsData]=await Promise.all([
+  M.SyncLog.findOne({finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean(),
+  M.SyncLog.findOne({success:true}).sort({finishedAt:-1}).lean(),
+  M.SyncLog.findOne({type:'manual'}).sort({finishedAt:-1}).lean(),
+  M.SyncLog.findOne({type:'auto',finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean(),
+  M.GpsSyncLock.findOne({key:GPS_SYNC_LOCK_KEY,lockUntil:{$gt:now}}).lean(),
+  M.VehicleLiveStatus.findOne({syncedAt:{$exists:true}}).sort({syncedAt:-1}).select('syncedAt').lean()
+ ]);
+ const active=Boolean(activeLock);
+ const recentAutomaticSync=lastAutoSync?.finishedAt&&
+  now.getTime()-new Date(lastAutoSync.finishedAt).getTime()<=GPS_SYNC_INTERVAL_MS+GPS_SYNC_RETRY_MS;
+ const autoSyncActive=Boolean(syncScheduler)||Boolean(recentAutomaticSync)||activeLock?.type==='auto';
+ const lastCycleErrors=lastCycle?.result
+  ?Object.entries(lastCycle.result).flatMap(([provider,result])=>
+    Array.isArray(result?.errors)?result.errors.map(error=>({provider,...error})):[])
+  :[];
+ const failureMessage=lastCycle?.result?.error||lastCycle?.result?.reason||
+  lastCycleErrors[0]?.message||lastCycle?.result?.geofenceError||'';
+ const status=active?'Syncing':lastCycle
+  ?lastCycle.success?'Sync Successful':'Sync Failed'
+  :autoSyncActive?'Scheduled':'Inactive';
+ return {
+  serverTime:now,
+  autoSyncActive,isSyncing:active,status,
+  nextAutoSyncAt:getNextAutoSyncAt(now,lastCycle),
+  lastSuccessfulSyncAt:lastSuccessfulSync?.finishedAt||null,
+  lastManualSyncAt:lastManualSync?.finishedAt||lastManualSync?.startedAt||null,
+  lastSyncAt:lastCycle?.finishedAt||lastCycle?.startedAt||null,
+  lastError:lastCycle?.success?'':failureMessage,
+  totalVehiclesSynced:lastCycle?.result?.totalVehiclesSynced||0,
+  failedVehicleCount:lastCycle?.result?.failedVehicleCount||0,
+  failedProviderCount:lastCycle?.result?.failedProviderCount||0,
+  gpsDataLastUpdated:gpsData?.syncedAt||null,
+  lastCycleErrors:lastCycleErrors.slice(0,20),
+  lastCycleGeofenceError:lastCycle?.result?.geofenceError||null,
+  lastCycleSuccess:lastCycle?.success??null,
+  lastCycleType:lastCycle?.type||null
+ };
+}
+
 function normalizeIgnitionStatus(value){
  if(value==null||value==='')return 'N/A';
  if(value===true||value===1)return 'ON';
@@ -292,12 +332,12 @@ function normalizeRunningStatus(value,speed,ignition){
  return ignition==='ON'?'Idle':'Unknown';
 }
 
-async function acquireGpsSyncLock(owner,now){
+async function acquireGpsSyncLock(owner,now,type){
  try{
   const lock=await M.GpsSyncLock.findOneAndUpdate({
    key:GPS_SYNC_LOCK_KEY,
    $or:[{lockUntil:{$lte:now}},{lockUntil:{$exists:false}}]
-  },{$set:{owner,acquiredAt:now,lockUntil:new Date(now.getTime()+GPS_SYNC_LOCK_TTL_MS)}},
+  },{$set:{owner,type,acquiredAt:now,lockUntil:new Date(now.getTime()+GPS_SYNC_LOCK_TTL_MS)}},
   {upsert:true,new:true});
   return lock?.owner===owner;
  }catch(error){
@@ -319,9 +359,10 @@ async function runSync(type='manual'){
  if(syncing)return logSkippedSync(type,'Sync already running',attemptedAt);
  syncing=true;
  const owner=crypto.randomUUID();
+ let nextSyncDelay=GPS_SYNC_RETRY_MS;
  let lockAcquired=false,lockLost=false,heartbeat=null;
  try{
-  lockAcquired=await acquireGpsSyncLock(owner,attemptedAt);
+  lockAcquired=await acquireGpsSyncLock(owner,attemptedAt,type);
   if(!lockAcquired)return await logSkippedSync(type,'Another backend instance is running GPS sync',attemptedAt);
   heartbeat=setInterval(async()=>{
    try{
@@ -353,8 +394,7 @@ async function runSync(type='manual'){
   const synchronizedRegisteredNumbers=new Set();
   const result={};
   const providers=[
-   {name:'Wheelseye',fetch:baseUrl=>wheelseyeService.fetchLive({baseUrl})},
-   {name:'FleetX',fetch:baseUrl=>fleetxService.fetchLive(baseUrl),map:fleetxService.mapLiveRecords}
+    {name:'Wheelseye',fetch:baseUrl=>wheelseyeService.fetchLive({baseUrl})}
   ];
   for(const p of providers){
    if(lockLost)throw new Error('GPS sync stopped after losing the distributed lock');
@@ -377,25 +417,6 @@ async function runSync(type='manual'){
    try{
     const response=await retryProviderRequest(p.name,()=>p.fetch(providerSettings?.baseUrl));
     let rows=p.map?p.map(response.data):flattenProvider(response.data,p.name);
-    if(p.name==='FleetX'){
-     const received=new Set(rows.map(row=>normalizeNumber(row.vehicleNumber)));
-     for(const vehicle of registered){
-      if(lockLost)throw new Error('GPS sync stopped after losing the distributed lock');
-      const vehicleNumber=normalizeNumber(vehicle.vehicleNumber);
-      if(received.has(vehicleNumber))continue;
-      try{
-       const fallback=await retryProviderRequest(p.name,()=>fleetxService.fetchLiveByNumber(vehicleNumber,providerSettings?.baseUrl));
-       const fallbackRows=fleetxService.mapLiveRecords(fallback.data,vehicleNumber);
-       const row=fallbackRows.find(item=>item.vehicleNumber===vehicleNumber);
-       if(row){rows.push(row);received.add(row.vehicleNumber)}
-       else errorDetails.push({vehicleNumber,message:'No valid live GPS record was returned'});
-      }catch(error){
-       const code=error.response?.status||error.statusCode||0;
-       errorDetails.push({vehicleNumber,code,message:error.message});
-       console.warn(`[GPS sync] FleetX live lookup failed for ${vehicleNumber}`,{code,message:error.message});
-      }
-     }
-    }
     const newestByNumber=new Map();
     for(const row of rows){
      const vehicleNumber=normalizeNumber(row.vehicleNumber);
@@ -546,6 +567,7 @@ async function runSync(type='manual'){
   const totalVehiclesSynced=synchronizedRegisteredNumbers.size;
   const failedVehicleCount=failedVehicleNumbers.length;
   const success=allProvidersSucceeded&&failedVehicleCount===0&&!geofenceError;
+  nextSyncDelay=success?GPS_SYNC_INTERVAL_MS:GPS_SYNC_RETRY_MS;
   const summary={
    ...result,totalVehiclesSynced,failedVehicleCount,failedProviderCount,
    geofenceError,partialSuccess:successfulProviders>0&&!success
@@ -554,7 +576,7 @@ async function runSync(type='manual'){
   return {
    started:true,startedAt,finishedAt,result:summary,success,
    partialSuccess:summary.partialSuccess,totalVehiclesSynced,failedVehicleCount,
-   failedProviderCount,nextAutoSyncAt:getNextAutoSyncAt(finishedAt)
+   failedProviderCount,nextAutoSyncAt:getNextAutoSyncAt(finishedAt,{finishedAt,success})
   };
  }catch(error){
   const finishedAt=new Date();
@@ -585,6 +607,7 @@ async function runSync(type='manual'){
    }
   }
   syncing=false;
+  if(syncScheduler)scheduleNextAutoSync(nextSyncDelay);
  }
 }
 
@@ -682,8 +705,15 @@ app.get('/api/auth/me',auth,async(req,res)=>{
 });
 
 app.get('/api/dashboard',auth,permission('Dashboard','view'),async(req,res)=>{
- const snapshot=await fleetSnapshotService.getOperationalSnapshot(M);
- res.json({plants:snapshot.plants,transit:snapshot.transit,lastSync:snapshot.lastSync?.finishedAt||snapshot.lastSync?.startedAt||null,nextSyncAt:getNextAutoSyncAt(),providers:snapshot.providers});
+ const [snapshot,syncStatus]=await Promise.all([
+  fleetSnapshotService.getOperationalSnapshot(M),getGpsSyncStatus()
+ ]);
+ res.json({
+  plants:snapshot.plants,transit:snapshot.transit,
+  lastSync:syncStatus.lastSuccessfulSyncAt,
+  nextSyncAt:syncStatus.nextAutoSyncAt,syncStatus,
+  providers:snapshot.providers
+ });
 });
 function allowedNumber(n){return /^[A-Z0-9]+$/.test(n)}
 function _nameSafe(p){return p.name}
@@ -717,7 +747,7 @@ app.get('/api/vehicles',auth,permission('Vehicle Registry','view'),async(req,res
  }
  res.json({items:items.map(vehicle=>({...vehicle,lastGps:liveByNumber.get(normalizeNumber(vehicle.vehicleNumber))?.gpsTime||null})),total,page,pages:Math.ceil(total/limit)});
 });
-app.post('/api/vehicles',auth,permission('Vehicle Registry','edit'),[body('vehicleNumber').trim().notEmpty(),body('fleetType').isIn(['Own Fleet','Contract Fleet']),body('gpsLink').isIn(['Wheelseye','FleetX']),body('status').isIn(['Active','Inactive'])],async(req,res)=>{
+app.post('/api/vehicles',auth,permission('Vehicle Registry','edit'),[body('vehicleNumber').trim().notEmpty(),body('fleetType').isIn(['Own Fleet','Contract Fleet']),body('gpsLink').isIn(['Wheelseye']),body('status').isIn(['Active','Inactive'])],async(req,res)=>{
  if(!validationResult(req).isEmpty())return res.status(400).json({error:'Invalid vehicle details'});
  const vehicleNumber=normalizeNumber(req.body.vehicleNumber);
  const match=vehicleNumberRegex(vehicleNumber);
@@ -741,6 +771,7 @@ app.post('/api/vehicles',auth,permission('Vehicle Registry','edit'),[body('vehic
 app.put('/api/vehicles/:id',auth,permission('Vehicle Registry','edit'),async(req,res)=>{
  const allowedFields=['vehicleNumber','fleetType','gpsLink','status','driver','mobile','plant'];
  const d=Object.fromEntries(allowedFields.filter(key=>Object.prototype.hasOwnProperty.call(req.body,key)).map(key=>[key,req.body[key]]));
+ if(d.gpsLink!==undefined&&d.gpsLink!=='Wheelseye')return res.status(400).json({error:'Invalid GPS provider'});
  for(const key of ['driver','mobile','plant'])if(d[key]!==undefined)d[key]=String(d[key]||'').trim();
  d.updatedBy=req.user.sub;
  if(d.vehicleNumber!==undefined){
@@ -842,34 +873,13 @@ app.delete('/api/plants/:id',auth,permission('Plant','edit'),async(req,res)=>{
 });
 
 app.get('/api/tracking',auth,permission('GPS Track','view'),async(req,res)=>{
- const [snapshot,lastSuccessfulSync,lastManualSync,lastCycle,gpsData]=await Promise.all([
-  fleetSnapshotService.getOperationalSnapshot(M),
-  M.SyncLog.findOne({success:true}).sort({finishedAt:-1}).lean(),
-  M.SyncLog.findOne({type:'manual'}).sort({startedAt:-1}).lean(),
-  M.SyncLog.findOne({'result.totalVehiclesSynced':{$exists:true}}).sort({startedAt:-1}).lean(),
-  M.VehicleLiveStatus.findOne({syncedAt:{$exists:true}}).sort({syncedAt:-1}).select('syncedAt').lean()
+ const [snapshot,syncStatus]=await Promise.all([
+  fleetSnapshotService.getOperationalSnapshot(M),getGpsSyncStatus()
  ]);
- const lastCycleErrors=lastCycle?.result
-  ?Object.entries(lastCycle.result).flatMap(([provider,result])=>
-    Array.isArray(result?.errors)?result.errors.map(error=>({provider,...error})):[])
-  :[];
  res.json({
   live:snapshot.live,registeredVehicles:snapshot.registeredVehicles,
   registeredCount:snapshot.registeredCount,summary:snapshot.summary,
-  providers:snapshot.providers,lastSync:snapshot.lastSync,
-  syncStatus:{
-   autoSyncActive:Boolean(syncScheduler),nextAutoSyncAt:getNextAutoSyncAt(),
-   lastSuccessfulSyncAt:lastSuccessfulSync?.finishedAt||null,
-   lastManualSyncAt:lastManualSync?.finishedAt||lastManualSync?.startedAt||null,
-   totalVehiclesSynced:lastCycle?.result?.totalVehiclesSynced||0,
-   failedVehicleCount:lastCycle?.result?.failedVehicleCount||0,
-   failedProviderCount:lastCycle?.result?.failedProviderCount||0,
-   gpsDataLastUpdated:gpsData?.syncedAt||null,
-   lastCycleErrors:lastCycleErrors.slice(0,20),
-   lastCycleGeofenceError:lastCycle?.result?.geofenceError||null,
-   lastCycleSuccess:lastCycle?.success??null,
-   lastCycleType:lastCycle?.type||null
-  }
+  providers:snapshot.providers,lastSync:snapshot.lastSync,syncStatus
  });
 });
 app.get('/api/history/search',auth,permission('GPS Track','view'),async(req,res)=>{
@@ -877,41 +887,13 @@ app.get('/api/history/search',auth,permission('GPS Track','view'),async(req,res)
  const provider=String(req.query.provider||'');
  const from=new Date(String(req.query.from||''));
  const to=new Date(String(req.query.to||''));
- if(!vehicleNumber||!['Wheelseye','FleetX'].includes(provider)||!Number.isFinite(from.getTime())||!Number.isFinite(to.getTime())||from>to||to>Date.now()){
+ if(!vehicleNumber||provider!=='Wheelseye'||!Number.isFinite(from.getTime())||!Number.isFinite(to.getTime())||from>to||to>Date.now()){
   return res.status(400).json({error:'Select a valid provider, vehicle and past date range'});
  }
  const matcher=vehicleNumberRegex(vehicleNumber);
  const vehicle=await M.Vehicle.findOne({vehicleNumber:matcher,status:'Active'});
  const live=await M.VehicleLiveStatus.findOne({vehicleNumber:matcher,provider}).sort({gpsTime:-1}).lean();
  if(!vehicle||!vehicleHasProvider(vehicle,provider))return res.status(404).json({error:'Registered vehicle not found for the selected provider'});
- if(provider==='FleetX'){
-  const providerVehicleId=getProviderVehicleId(vehicle,'FleetX')||live?.providerVehicleId;
-  if(!providerVehicleId)return res.status(409).json({error:'FleetX vehicle ID has not been received yet'});
-  try{
-   const response=await fleetxService.fetchHistory({vehicleId:providerVehicleId,from:from.getTime(),to:to.getTime()});
-   const records=flattenProvider(response.data,'FleetX').filter(row=>row.vehicleNumber===vehicleNumber&&row.gpsTime>=from&&row.gpsTime<=to);
-   for(const row of records){
-    let location=null;
-    try{location=await reverseGeocoding.resolve(row.lat,row.lng,{providerAddress:row.providerAddress,providerFields:row.providerFields});}
-    catch(error){console.warn(`History reverse geocoding failed for ${vehicleNumber}: ${error.message}`);}
-    const address=location?.readableLocation||null;
-    await M.VehicleLocationHistory.updateOne(
-     {vehicleNumber,gpsTime:row.gpsTime,provider:'FleetX'},
-     {$setOnInsert:{vehicle:vehicleNumber,vehicleNumber,lat:row.lat,lng:row.lng,address,readableLocation:address,
-      locality:location?.locality||'',city:location?.city||'',district:location?.district||'',
-      state:location?.state||'',pincode:location?.pincode||'',country:location?.country||'',
-      geocodedAt:location?.geocodedAt||null,addressLat:location?row.lat:undefined,addressLng:location?row.lng:undefined,
-      addressIsCurrent:Boolean(location),geocodingProvider:location?.provider||'Provider',
-      providerVehicleId:String(providerVehicleId),driverName:row.driverName,vehicleStatus:row.vehicleStatus,
-      speed:row.speed,ignition:row.ignition,gpsTime:row.gpsTime,provider:'FleetX',syncedAt:new Date()}},
-     {upsert:true}
-    );
-   }
-  }catch(error){
-   const code=error.response?.status||502;
-   return res.status(code===401?502:code).json({error:`FleetX history request failed (${code})`});
-  }
- }
  const rows=await M.VehicleLocationHistory.find({
   provider,gpsTime:{$gte:from,$lte:to},
   $or:[{vehicleNumber:matcher},{vehicle:matcher}]
@@ -962,8 +944,11 @@ app.delete('/api/users/:id',auth,permission('Users','edit'),async(req,res)=>{
 });
 
 const uploadDirectory=path.join(__dirname,'uploads');
-fs.mkdirSync(uploadDirectory,{recursive:true});
-const upload=multer({storage:multer.diskStorage({destination:(q,f,c)=>c(null,uploadDirectory),filename:(q,f,c)=>c(null,Date.now()+'-'+f.originalname.replace(/[^a-z0-9._-]/gi,'_'))}),limits:{fileSize:1024*1024},fileFilter:(q,f,c)=>['image/png','image/svg+xml','image/webp'].includes(f.mimetype)?c(null,true):c(new Error('Invalid icon type'))});
+if(process.env.VERCEL!=='1')fs.mkdirSync(uploadDirectory,{recursive:true});
+const uploadStorage=process.env.VERCEL==='1'
+ ?multer.memoryStorage()
+ :multer.diskStorage({destination:(q,f,c)=>c(null,uploadDirectory),filename:(q,f,c)=>c(null,Date.now()+'-'+f.originalname.replace(/[^a-z0-9._-]/gi,'_'))});
+const upload=multer({storage:uploadStorage,limits:{fileSize:1024*1024},fileFilter:(q,f,c)=>['image/png','image/svg+xml','image/webp'].includes(f.mimetype)?c(null,true):c(new Error('Invalid icon type'))});
 app.get('/api/gps/settings',auth,permission('GPS Track','view'),async(req,res)=>{
  const [saved,providerStatuses]=await Promise.all([
   M.GpsSetting.find().lean(),M.GpsProviderStatus.find().lean()
@@ -1000,25 +985,28 @@ app.put('/api/gps/settings/:provider',auth,permission('GPS Track','edit'),async(
  });
 });
 app.post('/api/settings/icons',auth,permission('GPS Track','edit'),upload.fields([{name:'running',maxCount:1},{name:'stopped',maxCount:1}]),async(req,res)=>{
- for(const key of ['running','stopped'])if(req.files[key])await M.AppSetting.findOneAndUpdate({key:`${key}Icon`},{$set:{value:'/uploads/'+req.files[key][0].filename}}, {upsert:true});
+ for(const key of ['running','stopped'])if(req.files[key]){
+  const file=req.files[key][0];
+  const value=file.buffer
+   ?`data:${file.mimetype};base64,${file.buffer.toString('base64')}`
+   :'/uploads/'+file.filename;
+  await M.AppSetting.findOneAndUpdate({key:`${key}Icon`},{$set:{value}}, {upsert:true});
+ }
  await audit('edit_icons',req.user.sub,{},req);res.json(await M.AppSetting.find({key:/Icon$/}));
 });
 app.get('/api/settings',auth,permission('GPS Track','view'),(req,res)=>M.AppSetting.find().then(x=>res.json(Object.fromEntries(x.map(v=>[v.key,v.value])))));
 
 app.post('/api/share',auth,permission('GPS Track','edit'),async(req,res)=>{const vehicleNumber=normalizeNumber(req.body.vehicleNumber);if(!await M.VehicleLiveStatus.exists({vehicleNumber}))return res.status(404).json({error:'Vehicle not found'});const token=crypto.randomBytes(24).toString('hex');const link=await M.ShareLink.create({vehicleNumber,token,expiresAt:new Date(Date.now()+24*60*60*1000),createdBy:req.user.sub});res.status(201).json({url:`/share/${link.token}`,token,expiresAt:link.expiresAt})});
 app.post('/api/share/:token/revoke',auth,permission('GPS Track','edit'),async(req,res)=>{await M.ShareLink.findOneAndUpdate({token:req.params.token},{$set:{revoked:true}});res.json({ok:true})});
-app.get('/share/:token',async(req,res)=>{const l=await M.ShareLink.findOne({token:req.params.token,revoked:false,expiresAt:{$gt:new Date()}});if(!l)return res.status(404).send('This location link is invalid or expired');const live=await M.VehicleLiveStatus.findOne({vehicleNumber:l.vehicleNumber});const speed=live?.speed==='N/A'||live?.speed==null?'N/A':live.provider==='FleetX'?live.speed:`${live.speed} km/h`;res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>${l.vehicleNumber} - Sikka Fleet</title></head><body style="margin:0;font-family:Arial;background:#eef2ff"><h2 style="padding:16px;margin:0">${l.vehicleNumber}</h2><div style="padding:16px"><b>Location:</b> ${live?.address||'No data'}<br><b>GPS time:</b> ${live?.gpsTime?.toLocaleString('en-IN')||'No data'}<br><b>Speed:</b> ${speed}<br><b>IGN:</b> ${live?.ignition||'N/A'}${live?.stale?'<br><b>GPS data:</b> Stale':''}</div></body></html>`)});
+app.get('/share/:token',async(req,res)=>{const l=await M.ShareLink.findOne({token:req.params.token,revoked:false,expiresAt:{$gt:new Date()}});if(!l)return res.status(404).send('This location link is invalid or expired');const live=await M.VehicleLiveStatus.findOne({vehicleNumber:l.vehicleNumber});const speed=live?.speed==='N/A'||live?.speed==null?'N/A':`${live.speed} km/h`;res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>${l.vehicleNumber} - Sikka Fleet</title></head><body style="margin:0;font-family:Arial;background:#eef2ff"><h2 style="padding:16px;margin:0">${l.vehicleNumber}</h2><div style="padding:16px"><b>Location:</b> ${live?.address||'No data'}<br><b>GPS time:</b> ${live?.gpsTime?.toLocaleString('en-IN')||'No data'}<br><b>Speed:</b> ${speed}<br><b>IGN:</b> ${live?.ignition||'N/A'}${live?.stale?'<br><b>GPS data:</b> Stale':''}</div></body></html>`)});
 
-function cleanChatQuestion(value){
- return String(value||'').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g,' ').replace(/<[^>]*>/g,'').trim();
-}
 function escapeRegex(value){return value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
 app.post('/api/ai/chat',auth,permission('Sikka AI','view'),aiChatLimiter,
- body('message').isString().trim().isLength({min:1,max:500}),
+ body('message').isString(),
  body('sessionId').optional().isString().trim().isLength({min:1,max:100}),
  async(req,res)=>{
-  if(!validationResult(req).isEmpty())return res.status(400).json({error:'Sawal 1 se 500 characters ka hona chahiye.'});
-  const question=cleanChatQuestion(req.body.message);
+  if(!validationResult(req).isEmpty())return res.status(400).json({error:'Question must be text.'});
+  const question=sikkaAiService.cleanChatQuestion(req.body.message);
   if(!question)return res.status(400).json({error:'Sawal khaali nahi ho sakta.'});
   const containsSensitiveInput=sikkaAiService.containsSensitiveInput(question);
   const savedQuestion=containsSensitiveInput?'[Sensitive content omitted]':question;
@@ -1207,12 +1195,21 @@ app.use('/api',(error,req,res,next)=>{
  return res.status(status>=400?status:500).json({error:message,...(referenceCode?{referenceCode}:{})});
 });
 
-function startGpsSyncScheduler(){
- if(syncScheduler)return;
- syncScheduler=cron.schedule('*/30 * * * *',async()=>{
-  const scheduledAt=new Date();
-  console.info('[GPS sync] Automatic cycle scheduled',{scheduledAt:scheduledAt.toISOString()});
+function scheduleNextAutoSync(delay){
+ if(!syncScheduler)return;
+ clearTimeout(syncScheduler.timer);
+ const waitMs=Math.max(0,delay);
+ syncScheduler.nextAt=new Date(Date.now()+waitMs);
+ syncScheduler.timer=setTimeout(async()=>{
+  syncScheduler.timer=null;
   try{
+   const latestSync=await M.SyncLog.findOne({finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean();
+   const dueAt=getNextAutoSyncAt(new Date(),latestSync);
+   const remaining=dueAt.getTime()-Date.now();
+   if(remaining>0){
+    scheduleNextAutoSync(remaining);
+    return;
+   }
    const result=await runSync('auto');
    console.info('[GPS sync] Automatic cycle finished',{
     started:result.started,success:result.success,partialSuccess:result.partialSuccess,
@@ -1223,9 +1220,19 @@ function startGpsSyncScheduler(){
    console.error('[GPS sync] Automatic cycle failed',{
     message:error.message,stack:error.stack
    });
+   scheduleNextAutoSync(GPS_SYNC_RETRY_MS);
   }
- },{timezone:'Asia/Kolkata'});
- console.info('[GPS sync] Backend scheduler active; cycles run every 30 minutes (Asia/Kolkata).');
+ },waitMs);
+ syncScheduler.timer.unref?.();
+}
+
+async function startGpsSyncScheduler(){
+ if(syncScheduler)return;
+ syncScheduler={timer:null,nextAt:null};
+ const latestSync=await M.SyncLog.findOne({finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean();
+ const nextSyncAt=getNextAutoSyncAt(new Date(),latestSync);
+ scheduleNextAutoSync(Math.max(0,nextSyncAt.getTime()-Date.now()));
+ console.info('[GPS sync] Backend scheduler active; next cycle at',syncScheduler.nextAt.toISOString());
 }
 
 async function start(){
@@ -1240,7 +1247,7 @@ async function start(){
  try{
   await ensureInitialized();
   startDailyJobs();
-  startGpsSyncScheduler();
+  await startGpsSyncScheduler();
   const dist=path.join(__dirname,'../frontend/dist');
   if(process.env.NODE_ENV==='production'&&fs.existsSync(dist)){
    app.use(express.static(dist));

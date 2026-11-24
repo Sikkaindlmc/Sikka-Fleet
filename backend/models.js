@@ -22,7 +22,7 @@ const userSchema=new mongoose.Schema({
 },{timestamps:true});
 
 const vehicleGpsProviderSchema=new mongoose.Schema({
- name:{type:String,enum:['Wheelseye','FleetX'],required:true},
+ name:{type:String,enum:['Wheelseye'],required:true},
  vehicleId:String
 },{_id:false});
 
@@ -30,7 +30,7 @@ const vehicleSchema=new mongoose.Schema({
  vehicleNumber:{type:String,required:true,unique:true,set:normalizeVehicleNumber},
  normalizedVehicleNumber:{type:String,required:true},
  fleetType:{type:String,enum:['Own Fleet','Contract Fleet'],required:true},
- gpsLink:{type:String,enum:['Wheelseye','FleetX'],required:true},
+ gpsLink:{type:String,enum:['Wheelseye'],required:true},
  driver:{type:String,trim:true},
  mobile:{type:String,trim:true},
  plant:{type:String,trim:true},
@@ -57,7 +57,7 @@ plantSchema.index({plantId:1},{unique:true,sparse:true});
 const liveSchema=new mongoose.Schema({
  vehicleNumber:{type:String,required:true,unique:true,index:true,set:normalizeVehicleNumber},
  normalizedVehicleNumber:{type:String,required:true},lat:Number,lng:Number,speed:{type:String},
- ignition:{type:String,default:'N/A'},gpsTime:Date,syncedAt:Date,provider:{type:String,enum:['Wheelseye','FleetX']},
+ ignition:{type:String,default:'N/A'},gpsTime:Date,syncedAt:Date,provider:{type:String,enum:['Wheelseye']},
  address:String,heading:Number,unregistered:{type:Boolean,default:false},stale:{type:Boolean,default:false},
  lastGoodTime:Date,runningStatus:{type:String,enum:['Moving','Stopped','Idle','Unknown'],default:'Unknown'},
  providerVehicleId:String,driverName:String,vehicleStatus:String,
@@ -113,7 +113,7 @@ const providerStatusSchema=new mongoose.Schema({
  apiResponseStatus:Number
 },{timestamps:true});
 const gpsSettingSchema=new mongoose.Schema({
- provider:{type:String,enum:['Wheelseye','FleetX'],required:true,unique:true},
+ provider:{type:String,enum:['Wheelseye'],required:true,unique:true},
  enabled:{type:Boolean,default:true},
  baseUrl:{type:String,trim:true},
  credentialsReference:{type:String,required:true},
@@ -131,6 +131,7 @@ syncLogSchema.index({success:1,finishedAt:-1});
 const gpsSyncLockSchema=new mongoose.Schema({
  key:{type:String,required:true,unique:true},
  owner:{type:String,required:true},
+ type:{type:String,enum:['auto','manual']},
  lockUntil:{type:Date,required:true},
  acquiredAt:{type:Date,required:true}
 },{timestamps:true});
@@ -175,7 +176,7 @@ const sikkaAiChatSchema=new mongoose.Schema({
  fullName:{type:String,required:true},
  role:{type:String,enum:['admin','user'],required:true},
  sessionId:{type:String,required:true,index:true},
- question:{type:String,required:true,maxlength:500},
+ question:{type:String,required:true},
  answer:{type:mongoose.Schema.Types.Mixed,required:true},
  askedAt:{type:Date,required:true},
  answeredAt:{type:Date,required:true},

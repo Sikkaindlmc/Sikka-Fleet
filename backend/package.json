@@ -7,7 +7,6 @@
     "start": "node server.js",
     "migrate:permissions": "node scripts/migrate-permissions.js",
     "migrate:vehicle-identity": "node scripts/migrateVehicleIdentity.js",
-    "test:fleetx": "node scripts/testFleetx.js",
     "test": "node --test"
   }
 }

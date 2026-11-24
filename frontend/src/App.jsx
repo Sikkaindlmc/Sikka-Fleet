@@ -12,7 +12,8 @@ import './chat.css';
 import './gps.css';
 import './error.css';
 
-axios.defaults.baseURL='/api';axios.defaults.withCredentials=true;
+const API_BASE_URL=String(import.meta.env.VITE_API_BASE_URL||'/api').trim().replace(/\/+$/,'');
+axios.defaults.baseURL=API_BASE_URL;axios.defaults.withCredentials=true;
 let refreshPromise=null;
 function requestUrl(config){
  const base=String(config?.baseURL||'').replace(/\/+$/,'');
@@ -89,7 +90,7 @@ const fmtIst=d=>{
  const values=Object.fromEntries(parts.filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
  return `${values.day}-${values.month}-${values.year} ${values.hour}:${values.minute}:${values.second} ${String(values.dayPeriod||'').toUpperCase()}`;
 };
-const speedText=vehicle=>vehicle?.speed==null||vehicle.speed==='N/A'?'N/A':vehicle.provider==='FleetX'?String(vehicle.speed):`${vehicle.speed} km/h`;
+const speedText=vehicle=>vehicle?.speed==null||vehicle.speed==='N/A'?'N/A':`${vehicle.speed} km/h`;
 const showToast=(text,type='success')=>window.dispatchEvent(new CustomEvent('toast',{detail:{text,type}}));
 const isAdminUser=user=>Boolean(user?.isAdmin||String(user?.role||'').toLowerCase()==='admin');
 const PERMISSION_PAGES=[
@@ -269,11 +270,25 @@ function Dashboard(){
  const {user}=useAuth();
  const canManage=canEdit(user,'dashboard');
  const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);
- const load=async()=>{try{const r=await axios.get('/dashboard');setData(dashboardData(r.data));setLoadError(null)}catch(error){setData(null);setLoadError(error);showToast('Cannot reach server','error')}};
+ const loadInFlight=useRef(false);
+ const load=async(silent=false)=>{
+  if(loadInFlight.current)return;
+  loadInFlight.current=true;
+  try{const r=await axios.get('/dashboard');setData(dashboardData(r.data));setLoadError(null)}
+  catch(error){if(!silent){setData(null);setLoadError(error);showToast('Cannot reach server','error')}}
+  finally{loadInFlight.current=false}
+ };
  useEffect(()=>{load()},[]);
  useEffect(()=>{const refresh=()=>load();window.addEventListener('gps-sync-complete',refresh);return()=>window.removeEventListener('gps-sync-complete',refresh)},[]);
- useEffect(()=>{if(!data?.nextSyncAt)return;const tick=()=>{const sec=Math.max(0,Math.floor((new Date(data.nextSyncAt)-new Date())/1000));setCountdown(`${String(Math.floor(sec/60)).padStart(2,'0')}:${String(sec%60).padStart(2,'0')}`)};tick();const i=setInterval(tick,1000);return()=>clearInterval(i)},[data?.nextSyncAt]);
+ useEffect(()=>{
+  const refresh=()=>{if(!document.hidden)load(true)};
+  const interval=window.setInterval(refresh,15000);
+  document.addEventListener('visibilitychange',refresh);
+  return()=>{window.clearInterval(interval);document.removeEventListener('visibilitychange',refresh)};
+ },[]);
+ useEffect(()=>{if(!data?.nextSyncAt)return;const serverTime=Date.parse(data.syncStatus?.serverTime);const clockOffset=Number.isFinite(serverTime)?serverTime-Date.now():0;const tick=()=>{const sec=Math.max(0,Math.floor((new Date(data.nextSyncAt).getTime()-Date.now()-clockOffset)/1000));setCountdown(`${String(Math.floor(sec/60)).padStart(2,'0')}:${String(sec%60).padStart(2,'0')}`)};tick();const i=setInterval(tick,1000);return()=>clearInterval(i)},[data?.nextSyncAt,data?.syncStatus?.serverTime]);
  const sync=async()=>{
+  if(syncing)return;
   setSyncing(true);
   try{
    const response=await axios.post('/sync');
@@ -287,11 +302,12 @@ function Dashboard(){
    setSyncing(false);
   }
  };
+ const syncStatus=data?.syncStatus||{};
  const savePlan=async()=>{if(planSaving)return;setPlanSaving(true);try{await axios.post('/plans',{vehicle:planModal.vehicleNumber,plant:plantModal?.plant?._id,planType:plan.planType,remarks:plan.remarks,expectedDeparture:plan.expectedDeparture||undefined});showToast('Plan saved');setPlanModal(null);setPlan({planType:'Loading',remarks:'',expectedDeparture:''})}catch(e){showToast(e.response?.data?.error||'Failed to save plan','error')}finally{setPlanSaving(false)}};
  if(loadError)return <ErrorPage title="Cannot reach server" details={loadError.message} onRetry={load}/>
  if(!data)return <Skeleton/>
  return <>
- <div className="page-head"><div><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} onClick={sync}><RefreshCw size={18}/> Sync Now</AnimatedButton>}<div className="clock"><b>Next sync</b><span>{countdown}</span></div><div className="clock"><b>Last Sync</b><span>{fmt(data.lastSync)}</span></div></div></div>
+ <div className="page-head"><div><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} onClick={sync}><RefreshCw size={18}/> Sync Now</AnimatedButton>}<div className="clock dashboard-sync-clock"><b>Next sync</b><span>{countdown}</span></div><div className="clock dashboard-status-clock"><b>GPS sync</b><span role="status">{syncStatus.status||'Loading status'}</span>{syncStatus.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div><div className="clock dashboard-sync-clock"><b>Last Sync</b><span>{fmt(data.lastSync)}</span></div></div></div>
  <div className="widget-grid">{data.plants.map((p,i)=><motion.button key={p.plant} className="plant-widget" onClick={()=>setPlantModal(p)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}} transition={{delay:i*.07}}><span className="widget-icon"><Factory/></span><div><small>{p.plant}</small><Count value={p.count}/></div></motion.button>)}
  <motion.button className="plant-widget transit" onClick={()=>setTransitModal(true)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}}><span className="widget-icon"><MapPinned/></span><div><small>Outside</small><Count value={data.transit.count}/><em>active vehicles</em></div></motion.button></div>
  <Modal open={!!plantModal} onClose={()=>setPlantModal(null)} title={`${plantModal?.plant||''} - Vehicles`} size="lg"><PlantPopup plant={plantModal} canPlan={canManage} onPlan={r=>setPlanModal(r)}/></Modal>
@@ -326,10 +342,10 @@ function Vehicles(){
  if(pageError)return <ErrorPage title="Cannot reach server" details={pageError.message} onRetry={load}/>;
  return <><div className="page-head"><div><p className="eyebrow">Fleet master</p><h1>Vehicle Registry</h1></div>{canManage&&<AnimatedButton variant="green" onClick={()=>open()}><Plus/> Add New Vehicle</AnimatedButton>}</div>
  {canManage&&!!unreg.length&&<div className="unregistered"><b>{unreg.length} unregistered provider vehicle(s)</b>{unreg.slice(0,5).map(v=><button key={v.vehicleNumber} onClick={()=>{setForm({vehicleNumber:v.vehicleNumber,fleetType:'Own Fleet',gpsLink:v.provider,driver:'',mobile:'',plant:'',status:'Active'});setModal(true)}}>{v.vehicleNumber} <Plus size={14}/></button>)}</div>}
- <div className="filters"><div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={fleet} onChange={e=>setFleet(e.target.value)}><option value="">Fleet Type</option><option>Own Fleet</option><option>Contract Fleet</option></select><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">GPS Provider</option><option>Wheelseye</option><option>FleetX</option></select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="">Status</option><option>Active</option><option>Inactive</option></select></div>
+ <div className="filters"><div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={fleet} onChange={e=>setFleet(e.target.value)}><option value="">Fleet Type</option><option>Own Fleet</option><option>Contract Fleet</option></select><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">GPS Provider</option><option>Wheelseye</option></select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="">Status</option><option>Active</option><option>Inactive</option></select></div>
  <Table headers={['Vehicle Number','Fleet Type','GPS Link','Driver','Mobile','Plant','Status','Last GPS time',...(canManage?['']:[])]} rows={data.items.map(v=>[v.vehicleNumber,v.fleetType,[...new Set([v.gpsLink,...(v.gpsProviders||[]).map(link=>link.name)])].filter(Boolean).join(' + '),v.driver||'-',v.mobile||'-',v.plant||'-',<span className={`badge ${v.status.toLowerCase()}`}>{v.status}</span>,fmt(v.lastGps),...(canManage?[<div className="row-actions"><AnimatedButton variant="orange" onClick={()=>syncVehicle(v)}>Sync GPS</AnimatedButton><AnimatedButton variant="blue" onClick={()=>open(v)}><Edit3 size={16}/></AnimatedButton><AnimatedButton variant="red" onClick={()=>remove(v)}><Trash2 size={16}/></AnimatedButton></div>]:[])])}/>
  <div className="pagination"><AnimatedButton variant="ghost" disabled={data.page<=1} onClick={()=>setData({...data,page:data.page-1})}>Previous</AnimatedButton><span>Page {data.page} of {data.pages||1}</span><AnimatedButton variant="ghost" disabled={data.page>=data.pages} onClick={()=>setData({...data,page:data.page+1})}>Next</AnimatedButton></div>
- <Modal open={modal} onClose={()=>setModal(false)} title={edit?'Edit Vehicle':'Add New Vehicle'} disableClose={saving}><div className="form-grid"><label>Vehicle Number<input value={form.vehicleNumber} onChange={e=>setForm({...form,vehicleNumber:e.target.value.toUpperCase()})}/></label><label>Fleet Type<select value={form.fleetType} onChange={e=>setForm({...form,fleetType:e.target.value})}><option>Own Fleet</option><option>Contract Fleet</option></select></label><label>GPS Provider<select value={form.gpsLink} onChange={e=>setForm({...form,gpsLink:e.target.value})}><option>Wheelseye</option><option>FleetX</option></select></label><label>Driver<input value={form.driver} onChange={e=>setForm({...form,driver:e.target.value})}/></label><label>Mobile<input type="tel" value={form.mobile} onChange={e=>setForm({...form,mobile:e.target.value})}/></label><label>Plant<input value={form.plant} onChange={e=>setForm({...form,plant:e.target.value})}/></label><label>Status<select value={form.status} onChange={e=>setForm({...form,status:e.target.value})}><option>Active</option><option>Inactive</option></select></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setModal(false)} disabled={saving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={save}>Save</AnimatedButton></div></Modal>
+ <Modal open={modal} onClose={()=>setModal(false)} title={edit?'Edit Vehicle':'Add New Vehicle'} disableClose={saving}><div className="form-grid"><label>Vehicle Number<input value={form.vehicleNumber} onChange={e=>setForm({...form,vehicleNumber:e.target.value.toUpperCase()})}/></label><label>Fleet Type<select value={form.fleetType} onChange={e=>setForm({...form,fleetType:e.target.value})}><option>Own Fleet</option><option>Contract Fleet</option></select></label><label>GPS Provider<select value={form.gpsLink} onChange={e=>setForm({...form,gpsLink:e.target.value})}><option>Wheelseye</option></select></label><label>Driver<input value={form.driver} onChange={e=>setForm({...form,driver:e.target.value})}/></label><label>Mobile<input type="tel" value={form.mobile} onChange={e=>setForm({...form,mobile:e.target.value})}/></label><label>Plant<input value={form.plant} onChange={e=>setForm({...form,plant:e.target.value})}/></label><label>Status<select value={form.status} onChange={e=>setForm({...form,status:e.target.value})}><option>Active</option><option>Inactive</option></select></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setModal(false)} disabled={saving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={save}>Save</AnimatedButton></div></Modal>
  <Modal open={Boolean(deleteTarget)} onClose={()=>{if(!deleting)setDeleteTarget(null)}} title="Delete Vehicle" disableClose={deleting}><p>Delete vehicle <b>{deleteTarget?.vehicleNumber}</b>? This action cannot be undone.</p><div className="modal-actions"><AnimatedButton variant="red" loading={deleting} onClick={confirmRemove}>Delete Vehicle</AnimatedButton><AnimatedButton variant="ghost" onClick={()=>setDeleteTarget(null)} disabled={deleting}>Cancel</AnimatedButton></div></Modal></>
 }
 
@@ -461,7 +477,7 @@ function vehiclePopup(vehicle,showProvider=true){
  title.textContent=vehicle.vehicleNumber||'Vehicle';
  content.appendChild(title);
  if(showProvider)addLine('Provider',vehicle.provider||'N/A');
- addLine('Status',vehicle.runningStatus||(vehicle.provider==='FleetX'?'Unknown':(+vehicle.speed>0?'Moving':'Stopped')));
+ addLine('Status',vehicle.runningStatus||(+vehicle.speed>0?'Moving':'Stopped'));
  addLine('Speed',speedText(vehicle));
  addLine('Ignition',vehicle.ignition||'N/A');
  if(vehicle.stale)addLine('GPS data','Stale');
@@ -635,12 +651,12 @@ function Gps(){
   <div><small>Failed Vehicles / Providers</small><b>{syncStatus.failedVehicleCount||0} / {syncStatus.failedProviderCount||0}</b></div>
   <div><small>GPS Data Last Updated (IST)</small><b>{fmtIst(syncStatus.gpsDataLastUpdated)}</b></div>
  </div>
- <div className="gps-stats">{[['Registered',data.registeredCount||0],['WheelsEye received',data.providers.find(p=>p.provider==='Wheelseye')?.vehiclesReceived||0],['FleetX received',data.providers.find(p=>p.provider==='FleetX')?.vehiclesReceived||0],['Moving',data.summary?.moving||0],['Stopped',data.summary?.stopped||0],['IGN ON',data.summary?.ignitionOn||0],['IGN OFF',data.summary?.ignitionOff||0],['Not Responding',data.summary?.notResponding||0],['API Errors',data.summary?.apiErrors||0]].map(([label,value])=><div className="gps-stat" key={label}><small>{label}</small><b>{value}</b></div>)}</div>
- <div className="provider-grid">{providerWidget('Wheelseye')}{providerWidget('FleetX')}</div>
+ <div className="gps-stats">{[['Registered',data.registeredCount||0],['WheelsEye received',data.providers.find(p=>p.provider==='Wheelseye')?.vehiclesReceived||0],['Moving',data.summary?.moving||0],['Stopped',data.summary?.stopped||0],['IGN ON',data.summary?.ignitionOn||0],['IGN OFF',data.summary?.ignitionOff||0],['Not Responding',data.summary?.notResponding||0],['API Errors',data.summary?.apiErrors||0]].map(([label,value])=><div className="gps-stat" key={label}><small>{label}</small><b>{value}</b></div>)}</div>
+ <div className="provider-grid">{providerWidget('Wheelseye')}</div>
  {(syncStatus.lastCycleErrors?.length>0||syncStatus.lastCycleGeofenceError)&&<div className="gps-sync-errors"><b>Last synchronization issues</b>{syncStatus.lastCycleGeofenceError&&<p>Plant status update: {syncStatus.lastCycleGeofenceError}</p>}{syncStatus.lastCycleErrors?.length>0&&<ul>{syncStatus.lastCycleErrors.map((error,index)=><li key={`${error.provider}-${error.vehicleNumber||index}-${index}`}>{error.provider}{error.vehicleNumber?` / ${error.vehicleNumber}`:''}: {error.message||'Synchronization failed'}{error.code?` (code ${error.code})`:''}</li>)}</ul>}</div>}
  <div className="gps-layout"><div className="gps-map"><OpenStreetMap vehicles={live} selectedVehicleNumber={selected?.vehicleNumber} onSelect={setSelected} settings={settings}/></div>
  <div className="gps-list">
-  <div className="filters"><div className="search-box"><Search/><input placeholder="Search" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">Provider</option><option>Wheelseye</option><option>FleetX</option></select><select value={running} onChange={e=>setRunning(e.target.value)}><option value="">Running Status</option><option value="running">Moving</option><option value="stopped">Stopped</option></select></div>
+  <div className="filters"><div className="search-box"><Search/><input placeholder="Search" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">Provider</option><option>Wheelseye</option></select><select value={running} onChange={e=>setRunning(e.target.value)}><option value="">Running Status</option><option value="running">Moving</option><option value="stopped">Stopped</option></select></div>
   <Table headers={['Vehicle','Provider','Fleet Type','Running','IGN','Speed','GPS data','Live Location','Coordinates','Driver','GPS time',...(canManage?['']:[])]} rows={live.map(v=>[<button className="vehicle-select" onClick={()=>setSelected(v)}>{v.vehicleNumber}</button>,v.provider,v.fleetType||'-',v.runningStatus||'Unknown',<span className={`ignition ${/^on|^1|^true$/i.test(String(v.ignition))?'on':'off'}`}>{v.ignition||'N/A'}</span>,speedText(v),v.noGpsData?'No GPS data':v.stale?'Stale':'Live',<LocationText location={v.location} current={v.addressIsCurrent}/>,v.noGpsData?'N/A':`${v.lat}, ${v.lng}`,v.driverName||v.driver||'-',fmt(v.gpsTime),...(canManage?[<AnimatedButton variant="blue" disabled={v.noGpsData} onClick={()=>share(v)}><Share2 size={16}/></AnimatedButton>]:[])])}/>
  </div></div>
  <div className="gps-attribution">Address data may be provided by OpenStreetMap contributors.</div>
@@ -686,7 +702,7 @@ function HistoryTab({vehicles}){
  };
  return <section className="history-panel">
   <form className="history-filters" onSubmit={search}>
-   <label>GPS Provider<select value={provider} onChange={e=>{setProvider(e.target.value);setVehicleNumber('')}}><option>Wheelseye</option><option>FleetX</option></select></label>
+   <label>GPS Provider<select value={provider} onChange={e=>{setProvider(e.target.value);setVehicleNumber('')}}><option>Wheelseye</option></select></label>
    <label>Vehicle<select value={vehicleNumber} onChange={e=>setVehicleNumber(e.target.value)} required><option value="">Select vehicle</option>{available.map(v=><option key={v.vehicleNumber} value={v.vehicleNumber}>{v.vehicleNumber}</option>)}</select></label>
    <label>From<input type="datetime-local" value={from} max={to} onChange={e=>setFrom(e.target.value)} required/></label>
    <label>To<input type="datetime-local" value={to} max={localInput(new Date())} onChange={e=>setTo(e.target.value)} required/></label>
@@ -1025,7 +1041,7 @@ function AIChat({open,onClose}){
      {loading&&<div className="typing" role="status"><span className="typing-dots"/>Sikka AI typing...</div>}
     </div>
     <form className="chat-input" onSubmit={event=>{event.preventDefault();send()}}>
-     <input value={text} maxLength={500} onChange={event=>setText(event.target.value)} placeholder="Ask Sikka AI (max 500 characters)" aria-label="Ask Sikka AI"/>
+     <textarea rows={1} value={text} onChange={event=>setText(event.target.value)} placeholder="Ask Sikka AI" aria-label="Ask Sikka AI"/>
      <AnimatedButton variant="blue" type="submit" loading={loading} disabled={loading||!text.trim()} aria-label="Send"><ChevronRight/></AnimatedButton>
     </form>
    </>:tab==='history'?<div className="chat-history-view">

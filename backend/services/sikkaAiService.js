@@ -349,6 +349,10 @@ function accessDenied(language,source){
  );
 }
 
+function cleanChatQuestion(value){
+ return String(value||'').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g,' ').trim();
+}
+
 async function answerQuestion(question,{models=M,now=new Date(),previousLanguage,permissions}={}){
  const query=String(question||'').trim();
  const language=detectLanguage(query,previousLanguage);
@@ -658,7 +662,7 @@ function parseAdminDate(value,endOfDay=false){
 }
 
 module.exports={
- answerQuestion,containsSensitiveInput,detectLanguage,extractVehicleNumber,getChatExpiry,
+ answerQuestion,cleanChatQuestion,containsSensitiveInput,detectLanguage,extractVehicleNumber,getChatExpiry,
  getHistoryCutoff,HISTORY_LIMIT_REPLY,mapHistoryRecord,matchPlant,parseAdminDate,
  parseDateRequest,UNKNOWN_REPLY
 };

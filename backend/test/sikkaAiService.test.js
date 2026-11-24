@@ -57,10 +57,46 @@ test('detects credential-like prompts before history storage',()=>{
  assert.equal(service.containsSensitiveInput('Salt Plant available vehicles'),false);
 });
 
+test('preserves long, multilingual, multiline and special-character questions',()=>{
+ for(const question of [
+  '1234567890',
+  'x'.repeat(100),
+  'x'.repeat(1000),
+  'x'.repeat(5000),
+  'आज मेरी गाड़ी कहाँ है?',
+  'Where is my vehicle today?',
+  'आज vehicle की location कहाँ है?',
+  'Show my vehicle\nUP14FT9150\nlocation now?',
+  'Use <these> symbols & punctuation!'
+ ]){
+  assert.equal(service.cleanChatQuestion(question),question);
+ }
+});
+
+test('attempts answers for 10, 100, 1000 and 5000 character questions',async()=>{
+ const prefix='Where is vehicle UP14FT9150 now?';
+ const questions=[
+  'UP14FT9150',
+  `${prefix}${'.'.repeat(100-prefix.length)}`,
+  `${prefix}${'.'.repeat(1000-prefix.length)}`,
+  `${prefix}${'.'.repeat(5000-prefix.length)}`,
+  'UP14FT9150 की location अभी कहाँ है?',
+  'Where is UP14FT9150 right now?',
+  'UP14FT9150 की current location बताओ please.',
+  'Where is UP14FT9150?\nPlease show its latest location.'
+ ];
+ for(const question of questions){
+  const prompt=service.cleanChatQuestion(question);
+  const answer=await service.answerQuestion(prompt,{models:makeModels(),now});
+  assert.ok(answer.text?.trim(),`Expected a response for: ${question.slice(0,60)}`);
+ }
+});
+
 test('chat records expire exactly seven days after creation and have a Mongo TTL index',()=>{
  const createdAt=new Date('2026-11-22T10:06:00.000Z');
  assert.equal(service.getChatExpiry(createdAt).toISOString(),'2026-11-29T10:06:00.000Z');
  assert.equal(models.SikkaAiChat.collection.collectionName,'SikkaAiChat');
+ assert.equal(models.SikkaAiChat.schema.path('question').options.maxlength,undefined);
  assert.ok(models.SikkaAiChat.schema.indexes().some(([index,options])=>index.expireAt===1&&options.expireAfterSeconds===0));
  for(const field of ['userFullName','question','answer','askedAt','answeredAt']){
   assert.ok(models.SikkaAiChat.schema.path(field),`${field} chat field should be persisted`);
@@ -127,10 +163,10 @@ test('answers the exact UP14FT9150 Location phrasing from GPS snapshot data',asy
    Vehicle:{find:()=>chain([{vehicleNumber:'UP14FT9150'}]),findOne:()=>one({vehicleNumber:'UP14FT9150',status:'Active'})},
    VehicleLiveStatus:{find:()=>chain([{
     vehicleNumber:'UP14FT9150',address:'Dasna, Uttar Pradesh',speed:'31',ignition:'ON',
-    gpsTime:new Date('2026-11-22T09:30:00.000Z'),provider:'FleetX',lat:28.5,lng:77.4
+    gpsTime:new Date('2026-11-22T09:30:00.000Z'),provider:'Wheelseye',lat:28.5,lng:77.4
    }]),findOne:()=>one({
     vehicleNumber:'UP14FT9150',address:'Dasna, Uttar Pradesh',speed:'31',ignition:'ON',
-    gpsTime:new Date('2026-11-22T09:30:00.000Z'),provider:'FleetX',lat:28.5,lng:77.4
+    gpsTime:new Date('2026-11-22T09:30:00.000Z'),provider:'Wheelseye',lat:28.5,lng:77.4
    })},
    VehiclePlantStay:{find:()=>chain([{vehicle:'UP14FT9150',plant,entryTime:new Date('2026-11-22T08:30:00.000Z')}])}
   }),now
@@ -138,7 +174,7 @@ test('answers the exact UP14FT9150 Location phrasing from GPS snapshot data',asy
  assert.equal(answer.type,'vehicle');
  assert.equal(answer.vehicleNumber,'UP14FT9150');
  assert.equal(answer.location,'Dasna, Uttar Pradesh');
- assert.equal(answer.provider,'FleetX');
+ assert.equal(answer.provider,'Wheelseye');
  assert.equal(answer.speed,'31');
  assert.equal(answer.ignition,'ON');
  assert.equal(answer.plantName,'Salt Plant');
@@ -209,7 +245,7 @@ test('distinguishes an unregistered vehicle from a registered vehicle with no li
 
  const lastRecord={
   vehicleNumber:'UP14FT9150',gpsTime:new Date('2026-11-22T09:00:00.000Z'),
-  address:'Dasna, Uttar Pradesh',lat:28.5,lng:77.4,speed:'0',ignition:'OFF',provider:'FleetX'
+  address:'Dasna, Uttar Pradesh',lat:28.5,lng:77.4,speed:'0',ignition:'OFF',provider:'Wheelseye'
  };
  const missingLiveModels=makeModels({
   Vehicle:{find:filter=>chain(filter.status?[ ]:[{vehicleNumber:'UP14FT9150',status:'Active'}]),findOne:filter=>one(filter.status?{vehicleNumber:'UP14FT9150',status:'Active'}:null)},

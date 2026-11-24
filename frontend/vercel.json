@@ -1,8 +1,0 @@
-{
-  "rewrites": [
-    { "source": "/api/:path*", "destination": "https://sikka-fleet.vercel.app/api/:path*" },
-    { "source": "/uploads/:path*", "destination": "https://sikka-fleet.vercel.app/uploads/:path*" },
-    { "source": "/share/:path*", "destination": "https://sikka-fleet.vercel.app/share/:path*" },
-    { "source": "/(.*)", "destination": "/index.html" }
-  ]
-}
