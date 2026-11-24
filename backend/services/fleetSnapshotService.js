@@ -189,6 +189,7 @@ async function getOperationalSnapshot(models,now=new Date(),{includeMetadata=tru
   if(!lastStayByVehicle.has(stay.vehicle))lastStayByVehicle.set(stay.vehicle,stay);
  }
  const transitRows=transitLive.map(record=>({
+  vehicleId:String(vehicleByNumber.get(vehicleNumberKey(record.vehicleNumber))?._id||''),
   vehicleNumber:record.vehicleNumber,
   leftPlant:lastStayByVehicle.get(record.vehicleNumber)?.plant?.name||'Not recorded',
   location:readableAddress(record),addressIsCurrent:Boolean(record.addressIsCurrent),

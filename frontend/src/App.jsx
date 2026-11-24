@@ -1,8 +1,8 @@
 import React,{createContext,useCallback,useContext,useEffect,useRef,useState,Suspense} from 'react';
-import {BrowserRouter,Routes,Route,Navigate,useNavigate,useLocation} from 'react-router-dom';
+import {BrowserRouter,Routes,Route,Navigate,useNavigate,useLocation,useParams} from 'react-router-dom';
 import {motion,AnimatePresence} from 'framer-motion';
 import {createPortal} from 'react-dom';
-import {LayoutDashboard,Truck,Factory,MapPin,Users,LogOut,Menu,X,Bot,RefreshCw,Moon,Sun,Plus,Edit3,Trash2,Search,Eye,EyeOff,Share2,Settings,MapPinned,ChevronRight,AlertTriangle} from 'lucide-react';
+import {LayoutDashboard,Truck,Factory,MapPin,Users,LogOut,Menu,X,Bot,RefreshCw,Moon,Sun,Plus,Edit3,Trash2,Search,Eye,EyeOff,Share2,Settings,MapPinned,ChevronRight,AlertTriangle,Navigation,Copy,LocateFixed,Maximize2,Minimize2} from 'lucide-react';
 import axios from 'axios';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
@@ -296,6 +296,7 @@ function dashboardData(value){
 function Dashboard(){
  const {user}=useAuth();
  const canManage=canEdit(user,'dashboard');
+ const canTrack=canView(user,'gpsTrack');
  const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
  const loadInFlight=useRef(false);
  const load=async(silent=false)=>{
@@ -340,6 +341,10 @@ function Dashboard(){
     :indiaDateTimeLocal(new Date())
   });
  };
+ const trackNow=vehicleId=>{
+  if(!vehicleId){showToast('Vehicle ID is unavailable','error');return}
+  window.open(`/live-tracking/${encodeURIComponent(vehicleId)}`,'_blank','noopener,noreferrer');
+ };
  const savePlan=async()=>{
   if(planSaving||!planModal)return;
   setPlanSaving(true);
@@ -368,7 +373,7 @@ function Dashboard(){
  <div className="widget-grid">{data.plants.map((p,i)=><motion.button key={p.plant} className="plant-widget" onClick={()=>setPlantModal(p)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}} transition={{delay:i*.07}}><span className="widget-icon"><Factory/></span><div><small>{p.plant}</small><Count value={p.count}/></div></motion.button>)}
  <motion.button className="plant-widget transit" onClick={()=>setTransitModal(true)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}}><span className="widget-icon"><MapPinned/></span><div><small>Outside</small><Count value={data.transit.count}/><em>active vehicles</em></div></motion.button></div>
  <Modal open={!!plantModal} onClose={()=>setPlantModal(null)} title={`${plantModal?.plant||''} - Vehicles`} size="lg"><PlantPopup plant={plantModal} canPlan={canManage} plansVersion={plansVersion} onPlan={openPlan} onViewPlan={setPlanDetails}/></Modal>
- <Modal open={transitModal} onClose={()=>setTransitModal(false)} title="Outside Vehicles" size="lg"><Table headers={['Vehicle Number','Last Out Plant Name','Current Location','Speed','IGN','GPS time','GPS data','']} rows={data.transit.rows.map(r=>[r.vehicleNumber,r.leftPlant,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.lastGpsUpdatedAt),r.stale?'Stale':'Live',<AnimatedButton variant="blue" onClick={()=>window.location.assign('/gps')}>Track Now</AnimatedButton>])}/></Modal>
+ <Modal open={transitModal} onClose={()=>setTransitModal(false)} title="Outside Vehicles" size="lg"><Table headers={['Vehicle Number','Last Out Plant Name','Current Location','Speed','IGN','GPS time','GPS data',...(canTrack?['']:[])]} rows={data.transit.rows.map(r=>[r.vehicleNumber,r.leftPlant,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.lastGpsUpdatedAt),r.stale?'Stale':'Live',...(canTrack?[<AnimatedButton key={r.vehicleId} variant="blue" onClick={()=>trackNow(r.vehicleId)}>Track Now</AnimatedButton>]:[])])}/></Modal>
  <Modal open={!!planDetails} onClose={()=>setPlanDetails(null)} title="Latest Plan Details" size="sm"><dl className="plan-details"><dt>Plan Type</dt><dd>{planDetails?.planType||'-'}</dd><dt>Expected Departure</dt><dd>{formatPlanDeparture(planDetails?.expectedDeparture)}</dd><dt>Created By</dt><dd>{planDetails?.createdByDisplayName||'Unavailable'}</dd><dt>Remarks</dt><dd className="plan-details-remarks">{planDetails?.remarks||'-'}</dd></dl><div className="modal-actions"><AnimatedButton variant="green" onClick={()=>setPlanDetails(null)}>Close</AnimatedButton></div></Modal>
  <Modal open={!!planModal} onClose={()=>setPlanModal(null)} title={`${planModal?.planId?'Edit':'Plan'} - ${planModal?.vehicleNumber||''}`} disableClose={planSaving}><div className="form-grid"><label>Plan Type<select value={plan.planType} onChange={e=>setPlan({...plan,planType:e.target.value})}>{['Loading','Unloading','Maintenance','Waiting','Other'].map(v=><option key={v}>{v}</option>)}</select></label><label>Expected Departure (Asia/Kolkata)<input type="datetime-local" value={plan.expectedDeparture} onChange={e=>setPlan({...plan,expectedDeparture:e.target.value})}/></label><label className="span-2">Remarks<textarea value={plan.remarks} onChange={e=>setPlan({...plan,remarks:e.target.value})}/></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setPlanModal(null)} disabled={planSaving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={planSaving} onClick={savePlan}>{planModal?.planId?'Update Plan':'Save Plan'}</AnimatedButton></div></Modal>
  </>
@@ -545,6 +550,14 @@ function vehiclePopup(vehicle,showProvider=true){
  addLine('Last GPS update',fmt(vehicle.gpsTime));
  return content;
 }
+function vehicleMapIcon(vehicle,settings={}){
+ const moving=vehicle.runningStatus==='Moving'||(!vehicle.runningStatus&&Number(vehicle.speed)>0);
+ const iconUrl=moving?settings.runningIcon:settings.stoppedIcon;
+ return iconUrl?L.icon({iconUrl,iconSize:[38,38],iconAnchor:[19,19],popupAnchor:[0,-18]}):
+  L.divIcon({className:'vehicle-marker-icon',html:`<span class="vehicle-marker ${moving?'moving':'stopped'}"></span>`,iconSize:[30,30],iconAnchor:[15,15]});
+}
+const LIVE_TRACKING_DEFAULT_CENTER=[28.5,78.4];
+const LIVE_TRACKING_DEFAULT_ZOOM=7;
 function OpenStreetMap({vehicles=[],selectedVehicleNumber,onSelect,settings={},showRoute=false}){
  const container=React.useRef(null);
  const mapRef=React.useRef(null);
@@ -585,10 +598,7 @@ function OpenStreetMap({vehicles=[],selectedVehicleNumber,onSelect,settings={},s
    const key=showRoute?`${vehicle.vehicleNumber}:${vehicle.gpsTime||index}`:vehicle.vehicleNumber;
    activeKeys.add(key);
    const position=[Number(vehicle.lat),Number(vehicle.lng)];
-   const moving=vehicle.runningStatus==='Moving'||(!vehicle.runningStatus&&Number(vehicle.speed)>0);
-   const iconUrl=moving?settings.runningIcon:settings.stoppedIcon;
-   const icon=iconUrl?L.icon({iconUrl,iconSize:[38,38],iconAnchor:[19,19],popupAnchor:[0,-18]}):
-    L.divIcon({className:'vehicle-marker-icon',html:`<span class="vehicle-marker ${moving?'moving':'stopped'}"></span>`,iconSize:[30,30],iconAnchor:[15,15]});
+   const icon=vehicleMapIcon(vehicle,settings);
    const tooltip=document.createElement('span');
    tooltip.textContent=showRoute?`${vehicle.vehicleNumber} · ${fmt(vehicle.gpsTime)} · ${speedText(vehicle)}`:vehicle.vehicleNumber;
    let marker=markersRef.current.get(key);
@@ -731,6 +741,392 @@ function Gps(){
  <Modal open={Boolean(shareUrl)} onClose={()=>setShareUrl('')} title="Vehicle Share Link"><label className="plant-field">Share link<input value={shareUrl} readOnly onFocus={event=>event.target.select()}/></label><div className="modal-actions"><AnimatedButton variant="green" onClick={copyShareLink}>Copy Link</AnimatedButton><AnimatedButton variant="red" onClick={()=>setShareUrl('')}>Close</AnimatedButton></div></Modal>
  </>
 }
+function LiveTrackingPage(){
+ const {vehicleId}=useParams();
+ const {user}=useAuth();
+ const canShare=canEdit(user,'gpsTrack');
+ const [data,setData]=useState(null);
+ const [pageLoading,setPageLoading]=useState(true);
+ const [refreshing,setRefreshing]=useState(false);
+ const [pageError,setPageError]=useState(null);
+ const [shareDialog,setShareDialog]=useState(null);
+ const [shareLoading,setShareLoading]=useState(false);
+ const [isFullscreen,setIsFullscreen]=useState(false);
+ const [mapSettings,setMapSettings]=useState({});
+ const [mapSettingsError,setMapSettingsError]=useState('');
+ const inFlight=useRef(false);
+ const shareInFlight=useRef(false);
+ const shareRecord=useRef(null);
+ const shareInput=useRef(null);
+ const mapFrame=useRef(null);
+
+ useEffect(()=>{
+  let active=true;
+  let loading=false;
+  const loadMapSettings=async()=>{
+   if(loading)return;
+   loading=true;
+   try{
+    const response=await axios.get('/settings');
+    if(active){setMapSettings(response.data||{});setMapSettingsError('')}
+   }catch(error){
+    if(active)setMapSettingsError(error.response?.data?.error||error.message||'Unable to refresh icon settings');
+   }finally{loading=false}
+  };
+  const refreshOnVisible=()=>{if(!document.hidden)loadMapSettings()};
+  loadMapSettings();
+  const interval=window.setInterval(loadMapSettings,60000);
+  document.addEventListener('visibilitychange',refreshOnVisible);
+  return()=>{
+   active=false;
+   window.clearInterval(interval);
+   document.removeEventListener('visibilitychange',refreshOnVisible);
+  };
+ },[]);
+
+ const load=useCallback(async()=>{
+  if(inFlight.current)return {busy:true};
+  inFlight.current=true;
+  setRefreshing(true);
+  try{
+   const response=await axios.get('/tracking/vehicles/'+encodeURIComponent(vehicleId));
+   setData(response.data);
+   setPageError(null);
+   return {data:response.data};
+  }catch(error){
+   setPageError(error);
+   return {error};
+  }finally{
+   inFlight.current=false;
+   setPageLoading(false);
+   setRefreshing(false);
+  }
+ },[vehicleId]);
+
+ useEffect(()=>{
+  let cancelled=false;
+  let timer=null;
+  let generation=0;
+  const refreshOnSchedule=async()=>{
+   const current=++generation;
+   const result=await load();
+   if(cancelled||current!==generation)return;
+   let delay=15000;
+   if(result.data){
+    const status=result.data.syncStatus||{};
+    const serverTime=Date.parse(status.serverTime);
+    const nextSync=Date.parse(status.nextAutoSyncAt);
+    if(!status.autoSyncActive)delay=60000;
+    else if(status.isSyncing)delay=5000;
+    else if(Number.isFinite(serverTime)&&Number.isFinite(nextSync)){
+     const untilSync=nextSync-serverTime;
+     delay=untilSync>1000?untilSync+2000:5000;
+    }else delay=60000;
+   }else if(result.busy)delay=3000;
+   timer=window.setTimeout(()=>{
+    if(current===generation)refreshOnSchedule();
+   },Math.max(1000,delay));
+  };
+  const refreshNow=()=>{
+   if(document.hidden)return;
+   generation++;
+   if(timer)window.clearTimeout(timer);
+   refreshOnSchedule();
+  };
+  refreshOnSchedule();
+  document.addEventListener('visibilitychange',refreshNow);
+  window.addEventListener('gps-sync-complete',refreshNow);
+  return()=>{
+   cancelled=true;
+   generation++;
+   if(timer)window.clearTimeout(timer);
+   document.removeEventListener('visibilitychange',refreshNow);
+   window.removeEventListener('gps-sync-complete',refreshNow);
+  };
+ },[load]);
+
+ useEffect(()=>{
+  const syncFullscreen=()=>setIsFullscreen(Boolean(document.fullscreenElement&&mapFrame.current===document.fullscreenElement));
+  document.addEventListener('fullscreenchange',syncFullscreen);
+  return()=>document.removeEventListener('fullscreenchange',syncFullscreen);
+ },[]);
+
+ const shareLocation=useCallback(async()=>{
+  if(!canShare){showToast('GPS Track edit permission is required to share a location','error');return}
+  if(!data?.vehicle||!hasValidTrackingCoordinates(data.gps)){showToast('GPS coordinates are unavailable to share','error');return}
+  const existing=shareRecord.current;
+  if(existing?.vehicleId===data.vehicle.id&&Date.parse(existing.expiresAt)>Date.now()){
+   setShareDialog(existing);
+   return;
+  }
+  if(shareInFlight.current)return;
+  shareInFlight.current=true;
+  setShareLoading(true);
+  try{
+   const response=await axios.post(`/tracking/vehicles/${encodeURIComponent(data.vehicle.id)}/share`);
+   const record={
+    vehicleId:data.vehicle.id,vehicleNumber:data.vehicle.vehicleNumber,
+    gpsTime:data.gps.gpsTime,url:new URL(response.data.url,window.location.origin).href,
+    expiresAt:response.data.expiresAt
+   };
+   shareRecord.current=record;
+   setShareDialog(record);
+   showToast('Secure location link created');
+  }catch(error){
+   showToast(error.response?.data?.error||'Could not create a location link','error');
+  }finally{
+   shareInFlight.current=false;
+   setShareLoading(false);
+  }
+ },[canShare,data]);
+
+ const copyShareLink=async()=>{
+  if(!shareDialog)return;
+  try{
+   if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(shareDialog.url);
+   else{
+    shareInput.current?.focus();
+    shareInput.current?.select();
+    if(!document.execCommand('copy'))throw new Error('Clipboard access is unavailable');
+   }
+   showToast('Location link copied');
+  }catch{
+   shareInput.current?.focus();
+   shareInput.current?.select();
+   showToast('Select the link and copy it','error');
+  }
+ };
+
+ const nativeShare=async()=>{
+  if(!shareDialog||typeof navigator.share!=='function')return;
+  try{
+   await navigator.share({
+    title:`${shareDialog.vehicleNumber} location`,
+    text:`Latest GPS update: ${shareDialog.gpsTime?fmtIst(shareDialog.gpsTime):'Not Available'}`,
+    url:shareDialog.url
+   });
+  }catch(error){
+   if(error.name!=='AbortError')showToast('Native sharing failed','error');
+  }
+ };
+
+ const openDirections=useCallback(()=>{
+  if(!hasValidTrackingCoordinates(data?.gps)){showToast('Vehicle coordinates are unavailable','error');return}
+  const lat=Number(data?.gps?.lat),lng=Number(data?.gps?.lng);
+  const destination=`${lat},${lng}`;
+  const makeUrl=start=>`https://www.openstreetmap.org/directions?engine=fossgis_osrm_car&route=${encodeURIComponent(start?`${start};${destination}`:`;${destination}`)}`;
+  const tab=window.open('about:blank','_blank');
+  if(!tab){showToast('Allow popups to open directions','error');return}
+  tab.opener=null;
+  const fallback=()=>{
+   tab.location.replace(makeUrl(''));
+   showToast('Starting location unavailable; choose one in OpenStreetMap','error');
+  };
+  if(!navigator.geolocation){fallback();return}
+  try{
+   navigator.geolocation.getCurrentPosition(position=>{
+    const start=`${position.coords.latitude},${position.coords.longitude}`;
+    tab.location.replace(makeUrl(start));
+   },fallback,{enableHighAccuracy:false,timeout:8000,maximumAge:60000});
+  }catch{fallback()}
+ },[data]);
+
+ const toggleFullscreen=async()=>{
+  try{
+   if(document.fullscreenElement)await document.exitFullscreen();
+   else if(mapFrame.current?.requestFullscreen)await mapFrame.current.requestFullscreen();
+   else showToast('Fullscreen is not supported by this browser','error');
+  }catch{showToast('Could not change fullscreen mode','error')}
+ };
+
+ const vehicle=data?.vehicle;
+ const gps=data?.gps;
+ const gpsStatus=!gps?'GPS data unavailable':gps.stale?'Stale GPS data':'GPS data current';
+ if(pageLoading&&!data)return <div className="live-tracking-loading"><Skeleton/></div>;
+ if(pageError&&!data)return <div className="live-tracking-error"><ErrorPage title="Vehicle tracking unavailable" details={pageError.message} onRetry={load}/></div>;
+ return <main className="live-tracking-page">
+  <header className="live-tracking-header">
+   <a className="live-tracking-brand" href="/dashboard">SIKKA FLEET</a>
+   <div className="live-tracking-heading"><small>Live vehicle tracking</small><h1>{vehicle?.vehicleNumber||'Vehicle'}</h1></div>
+   <div className="live-tracking-status">
+    <span className={gps?.stale?'is-stale':gps?'is-current':'is-unavailable'} role="status">{gpsStatus}</span>
+    <small>Last GPS update: {gps?.gpsTime?fmtIst(gps.gpsTime):'Not Available'}</small>
+    <small>Last successful sync: {data?.syncStatus?.lastSuccessfulSyncAt?fmtIst(data.syncStatus.lastSuccessfulSyncAt):'Not Available'}</small>
+   </div>
+   <AnimatedButton variant="ghost" loading={refreshing} onClick={load}><RefreshCw size={17}/> Refresh</AnimatedButton>
+  </header>
+  {(pageError&&data||mapSettingsError)&&<div className="live-tracking-warning" role="alert">{pageError&&data&&<div>Could not refresh location. Showing the last available GPS data.</div>}{mapSettingsError&&<div>Could not refresh GPS Track icon settings ({mapSettingsError}). Keeping the last available icon configuration.</div>}</div>}
+  <section className="live-map-frame" ref={mapFrame}>
+   <LiveTrackingMap vehicleNumber={vehicle?.vehicleNumber} gps={gps} settings={mapSettings} canShare={canShare} onShare={shareLocation} onDirections={openDirections} isFullscreen={isFullscreen} onToggleFullscreen={toggleFullscreen}/>
+  </section>
+  <Modal open={!!shareDialog} onClose={()=>setShareDialog(null)} title="Share Vehicle Location" size="sm">
+   <label className="plant-field">Secure link<input ref={shareInput} value={shareDialog?.url||''} readOnly onFocus={event=>event.target.select()}/></label>
+   <p className="live-share-note">The secure link expires at {shareDialog?.expiresAt?fmtIst(shareDialog.expiresAt):'Not Available'}. The page shows the location timestamp.</p>
+   <div className="modal-actions">
+    <AnimatedButton variant="blue" onClick={copyShareLink}><Copy size={16}/> Copy</AnimatedButton>
+    {typeof navigator.share==='function'&&<AnimatedButton variant="green" onClick={nativeShare}><Share2 size={16}/> Share</AnimatedButton>}
+    <AnimatedButton variant="ghost" loading={shareLoading} onClick={()=>setShareDialog(null)}>Close</AnimatedButton>
+   </div>
+  </Modal>
+ </main>;
+}
+
+function LiveTrackingMap({vehicleNumber,gps,settings,canShare,onShare,onDirections,isFullscreen,onToggleFullscreen}){
+ const container=useRef(null);
+ const mapRef=useRef(null);
+ const markerRef=useRef(null);
+ const previousPosition=useRef(null);
+ const centered=useRef(false);
+ const centeredVehicle=useRef('');
+ const [tileError,setTileError]=useState(false);
+
+ useEffect(()=>{
+  if(!container.current)return;
+  const map=L.map(container.current,{center:LIVE_TRACKING_DEFAULT_CENTER,zoom:LIVE_TRACKING_DEFAULT_ZOOM,scrollWheelZoom:true});
+  const standard=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+   maxZoom:19,attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
+  });
+  const humanitarian=L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',{
+   maxZoom:19,attribution:'&copy; OpenStreetMap contributors, Humanitarian style hosted by OpenStreetMap France'
+  });
+  standard.addTo(map);
+  L.control.layers({'OpenStreetMap':standard,'OpenStreetMap Humanitarian':humanitarian},null,{collapsed:true}).addTo(map);
+  standard.on('tileerror',()=>setTileError(true));
+  humanitarian.on('tileerror',()=>setTileError(true));
+  mapRef.current=map;
+  const resizeObserver=typeof ResizeObserver==='undefined'?null:new ResizeObserver(()=>map.invalidateSize());
+  resizeObserver?.observe(container.current);
+  const resize=setTimeout(()=>map.invalidateSize(),100);
+  return()=>{
+   clearTimeout(resize);
+   resizeObserver?.disconnect();
+   markerRef.current?.remove();
+   markerRef.current=null;
+   map.remove();
+   mapRef.current=null;
+  };
+ },[]);
+
+ useEffect(()=>{
+  const map=mapRef.current;
+  if(!map)return;
+  const lat=Number(gps?.lat),lng=Number(gps?.lng);
+  const valid=hasValidTrackingCoordinates(gps);
+  if(!valid){
+   markerRef.current?.remove();
+   markerRef.current=null;
+   previousPosition.current=null;
+   centered.current=false;
+   centeredVehicle.current=vehicleNumber||'';
+   map.setView(LIVE_TRACKING_DEFAULT_CENTER,LIVE_TRACKING_DEFAULT_ZOOM,{animate:false});
+   return;
+  }
+  if(centeredVehicle.current!==vehicleNumber){
+   centered.current=false;
+   centeredVehicle.current=vehicleNumber||'';
+   previousPosition.current=null;
+  }
+  const position=[lat,lng];
+  const icon=vehicleMapIcon(gps,settings);
+  const popup=createLiveTrackingPopup({vehicleNumber,gps,canShare,onShare,onDirections});
+  let marker=markerRef.current;
+  if(!marker){
+   marker=L.marker(position,{icon,title:vehicleNumber||'Vehicle',alt:vehicleNumber||'Vehicle'}).addTo(map);
+   marker.bindPopup(popup,{maxWidth:300});
+   const tooltip=document.createElement('span');
+   tooltip.textContent=vehicleNumber||'Vehicle';
+   marker.bindTooltip(tooltip,{direction:'top',offset:[0,-20]});
+   markerRef.current=marker;
+  }else{
+   marker.setLatLng(position);
+   marker.setIcon(icon);
+   marker.setPopupContent(popup);
+  }
+  const moved=!previousPosition.current||previousPosition.current[0]!==lat||previousPosition.current[1]!==lng;
+  if(!centered.current){
+   map.setView(position,15,{animate:false});
+   marker.openPopup();
+   centered.current=true;
+  }else if(moved){
+   map.panTo(position,{animate:true});
+  }
+  previousPosition.current=position;
+ },[vehicleNumber,gps,settings,canShare,onShare,onDirections]);
+
+ useEffect(()=>{
+  const timeout=setTimeout(()=>mapRef.current?.invalidateSize(),100);
+  return()=>clearTimeout(timeout);
+ },[isFullscreen]);
+
+ const centerOnVehicle=()=>{
+  if(!hasValidTrackingCoordinates(gps))return;
+  mapRef.current?.setView([Number(gps.lat),Number(gps.lng)],Math.max(mapRef.current.getZoom(),15),{animate:true});
+  markerRef.current?.openPopup();
+ };
+ const coordinatesAvailable=hasValidTrackingCoordinates(gps);
+ return <div className="live-map-canvas">
+  <div ref={container} className="live-map-leaflet" role="application" aria-label="Live vehicle location map"/>
+  <div className="live-map-controls">
+   <button type="button" onClick={centerOnVehicle} disabled={!coordinatesAvailable} aria-label="Center on vehicle" title="Center on vehicle"><LocateFixed size={19}/></button>
+   <button type="button" onClick={onToggleFullscreen} aria-label={isFullscreen?'Exit fullscreen':'Fullscreen map'} title={isFullscreen?'Exit fullscreen':'Fullscreen map'}>{isFullscreen?<Minimize2 size={19}/>:<Maximize2 size={19}/>}</button>
+  </div>
+  {tileError&&<div className="live-map-status">Map tiles are temporarily unavailable.</div>}
+  {!coordinatesAvailable&&<div className="live-map-status">No valid GPS coordinates are currently available.</div>}
+ </div>;
+}
+
+function hasValidTrackingCoordinates(gps){
+ if(gps?.lat==null||gps?.lng==null||gps.lat===''||gps.lng==='')return false;
+ const lat=Number(gps.lat),lng=Number(gps.lng);
+ return Number.isFinite(lat)&&Number.isFinite(lng)&&lat>=-90&&lat<=90&&lng>=-180&&lng<=180;
+}
+
+function createLiveTrackingPopup({vehicleNumber,gps,canShare,onShare,onDirections}){
+ const content=document.createElement('div');
+ content.className='live-tracking-popup';
+ const title=document.createElement('strong');
+ title.textContent=vehicleNumber||'Not Available';
+ content.appendChild(title);
+ const addLine=(label,value)=>{
+  const line=document.createElement('div');
+  line.className='live-popup-line';
+  const name=document.createElement('b');
+  name.textContent=`${label}: `;
+  const text=document.createElement('span');
+  text.textContent=value||'Not Available';
+  line.append(name,text);
+  content.appendChild(line);
+ };
+ addLine('Vehicle Number',vehicleNumber||'Not Available');
+ addLine('Human Readable Location',gps?.location||'Not Available');
+ if(gps?.location&&!gps.addressIsCurrent)addLine('Address status','Last resolved; may be outdated');
+ addLine('IGN Status',gps?.ignition&&gps.ignition!=='N/A'?gps.ignition:'Not Available');
+ const speed=Number(gps?.speed);
+ addLine('Speed',gps?.speed!=null&&gps.speed!==''&&Number.isFinite(speed)?`${speed} km/h`:'Not Available');
+ addLine('Last GPS Update',gps?.gpsTime?fmtIst(gps.gpsTime):'Not Available');
+ if(gps?.stale)addLine('GPS status','Stale - not current');
+ const actions=document.createElement('div');
+ actions.className='live-popup-actions';
+ const addAction=(label,icon,callback,disabled=false)=>{
+  const button=document.createElement('button');
+  button.type='button';
+  button.className='live-popup-action';
+  button.setAttribute('aria-label',label);
+  button.title=label;
+  button.disabled=disabled;
+  button.innerHTML=`${icon}<span>${label}</span>`;
+  button.addEventListener('click',event=>{event.preventDefault();event.stopPropagation();callback()});
+  actions.appendChild(button);
+ };
+ const shareIcon='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-5 5 5-5 5 5M5 12v7h14v-7"/></svg>';
+ const directionsIcon='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 11 19-8-8 19-2-8-9-3Z"/></svg>';
+ const validCoordinates=hasValidTrackingCoordinates(gps);
+ addAction('Share Location',shareIcon,onShare,!canShare||!hasValidTrackingCoordinates(gps));
+ addAction('Directions',directionsIcon,onDirections,!validCoordinates);
+ content.appendChild(actions);
+ return content;
+}
+
 function HistoryTab({vehicles}){
  const initialTo=new Date();
  const initialFrom=new Date(initialTo.getTime()-24*60*60*1000);
@@ -1276,7 +1672,10 @@ function AppRoutes(){
  if(authError)return <ErrorPage title="Cannot reach server" details={authError.message} onRetry={retryAuth}/>;
  if(!user)return location.pathname==='/login'?<Login/>:<Navigate to="/login" replace state={{from:location}}/>;
  if(location.pathname==='/login')return <Navigate to="/dashboard" replace/>;
- return <Layout/>;
+ return <Routes>
+  <Route path="/live-tracking/:vehicleId" element={<RoutedPage><Guard permission="gpsTrack"><LiveTrackingPage/></Guard></RoutedPage>}/>
+  <Route path="*" element={<Layout/>}/>
+ </Routes>;
 }
 
 function AuthProvider({children}){

@@ -47,3 +47,71 @@
  .gps-sync-status{grid-template-columns:repeat(2,minmax(0,1fr))}
  .gps-sync-status>div{padding:9px}
 }
+.live-tracking-page{
+ position:fixed;inset:0;z-index:2000;display:flex;flex-direction:column;
+ overflow:hidden;background:#f1f5f9;color:#172033
+}
+.live-tracking-header{
+ z-index:2;display:flex;align-items:center;gap:18px;min-height:76px;
+ padding:10px 18px;background:#fff;border-bottom:1px solid #dbe2ea;
+ box-shadow:0 2px 12px rgba(15,23,42,.08)
+}
+.live-tracking-brand{color:#312e81;font-weight:900;text-decoration:none;white-space:nowrap}
+.live-tracking-heading{min-width:130px}
+.live-tracking-heading small{display:block;color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+.live-tracking-heading h1{margin:2px 0 0;font-size:20px}
+.live-tracking-status{display:flex;flex:1;flex-direction:column;gap:3px;min-width:0}
+.live-tracking-status>span{font-size:13px;font-weight:800}
+.live-tracking-status>small{overflow:hidden;color:#64748b;font-size:11px;text-overflow:ellipsis;white-space:nowrap}
+.live-tracking-status .is-current{color:#15803d}
+.live-tracking-status .is-stale{color:#b45309}
+.live-tracking-status .is-unavailable{color:#b91c1c}
+.live-map-frame{position:relative;flex:1;min-height:0;background:#dbeafe}
+.live-map-frame:fullscreen{background:#fff}
+.live-map-canvas,.live-map-leaflet{position:absolute;inset:0;width:100%;height:100%}
+.live-map-controls{position:absolute;z-index:1001;right:14px;bottom:46px;display:flex;flex-direction:column;gap:8px}
+.live-map-controls button{
+ display:grid;width:42px;height:42px;place-items:center;border:1px solid #dbe2ea;
+ border-radius:12px;background:#fff;color:#1e3a8a;box-shadow:0 3px 12px rgba(15,23,42,.16);cursor:pointer
+}
+.live-map-controls button:disabled{opacity:.5;cursor:not-allowed}
+.live-map-controls button:hover:not(:disabled){background:#eef2ff}
+.live-map-status{
+ position:absolute;z-index:700;left:50%;bottom:22px;transform:translateX(-50%);
+ max-width:calc(100% - 24px);padding:10px 14px;border:1px solid #fed7aa;
+ border-radius:12px;background:rgba(255,255,255,.96);color:#9a3412;
+ font-size:13px;text-align:center;box-shadow:0 4px 16px rgba(15,23,42,.12)
+}
+.live-tracking-popup{min-width:220px;max-width:280px;color:#172033}
+.live-tracking-popup>strong{display:block;margin-bottom:8px;font-size:15px}
+.live-popup-line{display:flex;gap:4px;margin:4px 0;font-size:12px;line-height:1.45;overflow-wrap:anywhere}
+.live-popup-line b{flex:0 0 auto}
+.live-popup-actions{display:flex;gap:8px;margin-top:12px;padding-top:10px;border-top:1px solid #e5e7eb}
+.live-popup-action{
+ display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:7px 9px;
+ border:1px solid #c7d2fe;border-radius:9px;background:#eef2ff;color:#1e3a8a;
+ font:inherit;font-size:12px;font-weight:700;cursor:pointer
+}
+.live-popup-action svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.live-popup-action:disabled{opacity:.45;cursor:not-allowed}
+.live-tracking-warning{
+ position:absolute;z-index:900;top:86px;left:50%;transform:translateX(-50%);
+ max-width:calc(100% - 24px);padding:8px 12px;border-radius:10px;
+ background:#fff7ed;color:#9a3412;font-size:12px;box-shadow:0 3px 10px rgba(15,23,42,.12)
+}
+.live-tracking-loading,.live-tracking-error{min-height:100vh;padding:24px;background:#f1f5f9}
+.live-share-note{margin:12px 0 0;color:#64748b;font-size:12px}
+:root[data-theme=dark] .live-tracking-page{background:#111827;color:#e5e7eb}
+:root[data-theme=dark] .live-tracking-header{background:#1f2937;border-color:#374151}
+:root[data-theme=dark] .live-tracking-brand{color:#c7d2fe}
+:root[data-theme=dark] .live-tracking-heading small,:root[data-theme=dark] .live-tracking-status>small{color:#9ca3af}
+:root[data-theme=dark] .live-tracking-popup{color:#172033}
+@media(max-width:650px){
+ .live-tracking-header{flex-wrap:wrap;gap:8px 12px;padding:9px 12px}
+ .live-tracking-brand{font-size:12px}
+ .live-tracking-heading{flex:1}
+ .live-tracking-heading h1{font-size:17px}
+ .live-tracking-status{flex:1 0 100%;order:3}
+ .live-tracking-header>.animated-btn{margin-left:auto;padding:8px}
+ .live-map-controls{right:10px;bottom:46px}
+}

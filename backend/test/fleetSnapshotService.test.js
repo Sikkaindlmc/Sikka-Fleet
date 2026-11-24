@@ -20,7 +20,7 @@ test('snapshot counts one registered vehicle once across provider/live/stay dupl
     gpsProviders:[{name:'Wheelseye'}],updatedAt:new Date('2026-11-21T00:00:00Z')},
    {vehicleNumber:'UP14GT0100',fleetType:'Own Fleet',gpsLink:'Wheelseye',
     gpsProviders:[{name:'Wheelseye'}],updatedAt:new Date('2026-11-22T00:00:00Z')},
-   {vehicleNumber:'DL01AA1234',fleetType:'Contract Fleet',gpsLink:'Wheelseye'},
+   {_id:'vehicle-dl-1',vehicleNumber:'DL01AA1234',fleetType:'Contract Fleet',gpsLink:'Wheelseye'},
    {vehicleNumber:'MH02BB9876',fleetType:'Own Fleet',gpsLink:'Wheelseye'},
    {vehicleNumber:'KA03CC4567',fleetType:'Contract Fleet',gpsLink:'Wheelseye'}
   ])},
@@ -52,4 +52,5 @@ test('snapshot counts one registered vehicle once across provider/live/stay dupl
  assert.equal(snapshot.plants[0].rows.find(row=>row.vehicleNumber==='MH02BB9876').entryTime,null);
  assert.equal(snapshot.transit.count,1);
  assert.equal(snapshot.transit.rows[0].vehicleNumber,'DL01AA1234');
+ assert.equal(snapshot.transit.rows[0].vehicleId,'vehicle-dl-1');
 });

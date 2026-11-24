@@ -226,7 +226,9 @@ function flattenProvider(payload,provider){
   const dateValue=Number.isFinite(numericTime)&&numericTime>0
    ?new Date(numericTime<100000000000?numericTime*1000:numericTime)
    :new Date(time||NaN);
-  const heading=r.heading||r.course||r.bearing||r.COURSE;
+  const rawHeading=r.heading??r.course??r.bearing??r.COURSE;
+  const numericHeading=rawHeading==null||String(rawHeading).trim()===''?null:Number(rawHeading);
+  const heading=Number.isFinite(numericHeading)?((numericHeading%360)+360)%360:null;
   const providerAddress=typeof r.readableLocation==='string'?r.readableLocation:
    typeof r.formattedAddress==='string'?r.formattedAddress:
    typeof r.fullAddress==='string'?r.fullAddress:
@@ -249,7 +251,7 @@ function flattenProvider(payload,provider){
   const numericSpeed=Number(speed);
   const providerRunningStatus=r.runningStatus||r.running_status||r.movementStatus||r.MOVEMENT_STATUS;
   const runningStatus=normalizeRunningStatus(providerRunningStatus,numericSpeed,ignition);
-  return {vehicleNumber:normalizeNumber(number),lat:Number(lat),lng:Number(lng),speed:speed==null?'N/A':String(speed),ignition,runningStatus,gpsTime:dateValue,provider,heading:Number(heading)||0,providerAddress,providerFields,providerVehicleId:r.vehicleId??r.VEHICLE_ID??r.vehicle_id??r.id,driverName:r.driverName??r.DRIVER_NAME??r.driver_name,vehicleStatus:r.vehicleStatus??r.STATUS??r.status};
+  return {vehicleNumber:normalizeNumber(number),lat:Number(lat),lng:Number(lng),speed:speed==null?'N/A':String(speed),ignition,runningStatus,gpsTime:dateValue,provider,heading,providerAddress,providerFields,providerVehicleId:r.vehicleId??r.VEHICLE_ID??r.vehicle_id??r.id,driverName:r.driverName??r.DRIVER_NAME??r.driver_name,vehicleStatus:r.vehicleStatus??r.STATUS??r.status};
  }).filter(x=>x.vehicleNumber&&reverseGeocoding.validCoordinates(x.lat,x.lng)&&Number.isFinite(x.gpsTime.getTime()));
 }
 
@@ -890,6 +892,45 @@ app.get('/api/tracking',auth,permission('GPS Track','view'),async(req,res)=>{
   providers:snapshot.providers,lastSync:snapshot.lastSync,syncStatus
  });
 });
+app.get('/api/tracking/vehicles/:vehicleId',auth,permission('GPS Track','view'),async(req,res)=>{
+ if(!mongoose.Types.ObjectId.isValid(req.params.vehicleId))return res.status(400).json({error:'Invalid vehicle ID'});
+ const vehicle=await M.Vehicle.findById(req.params.vehicleId).select('vehicleNumber status').lean();
+ if(!vehicle||vehicle.status!=='Active')return res.status(404).json({error:'Registered vehicle not found'});
+ const matcher=vehicleNumberRegex(vehicle.vehicleNumber);
+ const [records,syncStatus]=await Promise.all([
+  M.VehicleLiveStatus.find({vehicleNumber:matcher}).sort({gpsTime:-1,syncedAt:-1}).lean(),
+  getGpsSyncStatus()
+ ]);
+ const now=new Date();
+ const record=records.find(item=>{
+  const timestamp=new Date(item.gpsTime||NaN).getTime();
+  return reverseGeocoding.validCoordinates(item.lat,item.lng)&&Number.isFinite(timestamp)&&timestamp<=now.getTime();
+ })||records[0]||null;
+ const gpsTime=record?.gpsTime?new Date(record.gpsTime):null;
+ const hasCoordinates=Boolean(record&&reverseGeocoding.validCoordinates(record.lat,record.lng)&&gpsTime&&
+  Number.isFinite(gpsTime.getTime())&&gpsTime<=now);
+ const isFresh=Boolean(hasCoordinates&&!record.stale&&gpsTime&&Number.isFinite(gpsTime.getTime())&&
+  gpsTime<=now&&now.getTime()-gpsTime.getTime()<=GPS_SYNC_INTERVAL_MS*2);
+ res.json({
+  vehicle:{id:String(vehicle._id),vehicleNumber:vehicle.vehicleNumber},
+  gps:record?{
+   lat:hasCoordinates?Number(record.lat):null,
+   lng:hasCoordinates?Number(record.lng):null,
+   location:readableAddress(record),
+   addressIsCurrent:Boolean(record.addressIsCurrent),
+   speed:record.speed??null,ignition:record.ignition??null,
+   runningStatus:record.runningStatus||'Unknown',
+   gpsTime:record.gpsTime||null,
+   heading:record.heading==null||record.heading===''||!Number.isFinite(Number(record.heading))?null:Number(record.heading),
+   provider:record.provider||null,stale:!isFresh
+  }:null,
+  syncStatus:{
+   status:syncStatus.status,isSyncing:syncStatus.isSyncing,
+   autoSyncActive:syncStatus.autoSyncActive,nextAutoSyncAt:syncStatus.nextAutoSyncAt,
+   lastSuccessfulSyncAt:syncStatus.lastSuccessfulSyncAt,serverTime:syncStatus.serverTime
+  }
+ });
+});
 app.get('/api/history/search',auth,permission('GPS Track','view'),async(req,res)=>{
  const vehicleNumber=normalizeNumber(req.query.vehicleNumber);
  const provider=String(req.query.provider||'');
@@ -1047,7 +1088,27 @@ app.post('/api/settings/icons',auth,permission('GPS Track','edit'),upload.fields
 });
 app.get('/api/settings',auth,permission('GPS Track','view'),(req,res)=>M.AppSetting.find().then(x=>res.json(Object.fromEntries(x.map(v=>[v.key,v.value])))));
 
-app.post('/api/share',auth,permission('GPS Track','edit'),async(req,res)=>{const vehicleNumber=normalizeNumber(req.body.vehicleNumber);if(!await M.VehicleLiveStatus.exists({vehicleNumber}))return res.status(404).json({error:'Vehicle not found'});const token=crypto.randomBytes(24).toString('hex');const link=await M.ShareLink.create({vehicleNumber,token,expiresAt:new Date(Date.now()+24*60*60*1000),createdBy:req.user.sub});res.status(201).json({url:`/share/${link.token}`,token,expiresAt:link.expiresAt})});
+async function createLocationShare(vehicleNumber,userId){
+ const token=crypto.randomBytes(24).toString('hex');
+ const link=await M.ShareLink.create({
+  vehicleNumber,token,expiresAt:new Date(Date.now()+24*60*60*1000),createdBy:userId
+ });
+ return {url:`/share/${link.token}`,token,expiresAt:link.expiresAt};
+}
+app.post('/api/share',auth,permission('GPS Track','edit'),async(req,res)=>{
+ const vehicleNumber=normalizeNumber(req.body.vehicleNumber);
+ if(!await M.VehicleLiveStatus.exists({vehicleNumber}))return res.status(404).json({error:'Vehicle not found'});
+ res.status(201).json(await createLocationShare(vehicleNumber,req.user.sub));
+});
+app.post('/api/tracking/vehicles/:vehicleId/share',auth,permission('GPS Track','edit'),async(req,res)=>{
+ if(!mongoose.Types.ObjectId.isValid(req.params.vehicleId))return res.status(400).json({error:'Invalid vehicle ID'});
+ const vehicle=await M.Vehicle.findById(req.params.vehicleId).select('vehicleNumber status').lean();
+ if(!vehicle||vehicle.status!=='Active')return res.status(404).json({error:'Registered vehicle not found'});
+ const vehicleMatcher=vehicleNumberRegex(vehicle.vehicleNumber);
+ const records=await M.VehicleLiveStatus.find({vehicleNumber:vehicleMatcher}).sort({gpsTime:-1,syncedAt:-1}).select('lat lng').lean();
+ if(!records.some(record=>reverseGeocoding.validCoordinates(record.lat,record.lng)))return res.status(404).json({error:'GPS coordinates are unavailable'});
+ res.status(201).json(await createLocationShare(vehicle.vehicleNumber,req.user.sub));
+});
 app.post('/api/share/:token/revoke',auth,permission('GPS Track','edit'),async(req,res)=>{await M.ShareLink.findOneAndUpdate({token:req.params.token},{$set:{revoked:true}});res.json({ok:true})});
 app.get('/share/:token',async(req,res)=>{const l=await M.ShareLink.findOne({token:req.params.token,revoked:false,expiresAt:{$gt:new Date()}});if(!l)return res.status(404).send('This location link is invalid or expired');const live=await M.VehicleLiveStatus.findOne({vehicleNumber:l.vehicleNumber});const speed=live?.speed==='N/A'||live?.speed==null?'N/A':`${live.speed} km/h`;res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>${l.vehicleNumber} - Sikka Fleet</title></head><body style="margin:0;font-family:Arial;background:#eef2ff"><h2 style="padding:16px;margin:0">${l.vehicleNumber}</h2><div style="padding:16px"><b>Location:</b> ${live?.address||'No data'}<br><b>GPS time:</b> ${live?.gpsTime?.toLocaleString('en-IN')||'No data'}<br><b>Speed:</b> ${speed}<br><b>IGN:</b> ${live?.ignition||'N/A'}${live?.stale?'<br><b>GPS data:</b> Stale':''}</div></body></html>`)});
 
