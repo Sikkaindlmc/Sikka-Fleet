@@ -2,11 +2,13 @@ import React,{createContext,useCallback,useContext,useEffect,useRef,useState,Sus
 import {BrowserRouter,Routes,Route,Navigate,useNavigate,useLocation,useParams} from 'react-router-dom';
 import {motion,AnimatePresence} from 'framer-motion';
 import {createPortal} from 'react-dom';
-import {LayoutDashboard,Truck,Factory,MapPin,Users,LogOut,Menu,X,Bot,RefreshCw,Moon,Sun,Plus,Edit3,Trash2,Search,Eye,EyeOff,Share2,Settings,MapPinned,ChevronRight,AlertTriangle,Navigation,Copy,LocateFixed,Maximize2,Minimize2} from 'lucide-react';
+import {LayoutDashboard,Truck,Factory,MapPin,Users,LogOut,Menu,X,Bot,RefreshCw,Moon,Sun,Plus,Edit3,Trash2,Search,Eye,EyeOff,Share2,Settings,MapPinned,ChevronRight,AlertTriangle,Navigation,Copy,LocateFixed,Maximize2,Minimize2,Timer,History} from 'lucide-react';
 import axios from 'axios';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import './index.css';
+import './dashboard.css';
+import {getIgnitionCounts} from './dashboardMetrics.js';
 import './permissions.css';
 import './chat.css';
 import './gps.css';
@@ -258,16 +260,16 @@ const {user}=useAuth();if(!user)return <Navigate to="/login" replace/>;return ca
 function NoAccess(){return <div className="empty-state"><X size={44}/><h2>No access</h2><p>You do not have permission to view this page.</p></div>}
 
 function Layout(){
- const {user,logout}=useAuth();const [drawer,setDrawer]=useState(false);const [ai,setAi]=useState(false);const [dark,setDark]=useState(false);const nav=useNavigate();
+ const {user,logout}=useAuth();const [drawer,setDrawer]=useState(false);const [ai,setAi]=useState(false);const [dark,setDark]=useState(false);const nav=useNavigate();const location=useLocation();
  useEffect(()=>{document.documentElement.dataset.theme=dark?'dark':'light'},[dark]);
  const links=[['Dashboard','/dashboard',LayoutDashboard,'dashboard'],['Vehicle Registry','/vehicles',Truck,'vehicleRegistry'],['Plant','/plants',Factory,'plant'],['GPS Track','/gps',MapPin,'gpsTrack'],['Users','/users',Users,'users']];
- return <div className="app-shell">
+ return <div className={`app-shell ${location.pathname==='/dashboard'?'dashboard-shell':''}`}>
   <AnimatePresence>{drawer&&<motion.div className="drawer-backdrop" onClick={()=>setDrawer(false)} initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}/>}</AnimatePresence>
   <aside className={`sidebar ${drawer?'open':''}`}><div className="brand"><img src="/logo.png"/><strong>SIKKA FLEET</strong><AnimatedButton variant="ghost" className="drawer-close" onClick={()=>setDrawer(false)}><X/></AnimatedButton></div>
    <nav>{links.map(([name,to,Icon,key])=>canView(user,key)&&<NavLink key={name} to={to} name={name} icon={Icon} onClick={()=>setDrawer(false)}/>)}</nav>
   </aside>
   <div className="workspace"><header className="topbar"><AnimatedButton variant="ghost" className="hamburger" onClick={()=>setDrawer(true)}><Menu/></AnimatedButton><div className="top-actions"><AnimatedButton variant="ghost" onClick={()=>setDark(!dark)}>{dark?<Sun size={18}/>:<Moon size={18}/>}</AnimatedButton>{canView(user,'sikkaAi')&&<AnimatedButton variant="orange" onClick={()=>setAi(true)}><Bot size={18}/> Sikka AI</AnimatedButton>}<span className="user-name">{user?.fullName||user?.username||'User'}</span><AnimatedButton variant="red" onClick={logout}><LogOut size={18}/> Logout</AnimatedButton></div></header>
-   <main className="content"><AnimatePresence mode="wait"><motion.div key={useLocation().pathname} initial={{opacity:0,x:18}} animate={{opacity:1,x:0}} exit={{opacity:0,x:-18}} transition={{duration:.22}}><Routes>
+   <main className="content"><AnimatePresence mode="wait"><motion.div key={location.pathname} initial={{opacity:0,x:18}} animate={{opacity:1,x:0}} exit={{opacity:0,x:-18}} transition={{duration:.22}}><Routes>
     <Route path="/dashboard" element={<RoutedPage><Guard permission="dashboard"><Dashboard/></Guard></RoutedPage>}/>
     <Route path="/vehicles" element={<RoutedPage><Guard permission="vehicleRegistry"><Vehicles/></Guard></RoutedPage>}/>
     <Route path="/plants" element={<RoutedPage><Guard permission="plant"><Plants/></Guard></RoutedPage>}/>
@@ -296,15 +298,19 @@ function dashboardData(value){
 function Dashboard(){
  const {user}=useAuth();
  const canManage=canEdit(user,'dashboard');
+ const canSync=canManage||canEdit(user,'gpsTrack');
  const canTrack=canView(user,'gpsTrack');
  const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
- const loadInFlight=useRef(false);
+ const loadInFlight=useRef(false);const refreshQueued=useRef(false);const syncInFlight=useRef(false);
  const load=async(silent=false)=>{
-  if(loadInFlight.current)return;
+  if(loadInFlight.current){if(silent)refreshQueued.current=true;return}
   loadInFlight.current=true;
   try{const r=await axios.get('/dashboard');setData(dashboardData(r.data));setLoadError(null)}
   catch(error){if(!silent){setData(null);setLoadError(error);showToast('Cannot reach server','error')}}
-  finally{loadInFlight.current=false}
+  finally{
+   loadInFlight.current=false;
+   if(refreshQueued.current){refreshQueued.current=false;void load(true)}
+  }
  };
  useEffect(()=>{load()},[]);
  useEffect(()=>{const refresh=()=>load();window.addEventListener('gps-sync-complete',refresh);return()=>window.removeEventListener('gps-sync-complete',refresh)},[]);
@@ -314,9 +320,14 @@ function Dashboard(){
   document.addEventListener('visibilitychange',refresh);
   return()=>{window.clearInterval(interval);document.removeEventListener('visibilitychange',refresh)};
  },[]);
- useEffect(()=>{if(!data?.nextSyncAt)return;const serverTime=Date.parse(data.syncStatus?.serverTime);const clockOffset=Number.isFinite(serverTime)?serverTime-Date.now():0;const tick=()=>{const sec=Math.max(0,Math.floor((new Date(data.nextSyncAt).getTime()-Date.now()-clockOffset)/1000));setCountdown(`${String(Math.floor(sec/60)).padStart(2,'0')}:${String(sec%60).padStart(2,'0')}`)};tick();const i=setInterval(tick,1000);return()=>clearInterval(i)},[data?.nextSyncAt,data?.syncStatus?.serverTime]);
+ useEffect(()=>{if(!data?.nextSyncAt){setCountdown('--:--');return}const serverTime=Date.parse(data.syncStatus?.serverTime);const clockOffset=Number.isFinite(serverTime)?serverTime-Date.now():0;const tick=()=>{const sec=Math.max(0,Math.floor((new Date(data.nextSyncAt).getTime()-Date.now()-clockOffset)/1000));setCountdown(`${String(Math.floor(sec/60)).padStart(2,'0')}:${String(sec%60).padStart(2,'0')}`)};tick();const i=setInterval(tick,1000);return()=>clearInterval(i)},[data?.nextSyncAt,data?.syncStatus?.serverTime]);
  const sync=async()=>{
-  if(syncing)return;
+  if(syncInFlight.current)return;
+  if(data?.syncStatus?.isSyncing){
+   showToast('A GPS synchronization is already running. Please wait for it to finish.','error');
+   return;
+  }
+  syncInFlight.current=true;
   setSyncing(true);
   try{
    const response=await axios.post('/sync');
@@ -324,13 +335,21 @@ function Dashboard(){
    showToast(result.success
     ?`GPS sync complete: ${result.totalVehiclesSynced||0} vehicle(s) synchronized.`
     :`GPS sync incomplete: ${result.totalVehiclesSynced||0} synchronized, ${result.failedVehicleCount||0} failed, ${result.failedProviderCount||0} provider(s) failed.`,result.success?'success':'error');
-  }catch(error){showToast(error.response?.data?.reason||error.response?.data?.error||'Sync failed','error')}
+  }catch(error){
+   const message=error.response?.status===409
+    ?error.response?.data?.reason||'A GPS synchronization is already running. Please wait for it to finish.'
+    :error.response?.data?.reason||error.response?.data?.error||'Sync failed';
+   showToast(message,'error');
+  }
   finally{
    window.dispatchEvent(new CustomEvent('gps-sync-complete'));
+   await load(true);
+   syncInFlight.current=false;
    setSyncing(false);
   }
  };
  const syncStatus=data?.syncStatus||{};
+ const isSyncing=Boolean(syncing||syncStatus.isSyncing||syncStatus.status==='Syncing');
  const openPlan=(vehicle,existingPlan=null)=>{
   setPlanModal({...vehicle,planId:existingPlan?._id||null});
   setPlan({
@@ -369,14 +388,58 @@ function Dashboard(){
  if(loadError)return <ErrorPage title="Cannot reach server" details={loadError.message} onRetry={load}/>
  if(!data)return <Skeleton/>
  return <>
- <div className="page-head"><div><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} onClick={sync}><RefreshCw size={18}/> Sync Now</AnimatedButton>}<div className="clock dashboard-sync-clock"><b>Next sync</b><span>{countdown}</span></div><div className="clock dashboard-status-clock"><b>GPS sync</b><span role="status">{syncStatus.status||'Loading status'}</span>{syncStatus.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div><div className="clock dashboard-sync-clock"><b>Last Sync</b><span>{fmt(data.lastSync)}</span></div></div></div>
- <div className="widget-grid">{data.plants.map((p,i)=><motion.button key={p.plant} className="plant-widget" onClick={()=>setPlantModal(p)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}} transition={{delay:i*.07}}><span className="widget-icon"><Factory/></span><div><small>{p.plant}</small><Count value={p.count}/></div></motion.button>)}
- <motion.button className="plant-widget transit" onClick={()=>setTransitModal(true)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}}><span className="widget-icon"><MapPinned/></span><div><small>Outside</small><Count value={data.transit.count}/><em>active vehicles</em></div></motion.button></div>
+ <section className="dashboard-page">
+  <div className="dashboard-overview">
+   <div className="dashboard-title"><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div>
+   <div className="dashboard-sync-grid">
+    <article className="dashboard-info-card dashboard-next-sync">
+     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{data.nextSyncAt?`${fmtIst(data.nextSyncAt)} IST`:'Scheduler disabled'}</p></div>
+     <Timer aria-hidden="true"/>
+    </article>
+    <article className="dashboard-info-card dashboard-sync-state">
+     <div><h2>GPS sync</h2><strong className="dashboard-sync-state-value" role="status">{isSyncing&&<span className="dashboard-sync-spinner" aria-hidden="true"/>}{isSyncing?'Syncing':syncStatus.status||'Loading status'}</strong><p>Scheduler {syncStatus.schedulerStatus||'loading'} - every {syncStatus.syncIntervalMinutes||30} min</p>{syncStatus.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
+     <Navigation aria-hidden="true"/>
+    </article>
+    {canSync&&<AnimatedButton variant="blue" className="dashboard-manual-sync" loading={syncing} disabled={syncing} onClick={sync} aria-label="GPS Sync">
+     {!syncing&&<RefreshCw size={22} aria-hidden="true"/>}<span>{syncing?'Syncing...':'GPS Sync'}</span>
+    </AnimatedButton>}
+    <article className="dashboard-info-card dashboard-last-sync">
+     <div><h2>Last Sync</h2><p>{fmtIst(data.lastSync)}</p></div>
+     <History aria-hidden="true"/>
+    </article>
+   </div>
+  </div>
+  <div className="widget-grid dashboard-stats">
+   {data.plants.map((p,i)=>{
+    const plantType=String(p.plant||'').toLowerCase().includes('tea')?'tea':
+     String(p.plant||'').toLowerCase().includes('salt')?'salt':'plant';
+    const ignition=getIgnitionCounts(p.rows);
+    return <motion.button key={p.plant} className={`plant-widget dashboard-stat-card ${plantType}`} onClick={()=>setPlantModal(p)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}} transition={{delay:i*.07}}>
+     <span className="dashboard-stat-main"><span className="widget-icon"><Factory size={30}/></span><span className="dashboard-stat-copy"><small>{p.plant}</small><Count value={p.count}/></span></span>
+     <IgnitionFooter counts={ignition}/>
+    </motion.button>;
+   })}
+   <motion.button className="plant-widget transit dashboard-stat-card" onClick={()=>setTransitModal(true)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}}>
+    <span className="dashboard-stat-main"><span className="widget-icon"><MapPinned size={30}/></span><span className="dashboard-stat-copy"><small>Outside</small><Count value={data.transit.count}/><em>active vehicles</em></span></span>
+    <IgnitionFooter counts={getIgnitionCounts(data.transit.rows)}/>
+   </motion.button>
+  </div>
+ </section>
  <Modal open={!!plantModal} onClose={()=>setPlantModal(null)} title={`${plantModal?.plant||''} - Vehicles`} size="lg"><PlantPopup plant={plantModal} canPlan={canManage} plansVersion={plansVersion} onPlan={openPlan} onViewPlan={setPlanDetails}/></Modal>
  <Modal open={transitModal} onClose={()=>setTransitModal(false)} title="Outside Vehicles" size="lg"><Table headers={['Vehicle Number','Last Out Plant Name','Current Location','Speed','IGN','GPS time','GPS data',...(canTrack?['']:[])]} rows={data.transit.rows.map(r=>[r.vehicleNumber,r.leftPlant,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.lastGpsUpdatedAt),r.stale?'Stale':'Live',...(canTrack?[<AnimatedButton key={r.vehicleId} variant="blue" onClick={()=>trackNow(r.vehicleId)}>Track Now</AnimatedButton>]:[])])}/></Modal>
  <Modal open={!!planDetails} onClose={()=>setPlanDetails(null)} title="Latest Plan Details" size="sm"><dl className="plan-details"><dt>Plan Type</dt><dd>{planDetails?.planType||'-'}</dd><dt>Expected Departure</dt><dd>{formatPlanDeparture(planDetails?.expectedDeparture)}</dd><dt>Created By</dt><dd>{planDetails?.createdByDisplayName||'Unavailable'}</dd><dt>Remarks</dt><dd className="plan-details-remarks">{planDetails?.remarks||'-'}</dd></dl><div className="modal-actions"><AnimatedButton variant="green" onClick={()=>setPlanDetails(null)}>Close</AnimatedButton></div></Modal>
  <Modal open={!!planModal} onClose={()=>setPlanModal(null)} title={`${planModal?.planId?'Edit':'Plan'} - ${planModal?.vehicleNumber||''}`} disableClose={planSaving}><div className="form-grid"><label>Plan Type<select value={plan.planType} onChange={e=>setPlan({...plan,planType:e.target.value})}>{['Loading','Unloading','Maintenance','Waiting','Other'].map(v=><option key={v}>{v}</option>)}</select></label><label>Expected Departure (Asia/Kolkata)<input type="datetime-local" value={plan.expectedDeparture} onChange={e=>setPlan({...plan,expectedDeparture:e.target.value})}/></label><label className="span-2">Remarks<textarea value={plan.remarks} onChange={e=>setPlan({...plan,remarks:e.target.value})}/></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setPlanModal(null)} disabled={planSaving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={planSaving} onClick={savePlan}>{planModal?.planId?'Update Plan':'Save Plan'}</AnimatedButton></div></Modal>
  </>
+}
+function IgnitionFooter({counts}){
+ return <span className="dashboard-ign-footer">
+  <span className="dashboard-ign-label">IGN Status</span>
+  <span className="dashboard-ign-badges">
+   <span className="dashboard-ign-badge off">{counts.off} Vehicle Off</span>
+   <span className="dashboard-ign-badge on">{counts.on} Vehicle On</span>
+   {counts.unknown>0&&<span className="dashboard-ign-badge unknown">{counts.unknown} Unknown</span>}
+  </span>
+ </span>
 }
 function Count({value}){const [n,setN]=useState(0);useEffect(()=>{let cur=0;const step=Math.max(1,Math.ceil(value/20));const i=setInterval(()=>{cur=Math.min(value,cur+step);setN(cur);if(cur>=value)clearInterval(i)},25);return()=>clearInterval(i)},[value]);return <b>{n}</b>}
 function PlantPopup({plant,onPlan,canPlan,plansVersion,onViewPlan}){const [search,setSearch]=useState('');const [latestPlans,setLatestPlans]=useState({});const reportPlan=useCallback((key,plan)=>setLatestPlans(current=>({...current,[key]:plan})),[]);if(!plant)return null;const rows=objectRows(plant.rows).filter(r=>String(r.vehicleNumber||'').includes(search.toUpperCase())).sort((a,b)=>String(a.vehicleNumber||'').localeCompare(String(b.vehicleNumber||'')));return <>{<div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div>}<Table headers={['Vehicle Number','Entry Time','Stay Hours','Current Location','Speed','IGN','GPS time','GPS data','Latest Plan',...(canPlan?['']:[])]} rows={rows.map(r=>{const planKey=`${plant._id}:${r.vehicleNumber||''}`;return [r.vehicleNumber||'N/A',fmt(r.entryTime),`${r.stayHours||0} h ${r.stayMinutes||0} m`,<LocationText location={r.location} current={r.addressIsCurrent}/>,speedText(r),r.ignition||'N/A',fmt(r.gpsTime),r.hasGps?(r.stale?'Stale':'Live'):'No data',<PlanName vehicle={r.vehicleNumber||''} plantId={plant._id} planKey={planKey} refreshKey={plansVersion} onViewPlan={onViewPlan} onLoaded={reportPlan}/>,...(canPlan?[<div className="row-actions"><AnimatedButton variant="orange" onClick={()=>onPlan(r)}>Plan</AnimatedButton>{latestPlans[planKey]&&<AnimatedButton variant="blue" onClick={()=>onPlan(r,latestPlans[planKey])}>Edit</AnimatedButton>}</div>]:[])];})}/></>}

@@ -127,10 +127,23 @@ const gpsSettingSchema=new mongoose.Schema({
 
 const syncLogSchema=new mongoose.Schema({
  type:{type:String,enum:['auto','manual']},startedAt:{type:Date,default:Date.now},finishedAt:Date,
- result:{type:Object},success:{type:Boolean,default:false}
+ result:{type:Object},success:{type:Boolean,default:false},
+ totalRegisteredVehicles:{type:Number,default:0},successfulVehicles:{type:Number,default:0},
+ failedVehicles:{type:Number,default:0},
+ status:{type:String,enum:['Success','Partial','Failed','Skipped']},
+ errorDetails:{type:[mongoose.Schema.Types.Mixed],default:[]}
 },{timestamps:true});
 syncLogSchema.index({type:1,startedAt:-1});
 syncLogSchema.index({success:1,finishedAt:-1});
+const gpsSyncConfigurationSchema=new mongoose.Schema({
+ key:{type:String,required:true,unique:true},
+ enabled:{type:Boolean,default:true},
+ intervalMinutes:{type:Number,default:30},
+ lastExecutionAt:Date,nextExecutionAt:Date,lastSuccessfulAt:Date,
+ nextRetryAt:Date,retryAttempts:{type:Number,default:0},
+ schedulerStatus:{type:String,enum:['starting','running','disabled','error','stopped'],default:'starting'},
+ schedulerHeartbeatAt:Date
+},{timestamps:true});
 const gpsSyncLockSchema=new mongoose.Schema({
  key:{type:String,required:true,unique:true},
  owner:{type:String,required:true},
@@ -201,6 +214,7 @@ module.exports={
  GpsProviderStatus:mongoose.model('GpsProviderStatus',providerStatusSchema),
  GpsSetting:mongoose.model('GpsSetting',gpsSettingSchema,'gps_settings'),
  SyncLog:mongoose.model('SyncLog',syncLogSchema),ShareLink:mongoose.model('ShareLink',shareSchema),
+ GpsSyncConfiguration:mongoose.model('GpsSyncConfiguration',gpsSyncConfigurationSchema,'gps_sync_configuration'),
  AppSetting:mongoose.model('AppSetting',appSettingSchema),AuditLog:mongoose.model('AuditLog',auditSchema),
  GeocodeCache:mongoose.model('GeocodeCache',geocodeCacheSchema),
  Session:mongoose.model('Session',sessionSchema),SikkaAiChat:mongoose.model('SikkaAiChat',sikkaAiChatSchema,'SikkaAiChat'),

@@ -24,7 +24,8 @@ const {aiChatRequestValidators,getAiChatValidationError}=require('./services/aiC
 const historyRetention=require('./jobs/historyRetention');
 const {backfillPlanActors}=require('./services/planActorBackfill');
 const {
- GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,getNextAutoSyncAt
+ GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,
+ getNextAutoSyncAt,getNextScheduledSyncAt,getNextGpsExecutionAt
 }=require('./services/gpsSyncSchedule');
 const {
  normalizeVehicleNumber:normalizeNumber,groupByVehicleNumber,vehicleNumberRegex
@@ -65,8 +66,10 @@ const readableAddress=record=>{
 };
 const haversine=(a,b)=>{const R=6371000,toRad=x=>x*Math.PI/180;const dLat=toRad(b.lat-a.lat),dLng=toRad(b.lng-a.lng);const x=Math.sin(dLat/2)**2+Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLng/2)**2;return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));};
 const GPS_SYNC_LOCK_KEY='gps-sync';
+const GPS_SYNC_CONFIG_KEY='global';
 const GPS_SYNC_LOCK_TTL_MS=90000;
 const GPS_SYNC_LOCK_RENEW_MS=20000;
+const GPS_SYNC_HEARTBEAT_MS=60000;
 const GPS_PROVIDER_DEFAULTS={
  Wheelseye:{url:'https://api.wheelseye.com/currentLoc',environmentVariable:'WHEELSEYE_API_URL',credentialsReference:'WHEELSEYE_API_TOKEN'}
 };
@@ -175,6 +178,7 @@ async function ensureInitialized(){
    console.log('MongoDB Atlas connected successfully');
    await M.SikkaAiChat.createIndexes().catch(()=>{});
    await M.GpsSyncLock.createIndexes().catch(()=>{});
+   await M.GpsSyncConfiguration.createIndexes();
    await seedGpsSettings().catch(()=>{});
    await seedAdmin().catch(()=>{});
    try{
@@ -281,18 +285,20 @@ async function retryProviderRequest(provider,request){
 }
 
 async function getGpsSyncStatus(now=new Date()){
- const [lastCycle,lastSuccessfulSync,lastManualSync,lastAutoSync,activeLock,gpsData]=await Promise.all([
+ const [lastCycle,lastSuccessfulSync,lastManualSync,lastAutoSync,activeLock,gpsData,syncConfig]=await Promise.all([
   M.SyncLog.findOne({finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean(),
   M.SyncLog.findOne({success:true}).sort({finishedAt:-1}).lean(),
   M.SyncLog.findOne({type:'manual'}).sort({finishedAt:-1}).lean(),
   M.SyncLog.findOne({type:'auto',finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean(),
   M.GpsSyncLock.findOne({key:GPS_SYNC_LOCK_KEY,lockUntil:{$gt:now}}).lean(),
-  M.VehicleLiveStatus.findOne({syncedAt:{$exists:true}}).sort({syncedAt:-1}).select('syncedAt').lean()
+  M.VehicleLiveStatus.findOne({syncedAt:{$exists:true}}).sort({syncedAt:-1}).select('syncedAt').lean(),
+  M.GpsSyncConfiguration.findOne({key:GPS_SYNC_CONFIG_KEY}).lean()
  ]);
  const active=Boolean(activeLock);
- const recentAutomaticSync=lastAutoSync?.finishedAt&&
-  now.getTime()-new Date(lastAutoSync.finishedAt).getTime()<=GPS_SYNC_INTERVAL_MS+GPS_SYNC_RETRY_MS;
- const autoSyncActive=Boolean(syncScheduler)||Boolean(recentAutomaticSync)||activeLock?.type==='auto';
+ const heartbeatAt=syncConfig?.schedulerHeartbeatAt?new Date(syncConfig.schedulerHeartbeatAt).getTime():0;
+ const schedulerHealthy=syncConfig?.enabled!==false&&syncConfig?.schedulerStatus==='running'&&
+  now.getTime()-heartbeatAt<=GPS_SYNC_HEARTBEAT_MS*2;
+ const autoSyncActive=Boolean(syncScheduler?.enabled)||schedulerHealthy||activeLock?.type==='auto';
  const lastCycleErrors=lastCycle?.result
   ?Object.entries(lastCycle.result).flatMap(([provider,result])=>
     Array.isArray(result?.errors)?result.errors.map(error=>({provider,...error})):[])
@@ -300,16 +306,18 @@ async function getGpsSyncStatus(now=new Date()){
  const failureMessage=lastCycle?.result?.error||lastCycle?.result?.reason||
   lastCycleErrors[0]?.message||lastCycle?.result?.geofenceError||'';
  const status=active?'Syncing':lastCycle
-  ?lastCycle.success?'Sync Successful':'Sync Failed'
+  ?lastCycle.status==='Skipped'?'Scheduled':lastCycle.success?'Sync Successful':'Sync Failed'
   :autoSyncActive?'Scheduled':'Inactive';
  return {
   serverTime:now,
   autoSyncActive,isSyncing:active,status,
-  nextAutoSyncAt:getNextAutoSyncAt(now,lastCycle),
-  lastSuccessfulSyncAt:lastSuccessfulSync?.finishedAt||null,
+  schedulerStatus:syncConfig?.enabled===false?'disabled':schedulerHealthy||syncScheduler?.enabled?'running':'inactive',
+  syncIntervalMinutes:syncConfig?.intervalMinutes||30,
+  nextAutoSyncAt:syncConfig?.enabled===false?null:getNextGpsExecutionAt(now,syncConfig,lastAutoSync),
+  lastSuccessfulSyncAt:syncConfig?.lastSuccessfulAt||lastSuccessfulSync?.finishedAt||null,
   lastManualSyncAt:lastManualSync?.finishedAt||lastManualSync?.startedAt||null,
   lastSyncAt:lastCycle?.finishedAt||lastCycle?.startedAt||null,
-  lastError:lastCycle?.success?'':failureMessage,
+  lastError:lastCycle?.success||lastCycle?.status==='Skipped'?'':failureMessage,
   totalVehiclesSynced:lastCycle?.result?.totalVehiclesSynced||0,
   failedVehicleCount:lastCycle?.result?.failedVehicleCount||0,
   failedProviderCount:lastCycle?.result?.failedProviderCount||0,
@@ -359,18 +367,20 @@ async function acquireGpsSyncLock(owner,now,type){
 async function logSkippedSync(type,reason,at=new Date()){
  await M.SyncLog.create({
   type,startedAt:at,finishedAt:new Date(),
-  result:{reason,skipped:true},success:false
+  result:{reason,skipped:true},success:false,status:'Skipped'
  });
  return {started:false,reason};
 }
 
-async function runSync(type='manual'){
+async function runSync(type='manual',options={}){
  const attemptedAt=new Date();
+ const isRetry=options.retry===true;
  if(syncing)return logSkippedSync(type,'Sync already running',attemptedAt);
  syncing=true;
  const owner=crypto.randomUUID();
- let nextSyncDelay=GPS_SYNC_RETRY_MS;
  let lockAcquired=false,lockLost=false,heartbeat=null;
+ let cycleStartedAt=attemptedAt,cycleFinishedAt=null,cycleSucceeded=false;
+ let registeredVehicleCount=0,synchronizedVehicleCount=0,failedVehicleCountForLog=0;
  try{
   lockAcquired=await acquireGpsSyncLock(owner,attemptedAt,type);
   if(!lockAcquired)return await logSkippedSync(type,'Another backend instance is running GPS sync',attemptedAt);
@@ -392,13 +402,22 @@ async function runSync(type='manual'){
   },GPS_SYNC_LOCK_RENEW_MS);
   heartbeat.unref?.();
   const startedAt=new Date();
+  cycleStartedAt=startedAt;
+  if(type==='auto'){
+   const schedulerUpdate={
+    lastExecutionAt:startedAt,schedulerStatus:'running',schedulerHeartbeatAt:startedAt,
+    ...(isRetry?{nextRetryAt:null}:{nextExecutionAt:getNextScheduledSyncAt(startedAt),nextRetryAt:null,retryAttempts:0})
+   };
+   await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:schedulerUpdate},{upsert:true});
+  }
   const activeVehicleRows=await M.Vehicle.find({status:'Active'})
-   .select('vehicleNumber gpsLink providerVehicleId gpsProviders updatedAt createdAt').lean();
+   .select('vehicleNumber gpsLink gpsProviders updatedAt createdAt').lean();
   const activeVehicles=[...groupByVehicleNumber(activeVehicleRows).values()].map(records=>
    records.sort((a,b)=>new Date(b.updatedAt||0)-new Date(a.updatedAt||0))[0]
   );
   const vehiclesByNumber=new Map(activeVehicles.map(vehicle=>[normalizeNumber(vehicle.vehicleNumber),vehicle]));
   const registeredNumbers=[...vehiclesByNumber.keys()];
+  registeredVehicleCount=registeredNumbers.length;
   const savedProviderSettings=await M.GpsSetting.find({}).lean();
   const providerSettingsByName=new Map(savedProviderSettings.map(setting=>[setting.provider,setting]));
   const synchronizedRegisteredNumbers=new Set();
@@ -441,6 +460,7 @@ async function runSync(type='manual'){
      const vehicle=vehiclesByNumber.get(row.vehicleNumber);
      if(!vehicle||!vehicleHasProvider(vehicle,p.name))continue;
      receivedRegistered.add(row.vehicleNumber);
+     try{
      const previousRecords=await M.VehicleLiveStatus.find({vehicleNumber:vehicleNumberRegex(row.vehicleNumber)})
       .sort({gpsTime:-1,syncedAt:-1}).lean();
      const previous=previousRecords[0]||null;
@@ -479,19 +499,6 @@ async function runSync(type='manual'){
       previous?{_id:previous._id}:{normalizedVehicleNumber:row.vehicleNumber},
       {$set:doc},{upsert:!previous,new:true}
      );
-     if(vehicle){
-      synchronizedRegisteredNumbers.add(row.vehicleNumber);
-      const links=new Map((vehicle.gpsProviders||[]).map(link=>[link.name,{name:link.name,vehicleId:link.vehicleId}]));
-      if(!links.has(vehicle.gpsLink))links.set(vehicle.gpsLink,{name:vehicle.gpsLink,vehicleId:vehicle.providerVehicleId});
-      const currentLink=links.get(p.name)||{name:p.name};
-      if(row.providerVehicleId)currentLink.vehicleId=String(row.providerVehicleId);
-      links.set(p.name,currentLink);
-      const vehicleUpdate={gpsProviders:[...links.values()]};
-      if(row.providerVehicleId&&p.name===vehicle.gpsLink)vehicleUpdate.providerVehicleId=String(row.providerVehicleId);
-      await M.Vehicle.updateOne({_id:vehicle._id},{$set:vehicleUpdate});
-      vehicle.gpsProviders=vehicleUpdate.gpsProviders;
-      if(vehicleUpdate.providerVehicleId)vehicle.providerVehicleId=vehicleUpdate.providerVehicleId;
-     }
      await M.VehicleLocationHistory.updateOne(
       {vehicleNumber:row.vehicleNumber,gpsTime:row.gpsTime,provider:row.provider},
       {$setOnInsert:{vehicle:row.vehicleNumber,vehicleNumber:row.vehicleNumber,lat:row.lat,lng:row.lng,address,
@@ -505,6 +512,18 @@ async function runSync(type='manual'){
       {upsert:true}
      );
      syncedNumbers.add(row.vehicleNumber);
+     synchronizedRegisteredNumbers.add(row.vehicleNumber);
+     synchronizedVehicleCount=synchronizedRegisteredNumbers.size;
+     }catch(error){
+      errorDetails.push({
+       vehicleNumber:row.vehicleNumber,
+       message:error.message||'Vehicle GPS data could not be saved'
+      });
+      console.error('[GPS sync] Vehicle synchronization failed',{
+       provider:p.name,vehicleNumber:row.vehicleNumber,
+       message:error.message,stack:error.stack
+      });
+     }
     }
     const receivedAssignedNumbers=registeredNumbers.filter(number=>receivedRegistered.has(number));
     const missingNumbers=registeredNumbers.filter(number=>!receivedRegistered.has(number));
@@ -577,26 +596,46 @@ async function runSync(type='manual'){
   const totalVehiclesSynced=synchronizedRegisteredNumbers.size;
   const failedVehicleCount=failedVehicleNumbers.length;
   const success=allProvidersSucceeded&&failedVehicleCount===0&&!geofenceError;
-  nextSyncDelay=success?GPS_SYNC_INTERVAL_MS:GPS_SYNC_RETRY_MS;
+  cycleFinishedAt=finishedAt;
+  cycleSucceeded=success;
+  synchronizedVehicleCount=totalVehiclesSynced;
+  failedVehicleCountForLog=failedVehicleCount;
   const summary={
    ...result,totalVehiclesSynced,failedVehicleCount,failedProviderCount,
    geofenceError,partialSuccess:successfulProviders>0&&!success
   };
-  await M.SyncLog.create({type,startedAt,finishedAt,result:summary,success});
+  const errorDetails=Object.entries(result).flatMap(([provider,providerResult])=>
+   (providerResult.errors||[]).map(error=>({provider,...error}))
+  );
+  await M.SyncLog.create({
+   type,startedAt,finishedAt,result:summary,success,
+   totalRegisteredVehicles:registeredVehicleCount,
+   successfulVehicles:totalVehiclesSynced,failedVehicles:failedVehicleCount,
+   status:success?'Success':totalVehiclesSynced?'Partial':'Failed',
+   errorDetails
+  });
   return {
    started:true,startedAt,finishedAt,result:summary,success,
    partialSuccess:summary.partialSuccess,totalVehiclesSynced,failedVehicleCount,
-   failedProviderCount,nextAutoSyncAt:getNextAutoSyncAt(finishedAt,{finishedAt,success})
+   failedProviderCount,nextAutoSyncAt:success
+    ?getNextScheduledSyncAt(finishedAt)
+    :new Date(Math.min(getNextScheduledSyncAt(finishedAt).getTime(),finishedAt.getTime()+GPS_SYNC_RETRY_MS))
   };
  }catch(error){
   const finishedAt=new Date();
+  cycleFinishedAt=finishedAt;
   console.error('[GPS sync] Synchronization cycle failed',{
    type,owner,message:error.message,stack:error.stack
   });
   try{
    await M.SyncLog.create({
     type,startedAt:attemptedAt,finishedAt,
-    result:{error:error.message||String(error)},success:false
+    result:{error:error.message||String(error)},success:false,
+    totalRegisteredVehicles:registeredVehicleCount,
+    successfulVehicles:synchronizedVehicleCount,
+    failedVehicles:Math.max(failedVehicleCountForLog,registeredVehicleCount-synchronizedVehicleCount),
+    status:synchronizedVehicleCount?'Partial':'Failed',
+    errorDetails:[{message:error.message||String(error)}]
    });
   }catch(logError){
    console.error('[GPS sync] Could not save failed synchronization log',{
@@ -606,6 +645,30 @@ async function runSync(type='manual'){
   throw error;
  }finally{
   if(heartbeat)clearInterval(heartbeat);
+ if(type==='auto'&&lockAcquired){
+  try{
+   const finishedAt=cycleFinishedAt||new Date();
+   const config=await M.GpsSyncConfiguration.findOne({key:GPS_SYNC_CONFIG_KEY}).select('nextExecutionAt retryAttempts').lean();
+   const retriesUsed=isRetry?Number(config?.retryAttempts)||0:0;
+   const retriesAfterCycle=cycleSucceeded?0:retriesUsed+1;
+   const nextRetryAt=!cycleSucceeded&&retriesAfterCycle<2
+    ?new Date(finishedAt.getTime()+GPS_SYNC_RETRY_MS):null;
+   const savedScheduledAt=config?.nextExecutionAt?new Date(config.nextExecutionAt):getNextScheduledSyncAt(finishedAt);
+   await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
+    lastExecutionAt:cycleStartedAt,
+    nextExecutionAt:savedScheduledAt.getTime()<=finishedAt.getTime()
+     ?getNextScheduledSyncAt(finishedAt):savedScheduledAt,
+    nextRetryAt,
+    retryAttempts:nextRetryAt?retriesAfterCycle:0,
+    schedulerStatus:'running',schedulerHeartbeatAt:new Date(),
+    ...(cycleSucceeded?{lastSuccessfulAt:finishedAt}:{})
+   }},{upsert:true});
+  }catch(error){
+   console.error('[GPS sync] Could not persist scheduler state',{
+    message:error.message,stack:error.stack
+   });
+  }
+ }
   if(lockAcquired){
    try{
     const released=await M.GpsSyncLock.deleteOne({key:GPS_SYNC_LOCK_KEY,owner});
@@ -617,7 +680,6 @@ async function runSync(type='manual'){
    }
   }
   syncing=false;
-  if(syncScheduler)scheduleNextAutoSync(nextSyncDelay);
  }
 }
 
@@ -1323,43 +1385,137 @@ app.use('/api',(error,req,res,next)=>{
  return res.status(status>=400?status:500).json({error:message,...(referenceCode?{referenceCode}:{})});
 });
 
-function scheduleNextAutoSync(delay){
- if(!syncScheduler)return;
- clearTimeout(syncScheduler.timer);
- const waitMs=Math.max(0,delay);
- syncScheduler.nextAt=new Date(Date.now()+waitMs);
- syncScheduler.timer=setTimeout(async()=>{
-  syncScheduler.timer=null;
-  try{
-   const latestSync=await M.SyncLog.findOne({finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean();
-   const dueAt=getNextAutoSyncAt(new Date(),latestSync);
-   const remaining=dueAt.getTime()-Date.now();
-   if(remaining>0){
-    scheduleNextAutoSync(remaining);
-    return;
-   }
-   const result=await runSync('auto');
-   console.info('[GPS sync] Automatic cycle finished',{
-    started:result.started,success:result.success,partialSuccess:result.partialSuccess,
-    totalVehiclesSynced:result.totalVehiclesSynced,failedVehicleCount:result.failedVehicleCount,
-    failedProviderCount:result.failedProviderCount
-   });
-  }catch(error){
-   console.error('[GPS sync] Automatic cycle failed',{
-    message:error.message,stack:error.stack
-   });
-   scheduleNextAutoSync(GPS_SYNC_RETRY_MS);
-  }
+function scheduleGpsSyncWake(at){
+ if(!syncScheduler?.enabled)return;
+ clearTimeout(syncScheduler.wakeTimer);
+ const waitMs=Math.max(0,new Date(at).getTime()-Date.now());
+ syncScheduler.wakeTimer=setTimeout(()=>{
+  syncScheduler.wakeTimer=null;
+  executeDueGpsSync();
  },waitMs);
- syncScheduler.timer.unref?.();
+ syncScheduler.wakeTimer.unref?.();
+}
+
+async function executeDueGpsSync(){
+ if(!syncScheduler?.enabled)return;
+ try{
+  const config=await M.GpsSyncConfiguration.findOne({key:GPS_SYNC_CONFIG_KEY}).lean();
+  if(config?.enabled===false){
+   syncScheduler.enabled=false;
+   syncScheduler.cronTask?.stop();
+   clearInterval(syncScheduler.heartbeat);
+   clearTimeout(syncScheduler.wakeTimer);
+   await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
+    schedulerStatus:'disabled',schedulerHeartbeatAt:null
+   }});
+   return;
+  }
+  const now=new Date();
+  const nextAt=getNextGpsExecutionAt(now,config||{});
+  syncScheduler.nextAt=nextAt;
+  if(nextAt.getTime()>now.getTime()){
+   if(config?.nextRetryAt&&new Date(config.nextRetryAt).getTime()<=nextAt.getTime()){
+    scheduleGpsSyncWake(config.nextRetryAt);
+   }else{
+    clearTimeout(syncScheduler.wakeTimer);
+    syncScheduler.wakeTimer=null;
+   }
+   return;
+  }
+  const retryTime=config?.nextRetryAt?new Date(config.nextRetryAt).getTime():NaN;
+  const scheduledTime=config?.nextExecutionAt?new Date(config.nextExecutionAt).getTime():NaN;
+  const isRetry=Number.isFinite(retryTime)&&retryTime<=now.getTime()&&
+   (!Number.isFinite(scheduledTime)||scheduledTime>now.getTime()&&retryTime<scheduledTime);
+  const result=await runSync('auto',{retry:isRetry});
+  console.info('[GPS sync] Automatic cycle finished',{
+   started:result.started,success:result.success,partialSuccess:result.partialSuccess,
+   totalVehiclesSynced:result.totalVehiclesSynced,failedVehicleCount:result.failedVehicleCount,
+   failedProviderCount:result.failedProviderCount
+  });
+  if(!result.started){
+   const retryAt=new Date(Date.now()+GPS_SYNC_RETRY_MS);
+   const activeLock=await M.GpsSyncLock.findOne({
+    key:GPS_SYNC_LOCK_KEY,lockUntil:{$gt:new Date()}
+   }).lean();
+   if(activeLock?.type!=='auto'){
+    await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
+     nextExecutionAt:getNextScheduledSyncAt(retryAt),nextRetryAt:retryAt,
+     retryAttempts:0,schedulerStatus:'running',schedulerHeartbeatAt:new Date()
+    }},{upsert:true});
+   }
+   scheduleGpsSyncWake(retryAt);
+   return;
+  }
+  const updatedConfig=await M.GpsSyncConfiguration.findOne({key:GPS_SYNC_CONFIG_KEY}).lean();
+  syncScheduler.nextAt=getNextGpsExecutionAt(new Date(),updatedConfig);
+  if(updatedConfig?.nextRetryAt)scheduleGpsSyncWake(updatedConfig.nextRetryAt);
+  else{
+   clearTimeout(syncScheduler.wakeTimer);
+   syncScheduler.wakeTimer=null;
+  }
+ }catch(error){
+  console.error('[GPS sync] Automatic cycle failed',{
+   message:error.message,stack:error.stack
+  });
+  const retryAt=new Date(Date.now()+GPS_SYNC_RETRY_MS);
+  try{
+   const config=await M.GpsSyncConfiguration.findOne({key:GPS_SYNC_CONFIG_KEY}).lean();
+   const nextRetryAt=config?.nextRetryAt||retryAt;
+   await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
+    nextExecutionAt:config?.nextExecutionAt||getNextScheduledSyncAt(nextRetryAt),
+    nextRetryAt,schedulerStatus:'running',schedulerHeartbeatAt:new Date()
+   }},{upsert:true});
+   scheduleGpsSyncWake(nextRetryAt);
+  }catch(stateError){
+   console.error('[GPS sync] Could not persist retry schedule',{
+    message:stateError.message,stack:stateError.stack
+   });
+   scheduleGpsSyncWake(retryAt);
+  }
+ }
 }
 
 async function startGpsSyncScheduler(){
  if(syncScheduler)return;
- syncScheduler={timer:null,nextAt:null};
- const latestSync=await M.SyncLog.findOne({finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean();
- const nextSyncAt=getNextAutoSyncAt(new Date(),latestSync);
- scheduleNextAutoSync(Math.max(0,nextSyncAt.getTime()-Date.now()));
+ const config=await M.GpsSyncConfiguration.findOneAndUpdate(
+  {key:GPS_SYNC_CONFIG_KEY},
+  {$setOnInsert:{enabled:true,intervalMinutes:30,schedulerStatus:'starting'}},
+  {upsert:true,new:true}
+ ).lean();
+ if(config.enabled===false){
+  syncScheduler={timer:null,nextAt:null,enabled:false,heartbeat:null};
+  await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
+   schedulerStatus:'disabled',schedulerHeartbeatAt:null
+  }});
+  console.info('[GPS sync] Backend scheduler is disabled by persistent configuration');
+  return;
+ }
+ const latestAutoSync=await M.SyncLog.findOne({
+  type:'auto',finishedAt:{$exists:true}
+ }).sort({finishedAt:-1}).lean();
+ const now=new Date();
+ const scheduledAt=config.nextExecutionAt||getNextAutoSyncAt(now,latestAutoSync);
+ const nextSyncAt=getNextGpsExecutionAt(now,{...config,nextExecutionAt:scheduledAt},latestAutoSync);
+ syncScheduler={wakeTimer:null,nextAt:nextSyncAt,enabled:true,heartbeat:null,cronTask:null};
+ await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
+  intervalMinutes:30,nextExecutionAt:scheduledAt,
+  schedulerStatus:'running',schedulerHeartbeatAt:now
+ }});
+ syncScheduler.cronTask=cron.schedule('*/30 * * * *',executeDueGpsSync,{timezone:'UTC'});
+ syncScheduler.heartbeat=setInterval(async()=>{
+  try{
+   await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
+    schedulerStatus:'running',schedulerHeartbeatAt:new Date()
+   }});
+  }catch(error){
+   console.error('[GPS sync] Scheduler heartbeat update failed',{
+    message:error.message,stack:error.stack
+   });
+  }
+ },GPS_SYNC_HEARTBEAT_MS);
+ syncScheduler.heartbeat.unref?.();
+ if(nextSyncAt.getTime()<=now.getTime())scheduleGpsSyncWake(nextSyncAt);
+ else if(config.nextRetryAt)scheduleGpsSyncWake(config.nextRetryAt);
  console.info('[GPS sync] Backend scheduler active; next cycle at',syncScheduler.nextAt.toISOString());
 }
 
