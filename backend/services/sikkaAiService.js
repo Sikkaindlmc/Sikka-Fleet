@@ -4,6 +4,7 @@ const {
  normalizeVehicleNumber,groupByVehicleNumber,vehicleNumberRegex
 }=require('./vehicleIdentity');
 const {GPS_SYNC_INTERVAL_MS}=require('./gpsSyncSchedule');
+const {getActivePlanExpiryFilter}=require('./planExpiry');
 
 const DAY_MS=24*60*60*1000;
 const CHAT_TTL_MS=7*DAY_MS;
@@ -527,7 +528,10 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
  const planQuestion=/\b(plan|schedule|planned)\b/.test(normalized);
  if(planQuestion){
   if(!hasPageAccess(permissions,'dashboard'))return accessDenied(language,'dashboard');
-  const filter=vehicleNumber?{vehicle:vehicleNumber}:{};
+  const filter={
+   ...(vehicleNumber?{vehicle:vehicleNumber}:{}),
+   $and:[getActivePlanExpiryFilter(now)]
+  };
   if(!vehicleNumber&&hasPlantWord){
    const plants=await fleetSnapshotService.getActivePlantRecords(models);
    const plant=matchPlant(query,plants);

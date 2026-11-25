@@ -23,6 +23,7 @@ const sikkaAiService=require('./services/sikkaAiService');
 const {aiChatRequestValidators,getAiChatValidationError}=require('./services/aiChatValidation');
 const historyRetention=require('./jobs/historyRetention');
 const {backfillPlanActors}=require('./services/planActorBackfill');
+const {getActivePlanExpiryFilter,setPlanExpiryAfterPlantExit}=require('./services/planExpiry');
 const {
  GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,GPS_SYNC_HEARTBEAT_MS,
  isGpsSchedulerHealthy,isGpsSchedulerSecretValid,
@@ -179,6 +180,7 @@ async function ensureInitialized(){
    await M.SikkaAiChat.createIndexes().catch(()=>{});
    await M.GpsSyncLock.createIndexes().catch(()=>{});
    await M.GpsSyncConfiguration.createIndexes();
+   await M.VehiclePlan.createIndexes();
    await seedGpsSettings().catch(()=>{});
    await seedAdmin().catch(()=>{});
    try{
@@ -724,6 +726,9 @@ async function updateGeofence(){
   for(const stay of close){
    const gpsTime=new Date(live.gpsTime||Date.now());
    const closeAt=new Date(Math.max(gpsTime.getTime(),new Date(stay.entryTime).getTime()+1));
+   await setPlanExpiryAfterPlantExit(M,{
+    vehicle:stay.vehicle,plant:stay.plant,exitTime:closeAt
+   });
    await M.VehiclePlantStay.updateOne({_id:stay._id,exitTime:null},{$set:{exitTime:closeAt}});
   }
   if(nearest&&!keep){
@@ -1052,7 +1057,10 @@ app.put('/api/plans/:id',auth,permission('Dashboard','edit'),[
  res.json(plan);
 });
 app.get('/api/plans/:vehicle',auth,permission('Dashboard','view'),async(req,res)=>{
- const filter={vehicle:normalizeNumber(req.params.vehicle)};
+ const filter={
+  vehicle:normalizeNumber(req.params.vehicle),
+  $and:[getActivePlanExpiryFilter()]
+ };
  if(req.query.plant){
   if(!mongoose.Types.ObjectId.isValid(req.query.plant))return res.status(400).json({error:'Invalid plant'});
   filter.plant=req.query.plant;

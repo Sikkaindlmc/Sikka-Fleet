@@ -114,3 +114,6 @@ Express serves the built frontend on port 5000 in production.
 ## GPS providers
 
 The cron job synchronizes providers every 30 minutes. Use **Sync Now** for manual synchronization. Provider failures are isolated and stale data is retained.
+
+Plant plans are automatically removed one hour after the vehicle's GPS-recorded
+exit from that plant. Plans created after the recorded exit are not affected.

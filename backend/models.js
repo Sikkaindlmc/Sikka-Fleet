@@ -106,8 +106,10 @@ const planSchema=new mongoose.Schema({
  remarks:String,expectedDeparture:Date,
  createdBy:{type:String},
  createdByUserId:{type:mongoose.Schema.Types.ObjectId,ref:'User'},createdByName:String,
- updatedByUserId:{type:mongoose.Schema.Types.ObjectId,ref:'User'},updatedByName:String
+ updatedByUserId:{type:mongoose.Schema.Types.ObjectId,ref:'User'},updatedByName:String,
+ expiresAt:Date
 },{timestamps:true});
+planSchema.index({expiresAt:1},{expireAfterSeconds:0});
 
 const providerStatusSchema=new mongoose.Schema({
  provider:{type:String,unique:true},status:{type:String,enum:['Connected','Disconnected','Error'],default:'Disconnected'},
