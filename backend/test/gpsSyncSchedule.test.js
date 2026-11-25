@@ -1,9 +1,29 @@
 const test=require('node:test');
 const assert=require('node:assert/strict');
 const {
- GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,
- getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
+ GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,GPS_SYNC_HEARTBEAT_MS,
+ isGpsSchedulerHealthy,getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
 }=require('../services/gpsSyncSchedule');
+
+test('scheduler health requires a recent persisted heartbeat and running status',()=>{
+ const now=new Date('2026-11-25T05:30:00.000Z');
+ const recentConfig={
+  enabled:true,schedulerStatus:'running',
+  schedulerHeartbeatAt:new Date(now.getTime()-GPS_SYNC_HEARTBEAT_MS*2)
+ };
+ assert.equal(isGpsSchedulerHealthy(now,recentConfig),true);
+ assert.equal(isGpsSchedulerHealthy(now,{
+  schedulerStatus:'running',schedulerHeartbeatAt:recentConfig.schedulerHeartbeatAt
+ }),true);
+ assert.equal(isGpsSchedulerHealthy(now,{
+  ...recentConfig,schedulerHeartbeatAt:new Date(now.getTime()-GPS_SYNC_HEARTBEAT_MS*4)
+ }),false);
+ assert.equal(isGpsSchedulerHealthy(now,{...recentConfig,schedulerStatus:'error'}),false);
+ assert.equal(isGpsSchedulerHealthy(now,{...recentConfig,enabled:false}),false);
+ assert.equal(isGpsSchedulerHealthy(now,{
+  ...recentConfig,schedulerHeartbeatAt:new Date(now.getTime()+1000)
+ }),false);
+});
 
 test('automatic syncs stay aligned to fixed UTC half-hour slots',()=>{
  const finishedAt=new Date('2026-11-24T05:07:00.000Z');

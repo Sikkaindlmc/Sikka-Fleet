@@ -1,5 +1,14 @@
 const GPS_SYNC_INTERVAL_MS=30*60*1000;
 const GPS_SYNC_RETRY_MS=5*60*1000;
+const GPS_SYNC_HEARTBEAT_MS=30*1000;
+
+function isGpsSchedulerHealthy(now,config){
+ if(config?.enabled===false||config?.schedulerStatus!=='running')return false;
+ const heartbeatAt=new Date(config.schedulerHeartbeatAt).getTime();
+ const currentTime=new Date(now).getTime();
+ return Number.isFinite(heartbeatAt)&&heartbeatAt<=currentTime&&
+  currentTime-heartbeatAt<=GPS_SYNC_HEARTBEAT_MS*3;
+}
 
 function getNextScheduledSyncAt(after=new Date()){
  const timestamp=new Date(after).getTime();
@@ -31,6 +40,6 @@ function getNextGpsExecutionAt(now,config,lastAutoSync){
 }
 
 module.exports={
- GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,
- getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
+ GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,GPS_SYNC_HEARTBEAT_MS,
+ isGpsSchedulerHealthy,getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
 };

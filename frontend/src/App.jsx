@@ -92,11 +92,16 @@ const fmtIst=d=>{
  const values=Object.fromEntries(parts.filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
  return `${values.day}-${values.month}-${values.year} ${values.hour}:${values.minute}:${values.second} ${String(values.dayPeriod||'').toUpperCase()}`;
 };
-const formatCountdown=(target,serverTime)=>{
+const getServerClockOffset=(serverTime,clientReceivedAt=Date.now())=>{
+ const serverAt=Date.parse(serverTime);
+ return Number.isFinite(serverAt)?serverAt-clientReceivedAt:0;
+};
+const formatCountdown=(target,clockOffset=0)=>{
  if(!target)return '--:--:--';
- const serverDate=Date.parse(serverTime);
- const clockOffset=Number.isFinite(serverDate)?serverDate-Date.now():0;
- const seconds=Math.max(0,Math.floor((new Date(target).getTime()-Date.now()-clockOffset)/1000));
+ const targetAt=new Date(target).getTime();
+ if(!Number.isFinite(targetAt))return '--:--:--';
+ const offset=Number.isFinite(clockOffset)?clockOffset:0;
+ const seconds=Math.max(0,Math.floor((targetAt-Date.now()-offset)/1000));
  const hours=Math.floor(seconds/3600);
  const minutes=Math.floor((seconds%3600)/60);
  const remainingSeconds=seconds%60;
@@ -315,7 +320,13 @@ function Dashboard(){
  const load=async(silent=false)=>{
   if(loadInFlight.current){if(silent)refreshQueued.current=true;return}
   loadInFlight.current=true;
-  try{const r=await axios.get('/dashboard');setData(dashboardData(r.data));setLoadError(null)}
+  try{
+   const r=await axios.get('/dashboard');
+   const responseData=dashboardData(r.data);
+   responseData.serverClockOffsetMs=getServerClockOffset(responseData.syncStatus?.serverTime);
+   setData(responseData);
+   setLoadError(null);
+  }
   catch(error){if(!silent){setData(null);setLoadError(error);showToast('Cannot reach server','error')}}
   finally{
    loadInFlight.current=false;
@@ -332,11 +343,11 @@ function Dashboard(){
  },[]);
  useEffect(()=>{
   if(!data?.nextSyncAt){setCountdown('--:--:--');return}
-  const tick=()=>setCountdown(formatCountdown(data.nextSyncAt,data.syncStatus?.serverTime));
+  const tick=()=>setCountdown(formatCountdown(data.nextSyncAt,data.serverClockOffsetMs));
   tick();
   const interval=setInterval(tick,1000);
   return()=>clearInterval(interval);
- },[data?.nextSyncAt,data?.syncStatus?.serverTime]);
+ },[data?.nextSyncAt,data?.serverClockOffsetMs]);
  const sync=async()=>{
   if(syncInFlight.current)return;
   if(data?.syncStatus?.isSyncing){
@@ -731,7 +742,7 @@ function Gps(){
  const [tab,setTab]=useState('tracking'); const [data,setData]=useState({live:[],registeredVehicles:[],providers:[],syncStatus:{}});const [selected,setSelected]=useState(null);const [search,setSearch]=useState('');const [provider,setProvider]=useState('');const [running,setRunning]=useState('');const [pageLoading,setPageLoading]=useState(true);const [pageError,setPageError]=useState(null);
  const [settings,setSettings]=useState({});const [providerSettings,setProviderSettings]=useState([]);const [runningFile,setRunningFile]=useState(null);const [stoppedFile,setStoppedFile]=useState(null);const [saving,setSaving]=useState(false);const [shareUrl,setShareUrl]=useState('');
  const [syncing,setSyncing]=useState(false);const [syncCountdown,setSyncCountdown]=useState('--:--:--');
- const load=async()=>{try{const [r,s,p]=await Promise.all([axios.get('/tracking'),axios.get('/settings'),axios.get('/gps/settings')]);setData(r.data);setSelected(current=>current?r.data.live.find(v=>v.vehicleNumber===current.vehicleNumber)||null:null);setSettings(s.data);setProviderSettings(p.data);setPageError(null)}catch(e){setPageError(e);showToast('Failed to load GPS data','error')}finally{setPageLoading(false)}};
+ const load=async()=>{try{const [r,s,p]=await Promise.all([axios.get('/tracking'),axios.get('/settings'),axios.get('/gps/settings')]);setData({...r.data,serverClockOffsetMs:getServerClockOffset(r.data.syncStatus?.serverTime)});setSelected(current=>current?r.data.live.find(v=>v.vehicleNumber===current.vehicleNumber)||null:null);setSettings(s.data);setProviderSettings(p.data);setPageError(null)}catch(e){setPageError(e);showToast('Failed to load GPS data','error')}finally{setPageLoading(false)}};
  useEffect(()=>{
   load();
   const interval=setInterval(load,60000);
@@ -743,12 +754,12 @@ function Gps(){
   const target=data.syncStatus?.nextAutoSyncAt;
   if(!target){setSyncCountdown('--:--:--');return}
   const tick=()=>{
-   setSyncCountdown(formatCountdown(target,data.syncStatus?.serverTime));
+   setSyncCountdown(formatCountdown(target,data.serverClockOffsetMs));
   };
   tick();
   const interval=setInterval(tick,1000);
   return()=>clearInterval(interval);
- },[data.syncStatus?.nextAutoSyncAt]);
+ },[data.syncStatus?.nextAutoSyncAt,data.serverClockOffsetMs]);
  const manualSync=async()=>{
   if(syncing)return;
   setSyncing(true);
