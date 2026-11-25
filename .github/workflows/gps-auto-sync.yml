@@ -1,6 +1,6 @@
 name: GPS automatic synchronization
 
-on:
+'on':
   schedule:
     - cron: '*/30 * * * *'
 
