@@ -92,6 +92,16 @@ const fmtIst=d=>{
  const values=Object.fromEntries(parts.filter(part=>part.type!=='literal').map(part=>[part.type,part.value]));
  return `${values.day}-${values.month}-${values.year} ${values.hour}:${values.minute}:${values.second} ${String(values.dayPeriod||'').toUpperCase()}`;
 };
+const formatCountdown=(target,serverTime)=>{
+ if(!target)return '--:--:--';
+ const serverDate=Date.parse(serverTime);
+ const clockOffset=Number.isFinite(serverDate)?serverDate-Date.now():0;
+ const seconds=Math.max(0,Math.floor((new Date(target).getTime()-Date.now()-clockOffset)/1000));
+ const hours=Math.floor(seconds/3600);
+ const minutes=Math.floor((seconds%3600)/60);
+ const remainingSeconds=seconds%60;
+ return `${String(hours).padStart(2,'0')}:${String(minutes).padStart(2,'0')}:${String(remainingSeconds).padStart(2,'0')}`;
+};
 const indiaDateTimeLocal=value=>{
  const date=new Date(value);
  if(!Number.isFinite(date.getTime()))return '';
@@ -300,7 +310,7 @@ function Dashboard(){
  const canManage=canEdit(user,'dashboard');
  const canSync=canManage||canEdit(user,'gpsTrack');
  const canTrack=canView(user,'gpsTrack');
- const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
+ const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
  const loadInFlight=useRef(false);const refreshQueued=useRef(false);const syncInFlight=useRef(false);
  const load=async(silent=false)=>{
   if(loadInFlight.current){if(silent)refreshQueued.current=true;return}
@@ -320,7 +330,13 @@ function Dashboard(){
   document.addEventListener('visibilitychange',refresh);
   return()=>{window.clearInterval(interval);document.removeEventListener('visibilitychange',refresh)};
  },[]);
- useEffect(()=>{if(!data?.nextSyncAt){setCountdown('--:--');return}const serverTime=Date.parse(data.syncStatus?.serverTime);const clockOffset=Number.isFinite(serverTime)?serverTime-Date.now():0;const tick=()=>{const sec=Math.max(0,Math.floor((new Date(data.nextSyncAt).getTime()-Date.now()-clockOffset)/1000));setCountdown(`${String(Math.floor(sec/60)).padStart(2,'0')}:${String(sec%60).padStart(2,'0')}`)};tick();const i=setInterval(tick,1000);return()=>clearInterval(i)},[data?.nextSyncAt,data?.syncStatus?.serverTime]);
+ useEffect(()=>{
+  if(!data?.nextSyncAt){setCountdown('--:--:--');return}
+  const tick=()=>setCountdown(formatCountdown(data.nextSyncAt,data.syncStatus?.serverTime));
+  tick();
+  const interval=setInterval(tick,1000);
+  return()=>clearInterval(interval);
+ },[data?.nextSyncAt,data?.syncStatus?.serverTime]);
  const sync=async()=>{
   if(syncInFlight.current)return;
   if(data?.syncStatus?.isSyncing){
@@ -349,7 +365,7 @@ function Dashboard(){
   }
  };
  const syncStatus=data?.syncStatus||{};
- const isSyncing=Boolean(syncing||syncStatus.isSyncing||syncStatus.status==='Syncing');
+ const isSyncing=Boolean(syncing||syncStatus.isSyncing||syncStatus.status==='Sync In Progress');
  const openPlan=(vehicle,existingPlan=null)=>{
   setPlanModal({...vehicle,planId:existingPlan?._id||null});
   setPlan({
@@ -397,14 +413,14 @@ function Dashboard(){
      <Timer aria-hidden="true"/>
     </article>
     <article className="dashboard-info-card dashboard-sync-state">
-     <div><h2>GPS sync</h2><strong className="dashboard-sync-state-value" role="status">{isSyncing&&<span className="dashboard-sync-spinner" aria-hidden="true"/>}{isSyncing?'Syncing':syncStatus.status||'Loading status'}</strong><p>Scheduler {syncStatus.schedulerStatus||'loading'} - every {syncStatus.syncIntervalMinutes||30} min</p>{syncStatus.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
+     <div><h2>GPS sync</h2><strong className="dashboard-sync-state-value" role="status">{isSyncing&&<span className="dashboard-sync-spinner" aria-hidden="true"/>}{isSyncing?'Sync In Progress':syncStatus.status||'Loading status'}</strong><p>Scheduler {syncStatus.schedulerStatus||'loading'} - every {syncStatus.syncIntervalMinutes||30} min</p>{syncStatus.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
      <Navigation aria-hidden="true"/>
     </article>
     {canSync&&<AnimatedButton variant="blue" className="dashboard-manual-sync" loading={syncing} disabled={syncing} onClick={sync} aria-label="GPS Sync">
      {!syncing&&<RefreshCw size={22} aria-hidden="true"/>}<span>{syncing?'Syncing...':'GPS Sync'}</span>
     </AnimatedButton>}
     <article className="dashboard-info-card dashboard-last-sync">
-     <div><h2>Last Sync</h2><p>{fmtIst(data.lastSync)}</p></div>
+     <div><h2>Last Sync</h2><p>{fmtIst(syncStatus.lastSyncAt)}</p><p>{syncStatus.lastSyncType?(String(syncStatus.lastSyncType).toUpperCase()+' - '+(syncStatus.lastSyncSuccess?'Successful':'Failed')):'No sync recorded'}</p></div>
      <History aria-hidden="true"/>
     </article>
    </div>
@@ -714,7 +730,7 @@ function Gps(){
  const canManage=canEdit(user,'gpsTrack');
  const [tab,setTab]=useState('tracking'); const [data,setData]=useState({live:[],registeredVehicles:[],providers:[],syncStatus:{}});const [selected,setSelected]=useState(null);const [search,setSearch]=useState('');const [provider,setProvider]=useState('');const [running,setRunning]=useState('');const [pageLoading,setPageLoading]=useState(true);const [pageError,setPageError]=useState(null);
  const [settings,setSettings]=useState({});const [providerSettings,setProviderSettings]=useState([]);const [runningFile,setRunningFile]=useState(null);const [stoppedFile,setStoppedFile]=useState(null);const [saving,setSaving]=useState(false);const [shareUrl,setShareUrl]=useState('');
- const [syncing,setSyncing]=useState(false);const [syncCountdown,setSyncCountdown]=useState('--:--');
+ const [syncing,setSyncing]=useState(false);const [syncCountdown,setSyncCountdown]=useState('--:--:--');
  const load=async()=>{try{const [r,s,p]=await Promise.all([axios.get('/tracking'),axios.get('/settings'),axios.get('/gps/settings')]);setData(r.data);setSelected(current=>current?r.data.live.find(v=>v.vehicleNumber===current.vehicleNumber)||null:null);setSettings(s.data);setProviderSettings(p.data);setPageError(null)}catch(e){setPageError(e);showToast('Failed to load GPS data','error')}finally{setPageLoading(false)}};
  useEffect(()=>{
   load();
@@ -725,10 +741,9 @@ function Gps(){
  },[]);
  useEffect(()=>{
   const target=data.syncStatus?.nextAutoSyncAt;
-  if(!target){setSyncCountdown('--:--');return}
+  if(!target){setSyncCountdown('--:--:--');return}
   const tick=()=>{
-   const seconds=Math.max(0,Math.floor((new Date(target).getTime()-Date.now())/1000));
-   setSyncCountdown(`${String(Math.floor(seconds/60)).padStart(2,'0')}:${String(seconds%60).padStart(2,'0')}`);
+   setSyncCountdown(formatCountdown(target,data.syncStatus?.serverTime));
   };
   tick();
   const interval=setInterval(tick,1000);

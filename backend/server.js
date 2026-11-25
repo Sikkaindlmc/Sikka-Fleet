@@ -305,9 +305,9 @@ async function getGpsSyncStatus(now=new Date()){
   :[];
  const failureMessage=lastCycle?.result?.error||lastCycle?.result?.reason||
   lastCycleErrors[0]?.message||lastCycle?.result?.geofenceError||'';
- const status=active?'Syncing':lastCycle
-  ?lastCycle.status==='Skipped'?'Scheduled':lastCycle.success?'Sync Successful':'Sync Failed'
-  :autoSyncActive?'Scheduled':'Inactive';
+ const status=active?'Sync In Progress':lastCycle
+  ?lastCycle.success?'Sync Successful':'Sync Failed'
+  :autoSyncActive?'Scheduler Active':'Scheduler Inactive';
  return {
   serverTime:now,
   autoSyncActive,isSyncing:active,status,
@@ -317,6 +317,14 @@ async function getGpsSyncStatus(now=new Date()){
   lastSuccessfulSyncAt:syncConfig?.lastSuccessfulAt||lastSuccessfulSync?.finishedAt||null,
   lastManualSyncAt:lastManualSync?.finishedAt||lastManualSync?.startedAt||null,
   lastSyncAt:lastCycle?.finishedAt||lastCycle?.startedAt||null,
+  lastSyncType:lastCycle?.type||null,
+  lastSyncStatus:lastCycle?.status||null,
+  lastSyncSuccess:typeof lastCycle?.success==='boolean'?lastCycle.success:null,
+  lastSyncStartedAt:lastCycle?.startedAt||null,
+  lastSyncFinishedAt:lastCycle?.finishedAt||null,
+  lastSyncTotalVehicles:lastCycle?.totalRegisteredVehicles||0,
+  lastSyncSuccessfulVehicles:lastCycle?.successfulVehicles||0,
+  lastSyncFailedVehicles:lastCycle?.failedVehicles||0,
   lastError:lastCycle?.success||lastCycle?.status==='Skipped'?'':failureMessage,
   totalVehiclesSynced:lastCycle?.result?.totalVehiclesSynced||0,
   failedVehicleCount:lastCycle?.result?.failedVehicleCount||0,
@@ -365,10 +373,6 @@ async function acquireGpsSyncLock(owner,now,type){
 }
 
 async function logSkippedSync(type,reason,at=new Date()){
- await M.SyncLog.create({
-  type,startedAt:at,finishedAt:new Date(),
-  result:{reason,skipped:true},success:false,status:'Skipped'
- });
  return {started:false,reason};
 }
 
@@ -782,7 +786,7 @@ app.get('/api/dashboard',auth,permission('Dashboard','view'),async(req,res)=>{
  ]);
  res.json({
   plants:snapshot.plants,transit:snapshot.transit,
-  lastSync:syncStatus.lastSuccessfulSyncAt,
+  lastSync:syncStatus.lastSyncAt,
   nextSyncAt:syncStatus.nextAutoSyncAt,syncStatus,
   providers:snapshot.providers
  });
@@ -1417,8 +1421,7 @@ async function executeDueGpsSync(){
    if(config?.nextRetryAt&&new Date(config.nextRetryAt).getTime()<=nextAt.getTime()){
     scheduleGpsSyncWake(config.nextRetryAt);
    }else{
-    clearTimeout(syncScheduler.wakeTimer);
-    syncScheduler.wakeTimer=null;
+    scheduleGpsSyncWake(nextAt);
    }
    return;
   }
@@ -1450,8 +1453,7 @@ async function executeDueGpsSync(){
   syncScheduler.nextAt=getNextGpsExecutionAt(new Date(),updatedConfig);
   if(updatedConfig?.nextRetryAt)scheduleGpsSyncWake(updatedConfig.nextRetryAt);
   else{
-   clearTimeout(syncScheduler.wakeTimer);
-   syncScheduler.wakeTimer=null;
+   scheduleGpsSyncWake(syncScheduler.nextAt);
   }
  }catch(error){
   console.error('[GPS sync] Automatic cycle failed',{
@@ -1514,8 +1516,7 @@ async function startGpsSyncScheduler(){
   }
  },GPS_SYNC_HEARTBEAT_MS);
  syncScheduler.heartbeat.unref?.();
- if(nextSyncAt.getTime()<=now.getTime())scheduleGpsSyncWake(nextSyncAt);
- else if(config.nextRetryAt)scheduleGpsSyncWake(config.nextRetryAt);
+ scheduleGpsSyncWake(nextSyncAt);
  console.info('[GPS sync] Backend scheduler active; next cycle at',syncScheduler.nextAt.toISOString());
 }
 
