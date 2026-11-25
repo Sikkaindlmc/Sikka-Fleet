@@ -60,18 +60,38 @@ The frontend uses same-origin `/api` by default; only set the build-time
 `ALLOWED_ORIGINS` to a comma-separated list of exact trusted origins if the API
 is called from a different domain; do not use `*`.
 
-Vercel functions do not keep a persistent scheduler process. Deploy the backend
-service in `render.yaml` as an always-running service with the same MongoDB and
-WheelsEye environment variables; it runs GPS sync independently of dashboard
-sessions. The Vercel API reads the shared sync records for countdown/status, and
-the database lock prevents the Vercel API and worker from running duplicate
-syncs. An always-running backend host may incur hosting charges depending on
-its selected plan. Vercel Hobby cron cannot meet a 30-minute schedule; see
-Vercel's [cron limits](https://vercel.com/docs/schedules/cron-jobs/usage-and-pricing).
+Vercel Functions do not keep a persistent scheduler process. The
+`.github/workflows/gps-auto-sync.yml` workflow calls the protected production
+endpoint every 30 minutes and reuses the backend's persisted schedule and
+distributed lock. It runs independently of browsers and uses GitHub-hosted
+runners, which are free for this public repository. GitHub scheduled workflows
+are best-effort: GitHub may delay or drop a scheduled run, so this is not a
+hard real-time guarantee. The backend heartbeat expires if scheduled calls
+stop, and the UI then reports Auto Sync as inactive.
+
+Vercel Hobby Cron only supports one run per day, so it cannot run this schedule;
+see Vercel's [Cron limits](https://vercel.com/docs/schedules/cron-jobs/usage-and-pricing).
+To enable the GitHub schedule, configure `GPS_SYNC_SCHEDULER_SECRET` as a
+Production environment variable in Vercel (**Project Settings > Environment
+Variables**) and as a repository Actions secret (**Settings > Secrets and
+variables > Actions**) with the same value. Generate a strong value locally
+with:
+
+```powershell
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+Keep the value private; do not put it in source control or frontend variables.
+Commit the workflow to the repository's default branch and enable GitHub Actions.
+Vercel's API function is configured for a maximum 300-second execution, subject
+to the current Vercel plan's limits and usage. If an already-running persistent
+backend scheduler has a healthy heartbeat in the shared database, the external
+trigger will not start a second synchronization. Do not deploy an additional
+Render worker for this setup.
+
 Icon uploads are stored in MongoDB when running on Vercel (up to 1 MB per image).
-The worker runs an initial sync if none exists, then schedules the next run
-30 minutes after completion; failed runs retry after 5 minutes. The Dashboard
-reads the server schedule and refreshes sync state and fleet data while open.
+The Dashboard reads the persisted production schedule and refreshes sync state
+and fleet data while open.
 
 ## Local production build
 

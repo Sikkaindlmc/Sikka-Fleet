@@ -2,7 +2,8 @@ const test=require('node:test');
 const assert=require('node:assert/strict');
 const {
  GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,GPS_SYNC_HEARTBEAT_MS,
- isGpsSchedulerHealthy,getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
+ GPS_SYNC_EXTERNAL_HEARTBEAT_MAX_AGE_MS,isGpsSchedulerHealthy,isGpsSchedulerSecretValid,
+ getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
 }=require('../services/gpsSyncSchedule');
 
 test('scheduler health requires a recent persisted heartbeat and running status',()=>{
@@ -23,6 +24,29 @@ test('scheduler health requires a recent persisted heartbeat and running status'
  assert.equal(isGpsSchedulerHealthy(now,{
   ...recentConfig,schedulerHeartbeatAt:new Date(now.getTime()+1000)
  }),false);
+});
+
+test('external scheduler health uses a bounded heartbeat window',()=>{
+ const now=new Date('2026-11-25T05:30:00.000Z');
+ const recentConfig={
+  enabled:true,schedulerStatus:'running',schedulerMode:'external',
+  schedulerHeartbeatAt:new Date(now.getTime()-GPS_SYNC_INTERVAL_MS)
+ };
+ assert.equal(isGpsSchedulerHealthy(now,recentConfig),true);
+ assert.equal(
+  isGpsSchedulerHealthy(now,{
+   ...recentConfig,
+   schedulerHeartbeatAt:new Date(now.getTime()-GPS_SYNC_EXTERNAL_HEARTBEAT_MAX_AGE_MS-1)
+  }),false
+ );
+});
+
+test('scheduler secret comparison rejects missing, mismatched, and differently sized values',()=>{
+ assert.equal(isGpsSchedulerSecretValid('secret-value','secret-value'),true);
+ assert.equal(isGpsSchedulerSecretValid('wrong-value','secret-value'),false);
+ assert.equal(isGpsSchedulerSecretValid('short','secret-value'),false);
+ assert.equal(isGpsSchedulerSecretValid('secret-value',''),false);
+ assert.equal(isGpsSchedulerSecretValid(undefined,'secret-value'),false);
 });
 
 test('automatic syncs stay aligned to fixed UTC half-hour slots',()=>{

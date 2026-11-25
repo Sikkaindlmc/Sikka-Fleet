@@ -1,13 +1,25 @@
+const crypto=require('crypto');
 const GPS_SYNC_INTERVAL_MS=30*60*1000;
 const GPS_SYNC_RETRY_MS=5*60*1000;
 const GPS_SYNC_HEARTBEAT_MS=30*1000;
+const GPS_SYNC_EXTERNAL_HEARTBEAT_MAX_AGE_MS=GPS_SYNC_INTERVAL_MS*2+5*60*1000;
 
 function isGpsSchedulerHealthy(now,config){
  if(config?.enabled===false||config?.schedulerStatus!=='running')return false;
  const heartbeatAt=new Date(config.schedulerHeartbeatAt).getTime();
  const currentTime=new Date(now).getTime();
+ const maxAge=config?.schedulerMode==='external'
+  ?GPS_SYNC_EXTERNAL_HEARTBEAT_MAX_AGE_MS:GPS_SYNC_HEARTBEAT_MS*3;
  return Number.isFinite(heartbeatAt)&&heartbeatAt<=currentTime&&
-  currentTime-heartbeatAt<=GPS_SYNC_HEARTBEAT_MS*3;
+  currentTime-heartbeatAt<=maxAge;
+}
+
+function isGpsSchedulerSecretValid(candidate,configured){
+ if(typeof candidate!=='string'||typeof configured!=='string'||!configured)return false;
+ const candidateBuffer=Buffer.from(candidate);
+ const configuredBuffer=Buffer.from(configured);
+ return candidateBuffer.length===configuredBuffer.length&&
+  crypto.timingSafeEqual(candidateBuffer,configuredBuffer);
 }
 
 function getNextScheduledSyncAt(after=new Date()){
@@ -41,5 +53,6 @@ function getNextGpsExecutionAt(now,config,lastAutoSync){
 
 module.exports={
  GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,GPS_SYNC_HEARTBEAT_MS,
- isGpsSchedulerHealthy,getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
+ GPS_SYNC_EXTERNAL_HEARTBEAT_MAX_AGE_MS,isGpsSchedulerHealthy,isGpsSchedulerSecretValid,
+ getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
 };

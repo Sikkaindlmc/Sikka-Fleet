@@ -142,6 +142,7 @@ const gpsSyncConfigurationSchema=new mongoose.Schema({
  lastExecutionAt:Date,nextExecutionAt:Date,lastSuccessfulAt:Date,
  nextRetryAt:Date,retryAttempts:{type:Number,default:0},
  schedulerStatus:{type:String,enum:['starting','running','disabled','error','stopped'],default:'starting'},
+ schedulerMode:{type:String,enum:['persistent','external']},
  schedulerHeartbeatAt:Date
 },{timestamps:true});
 const gpsSyncLockSchema=new mongoose.Schema({

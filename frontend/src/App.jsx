@@ -342,7 +342,7 @@ function Dashboard(){
   return()=>{window.clearInterval(interval);document.removeEventListener('visibilitychange',refresh)};
  },[]);
  useEffect(()=>{
-  if(!data?.nextSyncAt){setCountdown('--:--:--');return}
+  if(!data?.nextSyncAt){setCountdown('Inactive');return}
   const tick=()=>setCountdown(formatCountdown(data.nextSyncAt,data.serverClockOffsetMs));
   tick();
   const interval=setInterval(tick,1000);
@@ -420,7 +420,7 @@ function Dashboard(){
    <div className="dashboard-title"><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div>
    <div className="dashboard-sync-grid">
     <article className="dashboard-info-card dashboard-next-sync">
-     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{data.nextSyncAt?`${fmtIst(data.nextSyncAt)} IST`:'Scheduler disabled'}</p></div>
+     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{data.nextSyncAt?`${fmtIst(data.nextSyncAt)} IST`:syncStatus.schedulerStatus==='disabled'?'Scheduler disabled':'Scheduler inactive'}</p></div>
      <Timer aria-hidden="true"/>
     </article>
     <article className="dashboard-info-card dashboard-sync-state">
@@ -752,14 +752,14 @@ function Gps(){
  },[]);
  useEffect(()=>{
   const target=data.syncStatus?.nextAutoSyncAt;
-  if(!target){setSyncCountdown('--:--:--');return}
+  if(!target){setSyncCountdown('Inactive');return}
   const tick=()=>{
    setSyncCountdown(formatCountdown(target,data.serverClockOffsetMs));
   };
   tick();
   const interval=setInterval(tick,1000);
   return()=>clearInterval(interval);
- },[data.syncStatus?.nextAutoSyncAt,data.serverClockOffsetMs]);
+ },[data.syncStatus?.nextAutoSyncAt,data.syncStatus?.schedulerStatus,data.serverClockOffsetMs]);
  const manualSync=async()=>{
   if(syncing)return;
   setSyncing(true);
