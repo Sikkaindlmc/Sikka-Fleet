@@ -47,8 +47,11 @@ function preferredVehicle(records){
 
 function preferredLive(records,vehicle){
  return [...records].sort((a,b)=>{
-  const providerLinked=provider=>provider===vehicle?.gpsLink||
-   (vehicle?.gpsProviders||[]).some(link=>link.name===provider);
+  const providerLinked=provider=>{
+   const normalized=String(provider||'').toUpperCase();
+   return normalized===String(vehicle?.gpsLink||'').toUpperCase()||
+    (vehicle?.gpsProviders||[]).some(link=>String(link.name||'').toUpperCase()===normalized);
+  };
   const providerDifference=Number(providerLinked(b.provider))-Number(providerLinked(a.provider));
   if(providerDifference)return providerDifference;
   const validDifference=Number(validGps(b))-Number(validGps(a));

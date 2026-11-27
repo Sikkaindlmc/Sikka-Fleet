@@ -22,7 +22,7 @@ const userSchema=new mongoose.Schema({
 },{timestamps:true});
 
 const vehicleGpsProviderSchema=new mongoose.Schema({
- name:{type:String,enum:['Wheelseye'],required:true},
+ name:{type:String,enum:['Wheelseye','Fleetx'],required:true},
  vehicleId:String
 },{_id:false});
 
@@ -30,7 +30,7 @@ const vehicleSchema=new mongoose.Schema({
  vehicleNumber:{type:String,required:true,unique:true,set:normalizeVehicleNumber},
  normalizedVehicleNumber:{type:String,required:true},
  fleetType:{type:String,enum:['Own Fleet','Contract Fleet'],required:true},
- gpsLink:{type:String,enum:['Wheelseye'],required:true},
+ gpsLink:{type:String,enum:['Wheelseye','Fleetx'],required:true},
  driver:{type:String,trim:true},
  mobile:{type:String,trim:true},
  plant:{type:String,trim:true},
@@ -56,8 +56,8 @@ plantSchema.index({plantId:1},{unique:true,sparse:true});
 
 const liveSchema=new mongoose.Schema({
  vehicleNumber:{type:String,required:true,unique:true,index:true,set:normalizeVehicleNumber},
- normalizedVehicleNumber:{type:String,required:true},lat:Number,lng:Number,speed:{type:String},
- ignition:{type:String,default:'N/A'},gpsTime:Date,syncedAt:Date,provider:{type:String,enum:['Wheelseye']},
+ normalizedVehicleNumber:{type:String,required:true},lat:Number,lng:Number,speed:mongoose.Schema.Types.Mixed,
+ ignition:{type:mongoose.Schema.Types.Mixed,default:null},gpsTime:Date,syncedAt:Date,provider:{type:String,enum:['Wheelseye','Fleetx','FLEETX']},
  address:String,heading:Number,unregistered:{type:Boolean,default:false},stale:{type:Boolean,default:false},
  lastGoodTime:Date,runningStatus:{type:String,enum:['Moving','Stopped','Idle','Unknown'],default:'Unknown'},
  providerVehicleId:String,driverName:String,vehicleStatus:String,
@@ -78,7 +78,7 @@ const historySchema=new mongoose.Schema({
  readableLocation:String,locality:String,city:String,district:String,state:String,pincode:String,country:String,
  geocodedAt:Date,addressLat:Number,addressLng:Number,addressIsCurrent:{type:Boolean,default:false},geocodingProvider:String,
  providerVehicleId:String,driverName:String,vehicleStatus:String,
- speed:{type:String},ignition:{type:String},gpsTime:{type:Date,index:true},provider:String,syncedAt:{type:Date,default:Date.now}
+ speed:mongoose.Schema.Types.Mixed,ignition:mongoose.Schema.Types.Mixed,gpsTime:{type:Date,index:true},provider:String,syncedAt:{type:Date,default:Date.now}
 });
 historySchema.index({vehicleNumber:1,gpsTime:1});
 historySchema.index({vehicleNumber:1,gpsTime:1,provider:1},{unique:true,sparse:true});
@@ -112,13 +112,13 @@ const planSchema=new mongoose.Schema({
 planSchema.index({expiresAt:1},{expireAfterSeconds:0});
 
 const providerStatusSchema=new mongoose.Schema({
- provider:{type:String,unique:true},status:{type:String,enum:['Connected','Disconnected','Error'],default:'Disconnected'},
+ provider:{type:String,enum:['Wheelseye','Fleetx'],unique:true},status:{type:String,enum:['Connected','Disconnected','Error'],default:'Disconnected'},
  lastAttemptTime:Date,lastSuccessTime:Date,lastErrorMessage:String,lastErrorCode:Number,lastErrorTime:Date,vehicleCount:{type:Number,default:0},
  vehiclesReceived:{type:Number,default:0},vehiclesNotResponding:{type:Number,default:0},
  apiResponseStatus:Number
 },{timestamps:true});
 const gpsSettingSchema=new mongoose.Schema({
- provider:{type:String,enum:['Wheelseye'],required:true,unique:true},
+ provider:{type:String,enum:['Wheelseye','Fleetx'],required:true,unique:true},
  enabled:{type:Boolean,default:true},
  baseUrl:{type:String,trim:true},
  credentialsReference:{type:String,required:true},
@@ -153,6 +153,18 @@ const gpsSyncLockSchema=new mongoose.Schema({
  type:{type:String,enum:['auto','manual']},
  lockUntil:{type:Date,required:true},
  acquiredAt:{type:Date,required:true}
+},{timestamps:true});
+const syncStatusSchema=new mongoose.Schema({
+ key:{type:String,required:true,unique:true},
+ lastSyncAt:Date,lastSyncType:{type:String,enum:['AUTO','MANUAL']},
+ lastSyncStatus:{type:String,enum:['Successful','Partial','Failed']},
+ lastError:{type:String,default:''},providerResults:{type:mongoose.Schema.Types.Mixed,default:{}},lastAutoSyncAt:Date,
+ isSyncing:{type:Boolean,default:false},syncStartedAt:Date
+},{timestamps:true});
+const fleetxTokenSchema=new mongoose.Schema({
+ key:{type:String,required:true,unique:true},
+ token:{type:String,required:true,select:false},
+ expiresAt:{type:Date,default:null}
 },{timestamps:true});
 
 const shareSchema=new mongoose.Schema({
@@ -221,5 +233,7 @@ module.exports={
  AppSetting:mongoose.model('AppSetting',appSettingSchema),AuditLog:mongoose.model('AuditLog',auditSchema),
  GeocodeCache:mongoose.model('GeocodeCache',geocodeCacheSchema),
  Session:mongoose.model('Session',sessionSchema),SikkaAiChat:mongoose.model('SikkaAiChat',sikkaAiChatSchema,'SikkaAiChat'),
- GpsSyncLock:mongoose.model('GpsSyncLock',gpsSyncLockSchema)
+ GpsSyncLock:mongoose.model('GpsSyncLock',gpsSyncLockSchema),
+ SyncStatus:mongoose.model('SyncStatus',syncStatusSchema,'sync_status'),
+ FleetxToken:mongoose.model('FleetxToken',fleetxTokenSchema,'fleetx_tokens')
 };

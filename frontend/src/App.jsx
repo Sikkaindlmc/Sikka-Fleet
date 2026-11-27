@@ -315,15 +315,23 @@ function Dashboard(){
  const canManage=canEdit(user,'dashboard');
  const canSync=canManage||canEdit(user,'gpsTrack');
  const canTrack=canView(user,'gpsTrack');
- const [data,setData]=useState(null);const [loadError,setLoadError]=useState(null);const [syncing,setSyncing]=useState(false);const [countdown,setCountdown]=useState('--:--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
- const loadInFlight=useRef(false);const refreshQueued=useRef(false);const syncInFlight=useRef(false);
+ const [data,setData]=useState(null);const [syncStatus,setSyncStatus]=useState(null);const [loadError,setLoadError]=useState(null);const [countdown,setCountdown]=useState('--:--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
+ const loadInFlight=useRef(false);const refreshQueued=useRef(false);const syncInFlight=useRef(false);const previousSyncAt=useRef(null);
+ const loadSyncStatus=async()=>{
+  try{
+   const nextStatus=(await axios.get('/sync/status')).data;
+   const previous=previousSyncAt.current;
+   previousSyncAt.current=nextStatus.lastSyncAt||null;
+   setSyncStatus(nextStatus);
+   if(previous&&nextStatus.lastSyncAt&&new Date(nextStatus.lastSyncAt)>new Date(previous))void load(true);
+  }catch(error){showToast(error.response?.data?.error||'Failed to load GPS sync status','error')}
+ };
  const load=async(silent=false)=>{
   if(loadInFlight.current){if(silent)refreshQueued.current=true;return}
   loadInFlight.current=true;
   try{
    const r=await axios.get('/dashboard');
    const responseData=dashboardData(r.data);
-   responseData.serverClockOffsetMs=getServerClockOffset(responseData.syncStatus?.serverTime);
    setData(responseData);
    setLoadError(null);
   }
@@ -333,8 +341,8 @@ function Dashboard(){
    if(refreshQueued.current){refreshQueued.current=false;void load(true)}
   }
  };
- useEffect(()=>{load()},[]);
- useEffect(()=>{const refresh=()=>load();window.addEventListener('gps-sync-complete',refresh);return()=>window.removeEventListener('gps-sync-complete',refresh)},[]);
+ useEffect(()=>{load();loadSyncStatus()},[]);
+ useEffect(()=>{const refresh=()=>{load();loadSyncStatus()};window.addEventListener('gps-sync-complete',refresh);return()=>window.removeEventListener('gps-sync-complete',refresh)},[]);
  useEffect(()=>{
   const refresh=()=>{if(!document.hidden)load(true)};
   const interval=window.setInterval(refresh,15000);
@@ -342,20 +350,27 @@ function Dashboard(){
   return()=>{window.clearInterval(interval);document.removeEventListener('visibilitychange',refresh)};
  },[]);
  useEffect(()=>{
-  if(!data?.nextSyncAt){setCountdown('Inactive');return}
-  const tick=()=>setCountdown(formatCountdown(data.nextSyncAt,data.serverClockOffsetMs));
+  const refresh=()=>{if(!document.hidden)loadSyncStatus()};
+  const interval=window.setInterval(refresh,30000);
+  document.addEventListener('visibilitychange',refresh);
+  return()=>{window.clearInterval(interval);document.removeEventListener('visibilitychange',refresh)};
+ },[]);
+ useEffect(()=>{
+  if(!syncStatus?.nextSyncAt){setCountdown(syncStatus?.schedulerStatus==='Inactive'?'Inactive':'--:--:--');return}
+  const offset=getServerClockOffset(syncStatus.serverTime);
+  const tick=()=>setCountdown(formatCountdown(syncStatus.nextSyncAt,offset));
   tick();
   const interval=setInterval(tick,1000);
   return()=>clearInterval(interval);
- },[data?.nextSyncAt,data?.serverClockOffsetMs]);
+ },[syncStatus?.nextSyncAt,syncStatus?.serverTime,syncStatus?.schedulerStatus]);
  const sync=async()=>{
   if(syncInFlight.current)return;
-  if(data?.syncStatus?.isSyncing){
+  if(syncStatus?.isSyncing){
    showToast('A GPS synchronization is already running. Please wait for it to finish.','error');
    return;
   }
   syncInFlight.current=true;
-  setSyncing(true);
+  void loadSyncStatus();
   try{
    const response=await axios.post('/sync');
    const result=response.data;
@@ -370,13 +385,11 @@ function Dashboard(){
   }
   finally{
    window.dispatchEvent(new CustomEvent('gps-sync-complete'));
-   await load(true);
+   await Promise.all([load(true),loadSyncStatus()]);
    syncInFlight.current=false;
-   setSyncing(false);
   }
  };
- const syncStatus=data?.syncStatus||{};
- const isSyncing=Boolean(syncing||syncStatus.isSyncing||syncStatus.status==='Sync In Progress');
+ const isSyncing=Boolean(syncStatus?.isSyncing);
  const openPlan=(vehicle,existingPlan=null)=>{
   setPlanModal({...vehicle,planId:existingPlan?._id||null});
   setPlan({
@@ -420,18 +433,18 @@ function Dashboard(){
    <div className="dashboard-title"><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div>
    <div className="dashboard-sync-grid">
     <article className="dashboard-info-card dashboard-next-sync">
-     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{data.nextSyncAt?`${fmtIst(data.nextSyncAt)} IST`:syncStatus.schedulerStatus==='disabled'?'Scheduler disabled':'Scheduler inactive'}</p></div>
+     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{syncStatus?.schedulerStatus==='Active'?`${syncStatus.nextSyncAt?`${fmtIst(syncStatus.nextSyncAt)} IST · `:''}Scheduler active - every 30 min`:'Inactive'}</p></div>
      <Timer aria-hidden="true"/>
     </article>
     <article className="dashboard-info-card dashboard-sync-state">
-     <div><h2>GPS sync</h2><strong className="dashboard-sync-state-value" role="status">{isSyncing&&<span className="dashboard-sync-spinner" aria-hidden="true"/>}{isSyncing?'Sync In Progress':syncStatus.status||'Loading status'}</strong><p>Scheduler {syncStatus.schedulerStatus||'loading'} - every {syncStatus.syncIntervalMinutes||30} min</p>{syncStatus.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
+      <div><h2>GPS sync</h2><strong className="dashboard-sync-state-value" role="status">{isSyncing&&<span className="dashboard-sync-spinner" aria-hidden="true"/>}{isSyncing?'Sync In Progress':syncStatus?.lastSyncStatus||'No sync recorded'}</strong><p>{syncStatus?.schedulerStatus==='Active'?'Scheduler active - every 30 min':'Inactive'}</p>{Object.entries(syncStatus?.providerResults||{}).filter(([,provider])=>provider.enabled!==false&&!provider.ok).map(([provider,result])=><small role="alert" key={provider}>{provider}: {result.reason||'provider failed'}</small>)}{!Object.values(syncStatus?.providerResults||{}).some(provider=>provider.enabled!==false&&!provider.ok)&&syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
      <Navigation aria-hidden="true"/>
     </article>
-    {canSync&&<AnimatedButton variant="blue" className="dashboard-manual-sync" loading={syncing} disabled={syncing} onClick={sync} aria-label="GPS Sync">
-     {!syncing&&<RefreshCw size={22} aria-hidden="true"/>}<span>{syncing?'Syncing...':'GPS Sync'}</span>
+    {canSync&&<AnimatedButton variant="blue" className="dashboard-manual-sync" loading={isSyncing} disabled={isSyncing} onClick={sync} aria-label="GPS Sync">
+     {!isSyncing&&<RefreshCw size={22} aria-hidden="true"/>}<span>{isSyncing?'Syncing...':'GPS Sync'}</span>
     </AnimatedButton>}
     <article className="dashboard-info-card dashboard-last-sync">
-     <div><h2>Last Sync</h2><p>{fmtIst(syncStatus.lastSyncAt)}</p><p>{syncStatus.lastSyncType?(String(syncStatus.lastSyncType).toUpperCase()+' - '+(syncStatus.lastSyncSuccess?'Successful':'Failed')):'No sync recorded'}</p></div>
+     <div><h2>Last Sync</h2><p>{fmtIst(syncStatus?.lastSyncAt)}</p><p>{syncStatus?.lastSyncType?`${syncStatus.lastSyncType} - ${syncStatus.lastSyncStatus||'Unknown'}`:'No sync recorded'}</p></div>
      <History aria-hidden="true"/>
     </article>
    </div>
@@ -494,11 +507,11 @@ function Vehicles(){
  if(pageLoading)return <Skeleton/>;
  if(pageError)return <ErrorPage title="Cannot reach server" details={pageError.message} onRetry={load}/>;
  return <><div className="page-head"><div><p className="eyebrow">Fleet master</p><h1>Vehicle Registry</h1></div>{canManage&&<AnimatedButton variant="green" onClick={()=>open()}><Plus/> Add New Vehicle</AnimatedButton>}</div>
- {canManage&&!!unreg.length&&<div className="unregistered"><b>{unreg.length} unregistered provider vehicle(s)</b>{unreg.slice(0,5).map(v=><button key={v.vehicleNumber} onClick={()=>{setEdit(null);setForm({vehicleNumber:v.vehicleNumber,fleetType:'Own Fleet',gpsLink:v.provider,status:'Active'});setModal(true)}}>{v.vehicleNumber} <Plus size={14}/></button>)}</div>}
- <div className="filters"><div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={fleet} onChange={e=>setFleet(e.target.value)}><option value="">Fleet Type</option><option>Own Fleet</option><option>Contract Fleet</option></select><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">GPS Provider</option><option>Wheelseye</option></select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="">Status</option><option>Active</option><option>Inactive</option></select></div>
+ {canManage&&!!unreg.length&&<div className="unregistered"><b>{unreg.length} unregistered provider vehicle(s)</b>{unreg.slice(0,5).map(v=><button key={v.vehicleNumber} onClick={()=>{setEdit(null);setForm({vehicleNumber:v.vehicleNumber,fleetType:'Own Fleet',gpsLink:String(v.provider).toUpperCase()==='FLEETX'?'Fleetx':'Wheelseye',status:'Active'});setModal(true)}}>{v.vehicleNumber} <Plus size={14}/></button>)}</div>}
+ <div className="filters"><div className="search-box"><Search/><input placeholder="Search vehicle" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={fleet} onChange={e=>setFleet(e.target.value)}><option value="">Fleet Type</option><option>Own Fleet</option><option>Contract Fleet</option></select><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">GPS Provider</option><option>Wheelseye</option><option>Fleetx</option></select><select value={status} onChange={e=>setStatus(e.target.value)}><option value="">Status</option><option>Active</option><option>Inactive</option></select></div>
  <Table headers={['Vehicle Number','Fleet Type','GPS Link','Driver','Mobile','Plant','Status','Last GPS time',...(canManage?['']:[])]} rows={data.items.map(v=>[v.vehicleNumber,v.fleetType,[...new Set([v.gpsLink,...(v.gpsProviders||[]).map(link=>link.name)])].filter(Boolean).join(' + '),v.driver||'-',v.mobile||'-',v.plant||'-',<span className={`badge ${v.status.toLowerCase()}`}>{v.status}</span>,fmt(v.lastGps),...(canManage?[<div className="row-actions"><AnimatedButton variant="orange" onClick={()=>syncVehicle(v)}>Sync GPS</AnimatedButton><AnimatedButton variant="blue" onClick={()=>open(v)}><Edit3 size={16}/></AnimatedButton><AnimatedButton variant="red" onClick={()=>remove(v)}><Trash2 size={16}/></AnimatedButton></div>]:[])])}/>
  <div className="pagination"><AnimatedButton variant="ghost" disabled={data.page<=1} onClick={()=>setData({...data,page:data.page-1})}>Previous</AnimatedButton><span>Page {data.page} of {data.pages||1}</span><AnimatedButton variant="ghost" disabled={data.page>=data.pages} onClick={()=>setData({...data,page:data.page+1})}>Next</AnimatedButton></div>
- <Modal open={modal} onClose={()=>setModal(false)} title={edit?'Edit Vehicle':'Add New Vehicle'} disableClose={saving}><div className="form-grid"><label>Vehicle Number<input value={form.vehicleNumber} onChange={e=>setForm({...form,vehicleNumber:e.target.value.toUpperCase()})}/></label><label>Fleet Type<select value={form.fleetType} onChange={e=>setForm({...form,fleetType:e.target.value})}><option>Own Fleet</option><option>Contract Fleet</option></select></label><label>GPS Provider<select value={form.gpsLink} onChange={e=>setForm({...form,gpsLink:e.target.value})}><option>Wheelseye</option></select></label><label>Status<select value={form.status} onChange={e=>setForm({...form,status:e.target.value})}><option>Active</option><option>Inactive</option></select></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setModal(false)} disabled={saving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={save}>Save</AnimatedButton></div></Modal>
+ <Modal open={modal} onClose={()=>setModal(false)} title={edit?'Edit Vehicle':'Add New Vehicle'} disableClose={saving}><div className="form-grid"><label>Vehicle Number<input value={form.vehicleNumber} onChange={e=>setForm({...form,vehicleNumber:e.target.value.toUpperCase()})}/></label><label>Fleet Type<select value={form.fleetType} onChange={e=>setForm({...form,fleetType:e.target.value})}><option>Own Fleet</option><option>Contract Fleet</option></select></label><label>GPS Provider<select value={form.gpsLink} onChange={e=>setForm({...form,gpsLink:e.target.value})}><option>Wheelseye</option><option>Fleetx</option></select></label><label>Status<select value={form.status} onChange={e=>setForm({...form,status:e.target.value})}><option>Active</option><option>Inactive</option></select></label></div><div className="modal-actions"><AnimatedButton variant="red" onClick={()=>setModal(false)} disabled={saving}>Cancel</AnimatedButton><AnimatedButton variant="green" loading={saving} onClick={save}>Save</AnimatedButton></div></Modal>
  <Modal open={Boolean(deleteTarget)} onClose={()=>{if(!deleting)setDeleteTarget(null)}} title="Delete Vehicle" disableClose={deleting}><p>Delete vehicle <b>{deleteTarget?.vehicleNumber}</b>? This action cannot be undone.</p><div className="modal-actions"><AnimatedButton variant="red" loading={deleting} onClick={confirmRemove}>Delete Vehicle</AnimatedButton><AnimatedButton variant="ghost" onClick={()=>setDeleteTarget(null)} disabled={deleting}>Cancel</AnimatedButton></div></Modal></>
 }
 
@@ -789,7 +802,8 @@ function Gps(){
  const providerWidget=n=>{
   const p=data.providers.find(x=>x.provider===n)||{status:'Disconnected',vehicleCount:0};
   const status=typeof p.status==='string'?p.status:'Disconnected';
-  const providerRecords=data.live.filter(v=>v.provider===n);
+  const providerKey=n==='Fleetx'?'FLEETX':n;
+  const providerRecords=data.live.filter(v=>v.provider===providerKey);
   const count=providerRecords.filter(v=>!v.stale&&!v.noGpsData).length;
   const staleCount=providerRecords.filter(v=>v.stale).length;
   return <div className={`provider-widget ${status.toLowerCase()}`}><b>{n}</b><span className="badge">{status==='Error'?'Failed':status}</span><div><small>Registered</small><strong>{p.vehicleCount||0}</strong></div><div><small>Reporting</small><strong>{count}</strong></div><div><small>Failed vehicles</small><strong>{p.vehiclesNotResponding||0}</strong></div><div><small>Stale data</small><strong>{staleCount}</strong></div><div><small>Last successful sync (IST)</small><strong>{fmtIst(p.lastSuccessTime)}</strong></div>{status==='Error'&&<em>{p.lastErrorMessage||'Provider request failed'} ({p.lastErrorCode||'N/A'})</em>}</div>
@@ -808,12 +822,12 @@ function Gps(){
   <div><small>Failed Vehicles / Providers</small><b>{syncStatus.failedVehicleCount||0} / {syncStatus.failedProviderCount||0}</b></div>
   <div><small>GPS Data Last Updated (IST)</small><b>{fmtIst(syncStatus.gpsDataLastUpdated)}</b></div>
  </div>
- <div className="gps-stats">{[['Registered',data.registeredCount||0],['WheelsEye received',data.providers.find(p=>p.provider==='Wheelseye')?.vehiclesReceived||0],['Moving',data.summary?.moving||0],['Stopped',data.summary?.stopped||0],['IGN ON',data.summary?.ignitionOn||0],['IGN OFF',data.summary?.ignitionOff||0],['Not Responding',data.summary?.notResponding||0],['API Errors',data.summary?.apiErrors||0]].map(([label,value])=><div className="gps-stat" key={label}><small>{label}</small><b>{value}</b></div>)}</div>
- <div className="provider-grid">{providerWidget('Wheelseye')}</div>
+ <div className="gps-stats">{[['Registered',data.registeredCount||0],['WheelsEye received',data.providers.find(p=>p.provider==='Wheelseye')?.vehiclesReceived||0],['Fleetx received',data.providers.find(p=>p.provider==='Fleetx')?.vehiclesReceived||0],['Moving',data.summary?.moving||0],['Stopped',data.summary?.stopped||0],['IGN ON',data.summary?.ignitionOn||0],['IGN OFF',data.summary?.ignitionOff||0],['Not Responding',data.summary?.notResponding||0],['API Errors',data.summary?.apiErrors||0]].map(([label,value])=><div className="gps-stat" key={label}><small>{label}</small><b>{value}</b></div>)}</div>
+ <div className="provider-grid">{providerWidget('Wheelseye')}{providerWidget('Fleetx')}</div>
  {(syncStatus.lastCycleErrors?.length>0||syncStatus.lastCycleGeofenceError)&&<div className="gps-sync-errors"><b>Last synchronization issues</b>{syncStatus.lastCycleGeofenceError&&<p>Plant status update: {syncStatus.lastCycleGeofenceError}</p>}{syncStatus.lastCycleErrors?.length>0&&<ul>{syncStatus.lastCycleErrors.map((error,index)=><li key={`${error.provider}-${error.vehicleNumber||index}-${index}`}>{error.provider}{error.vehicleNumber?` / ${error.vehicleNumber}`:''}: {error.message||'Synchronization failed'}{error.code?` (code ${error.code})`:''}</li>)}</ul>}</div>}
  <div className="gps-layout"><div className="gps-map"><OpenStreetMap vehicles={live} selectedVehicleNumber={selected?.vehicleNumber} onSelect={setSelected} settings={settings}/></div>
  <div className="gps-list">
-  <div className="filters"><div className="search-box"><Search/><input placeholder="Search" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">Provider</option><option>Wheelseye</option></select><select value={running} onChange={e=>setRunning(e.target.value)}><option value="">Running Status</option><option value="running">Moving</option><option value="stopped">Stopped</option></select></div>
+  <div className="filters"><div className="search-box"><Search/><input placeholder="Search" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="">Provider</option><option>Wheelseye</option><option value="FLEETX">Fleetx</option></select><select value={running} onChange={e=>setRunning(e.target.value)}><option value="">Running Status</option><option value="running">Moving</option><option value="stopped">Stopped</option></select></div>
   <Table headers={['Vehicle','Provider','Fleet Type','Running','IGN','Speed','GPS data','Live Location','Coordinates','Driver','GPS time',...(canManage?['']:[])]} rows={live.map(v=>[<button className="vehicle-select" onClick={()=>setSelected(v)}>{v.vehicleNumber}</button>,v.provider,v.fleetType||'-',v.runningStatus||'Unknown',<span className={`ignition ${/^on|^1|^true$/i.test(String(v.ignition))?'on':'off'}`}>{v.ignition||'N/A'}</span>,speedText(v),v.noGpsData?'No GPS data':v.stale?'Stale':'Live',<LocationText location={v.location} current={v.addressIsCurrent}/>,v.noGpsData?'N/A':`${v.lat}, ${v.lng}`,v.driverName||v.driver||'-',fmt(v.gpsTime),...(canManage?[<AnimatedButton variant="blue" disabled={v.noGpsData} onClick={()=>share(v)}><Share2 size={16}/></AnimatedButton>]:[])])}/>
  </div></div>
  <div className="gps-attribution">Address data may be provided by OpenStreetMap contributors.</div>
@@ -1226,7 +1240,7 @@ function HistoryTab({vehicles}){
  const [to,setTo]=useState(localInput(initialTo));
  const [rows,setRows]=useState([]);
  const [loading,setLoading]=useState(false);
- const available=vehicles.filter(v=>v.provider===provider);
+ const available=vehicles.filter(v=>String(v.provider||'').toUpperCase()===provider.toUpperCase());
  const search=async e=>{
   e.preventDefault();setLoading(true);
   try{
@@ -1245,7 +1259,7 @@ function HistoryTab({vehicles}){
  };
  return <section className="history-panel">
   <form className="history-filters" onSubmit={search}>
-   <label>GPS Provider<select value={provider} onChange={e=>{setProvider(e.target.value);setVehicleNumber('')}}><option>Wheelseye</option></select></label>
+   <label>GPS Provider<select value={provider} onChange={e=>{setProvider(e.target.value);setVehicleNumber('')}}><option value="Wheelseye">Wheelseye</option><option value="FLEETX">Fleetx</option></select></label>
    <label>Vehicle<select value={vehicleNumber} onChange={e=>setVehicleNumber(e.target.value)} required><option value="">Select vehicle</option>{available.map(v=><option key={v.vehicleNumber} value={v.vehicleNumber}>{v.vehicleNumber}</option>)}</select></label>
    <label>From<input type="datetime-local" value={from} max={to} onChange={e=>setFrom(e.target.value)} required/></label>
    <label>To<input type="datetime-local" value={to} max={localInput(new Date())} onChange={e=>setTo(e.target.value)} required/></label>
