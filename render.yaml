@@ -28,7 +28,17 @@ services:
         sync: false
       - key: WHEELSEYE_API_TOKEN
         sync: false
-      - key: NOMINATIM_URL
+      - key: CRON_SECRET
         sync: false
-      - key: NOMINATIM_USER_AGENT
-        value: SIKKA-FLEET/1.0
+      - key: GEOCODER_PROVIDER
+        sync: false
+      - key: GEOCODER_API_KEY
+        sync: false
+      - key: GEOCODER_USER_AGENT
+        sync: false
+      - key: NOMINATIM_REVERSE_URL
+        sync: false
+      - key: LOCATIONIQ_REVERSE_URL
+        sync: false
+      - key: GEOAPIFY_REVERSE_URL
+        sync: false

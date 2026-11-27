@@ -2,48 +2,39 @@ const test=require('node:test');
 const assert=require('node:assert/strict');
 const {persistMatchedRecords,aggregateSyncOutcome}=require('../services/gpsSyncOutcome');
 
-async function syncRecords(recordsByProvider,registry){
- const saved=new Map([['WHEELS-1','old-wheelseye'],['FLEETX-1','old-fleetx']]);
- const providerResults={};
- for(const [provider,records] of Object.entries(recordsByProvider)){
-  const outcome=await persistMatchedRecords({
-   records,vehiclesByNumber:registry,providerName:provider,
-   isLinked:(vehicle,name)=>vehicle.provider===name,
-   persistRecord:async(record)=>saved.set(record.vehicleNumber,record.value)
-  });
-  providerResults[provider]={enabled:true,ok:records.length>0&&outcome.savedNumbers.size>0};
- }
- return {saved,aggregate:aggregateSyncOutcome(providerResults)};
+async function syncRecords(records,apiSucceeded,registry){
+ const saved=new Map([['WHEELS-1','last-good-location']]);
+ const persisted=await persistMatchedRecords({
+  records,vehiclesByNumber:registry,providerName:'Wheelseye',
+  isLinked:(vehicle,name)=>vehicle.provider===name,
+  persistRecord:async(record)=>saved.set(record.vehicleNumber,record.value)
+ });
+ return {
+  saved,
+  outcome:aggregateSyncOutcome({
+   ok:apiSucceeded&&persisted.savedNumbers.size>0
+  })
+ };
 }
 
-const registry=new Map([
- ['WHEELS-1',{provider:'Wheelseye'}],
- ['FLEETX-1',{provider:'Fleetx'}]
-]);
+const registry=new Map([['WHEELS-1',{provider:'Wheelseye'}]]);
 
-test('one provider failure is Partial and retains successful provider data',async()=>{
- const {saved,aggregate}=await syncRecords({
-  Wheelseye:[{vehicleNumber:'WHEELS-1',value:'new-wheelseye'}],
-  Fleetx:[]
- },registry);
- assert.equal(aggregate.status,'Partial');
- assert.equal(saved.get('WHEELS-1'),'new-wheelseye');
- assert.equal(saved.get('FLEETX-1'),'old-fleetx');
+test('empty WheelsEye response is Failed and preserves the last good record',async()=>{
+ const {saved,outcome}=await syncRecords([],true,registry);
+ assert.equal(outcome.status,'Failed');
+ assert.equal(saved.get('WHEELS-1'),'last-good-location');
 });
 
-test('all provider failures are Failed and preserve last good data',async()=>{
- const {saved,aggregate}=await syncRecords({Wheelseye:[],Fleetx:[]},registry);
- assert.equal(aggregate.status,'Failed');
- assert.equal(saved.get('WHEELS-1'),'old-wheelseye');
- assert.equal(saved.get('FLEETX-1'),'old-fleetx');
+test('failed WheelsEye request is Failed and preserves the last good record',async()=>{
+ const {saved,outcome}=await syncRecords([],false,registry);
+ assert.equal(outcome.status,'Failed');
+ assert.equal(saved.get('WHEELS-1'),'last-good-location');
 });
 
-test('all enabled providers succeeding is Successful',async()=>{
- const {saved,aggregate}=await syncRecords({
-  Wheelseye:[{vehicleNumber:'WHEELS-1',value:'new-wheelseye'}],
-  Fleetx:[{vehicleNumber:'FLEETX-1',value:'new-fleetx'}]
- },registry);
- assert.equal(aggregate.status,'Successful');
- assert.equal(saved.get('WHEELS-1'),'new-wheelseye');
- assert.equal(saved.get('FLEETX-1'),'new-fleetx');
+test('a saved WheelsEye record is Successful and updates only that vehicle',async()=>{
+ const {saved,outcome}=await syncRecords([
+  {vehicleNumber:'WHEELS-1',value:'new-location'}
+ ],true,registry);
+ assert.equal(outcome.status,'Successful');
+ assert.equal(saved.get('WHEELS-1'),'new-location');
 });

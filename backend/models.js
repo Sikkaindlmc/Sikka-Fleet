@@ -22,7 +22,7 @@ const userSchema=new mongoose.Schema({
 },{timestamps:true});
 
 const vehicleGpsProviderSchema=new mongoose.Schema({
- name:{type:String,enum:['Wheelseye','Fleetx'],required:true},
+ name:{type:String,enum:['Wheelseye'],required:true},
  vehicleId:String
 },{_id:false});
 
@@ -30,7 +30,7 @@ const vehicleSchema=new mongoose.Schema({
  vehicleNumber:{type:String,required:true,unique:true,set:normalizeVehicleNumber},
  normalizedVehicleNumber:{type:String,required:true},
  fleetType:{type:String,enum:['Own Fleet','Contract Fleet'],required:true},
- gpsLink:{type:String,enum:['Wheelseye','Fleetx'],required:true},
+ gpsLink:{type:String,enum:['Wheelseye'],required:true},
  driver:{type:String,trim:true},
  mobile:{type:String,trim:true},
  plant:{type:String,trim:true},
@@ -57,13 +57,16 @@ plantSchema.index({plantId:1},{unique:true,sparse:true});
 const liveSchema=new mongoose.Schema({
  vehicleNumber:{type:String,required:true,unique:true,index:true,set:normalizeVehicleNumber},
  normalizedVehicleNumber:{type:String,required:true},lat:Number,lng:Number,speed:mongoose.Schema.Types.Mixed,
- ignition:{type:mongoose.Schema.Types.Mixed,default:null},gpsTime:Date,syncedAt:Date,provider:{type:String,enum:['Wheelseye','Fleetx','FLEETX']},
+ ignition:{type:mongoose.Schema.Types.Mixed,default:null},ignitionStatus:{type:String,enum:['ON','OFF','UNKNOWN'],default:'UNKNOWN'},
+ gpsTime:Date,syncedAt:Date,provider:{type:String,enum:['Wheelseye']},
  address:String,heading:Number,unregistered:{type:Boolean,default:false},stale:{type:Boolean,default:false},
  lastGoodTime:Date,runningStatus:{type:String,enum:['Moving','Stopped','Idle','Unknown'],default:'Unknown'},
  providerVehicleId:String,driverName:String,vehicleStatus:String,
- readableLocation:String,locality:String,city:String,district:String,state:String,pincode:String,country:String,
+ readableLocation:String,street:String,galiNumber:String,road:String,nearby:String,
+ locality:String,city:String,cityOrVillage:String,district:String,state:String,pincode:String,country:String,
  geocodedAt:Date,addressLat:Number,addressLng:Number,addressIsCurrent:{type:Boolean,default:false},
- geocodingProvider:{type:String,enum:['Google','OpenStreetMap','Provider','Coordinate']}
+ addressDistanceKm:Number,
+ geocodingProvider:{type:String,enum:['GeoNames','Nominatim','LocationIQ','Geoapify','Provider','Coordinate']}
 },{timestamps:true});
 liveSchema.pre('validate',function(){
  const normalized=normalizeVehicleNumber(this.vehicleNumber);
@@ -75,10 +78,14 @@ liveSchema.index({normalizedVehicleNumber:1},{unique:true,partialFilterExpressio
 const historySchema=new mongoose.Schema({
  vehicle:{type:String,required:true,index:true,set:normalizeVehicleNumber},
  vehicleNumber:{type:String,set:value=>value?normalizeVehicleNumber(value):value},lat:Number,lng:Number,address:String,
- readableLocation:String,locality:String,city:String,district:String,state:String,pincode:String,country:String,
- geocodedAt:Date,addressLat:Number,addressLng:Number,addressIsCurrent:{type:Boolean,default:false},geocodingProvider:String,
+ readableLocation:String,street:String,galiNumber:String,road:String,nearby:String,
+ locality:String,city:String,cityOrVillage:String,district:String,state:String,pincode:String,country:String,
+ geocodedAt:Date,addressLat:Number,addressLng:Number,addressIsCurrent:{type:Boolean,default:false},
+ addressDistanceKm:Number,geocodingProvider:String,
  providerVehicleId:String,driverName:String,vehicleStatus:String,
- speed:mongoose.Schema.Types.Mixed,ignition:mongoose.Schema.Types.Mixed,gpsTime:{type:Date,index:true},provider:String,syncedAt:{type:Date,default:Date.now}
+ speed:mongoose.Schema.Types.Mixed,ignition:mongoose.Schema.Types.Mixed,
+ ignitionStatus:{type:String,enum:['ON','OFF','UNKNOWN'],default:'UNKNOWN'},
+ gpsTime:{type:Date,index:true},provider:String,syncedAt:{type:Date,default:Date.now}
 });
 historySchema.index({vehicleNumber:1,gpsTime:1});
 historySchema.index({vehicleNumber:1,gpsTime:1,provider:1},{unique:true,sparse:true});
@@ -112,13 +119,13 @@ const planSchema=new mongoose.Schema({
 planSchema.index({expiresAt:1},{expireAfterSeconds:0});
 
 const providerStatusSchema=new mongoose.Schema({
- provider:{type:String,enum:['Wheelseye','Fleetx'],unique:true},status:{type:String,enum:['Connected','Disconnected','Error'],default:'Disconnected'},
+ provider:{type:String,enum:['Wheelseye'],unique:true},status:{type:String,enum:['Connected','Disconnected','Error'],default:'Disconnected'},
  lastAttemptTime:Date,lastSuccessTime:Date,lastErrorMessage:String,lastErrorCode:Number,lastErrorTime:Date,vehicleCount:{type:Number,default:0},
  vehiclesReceived:{type:Number,default:0},vehiclesNotResponding:{type:Number,default:0},
  apiResponseStatus:Number
 },{timestamps:true});
 const gpsSettingSchema=new mongoose.Schema({
- provider:{type:String,enum:['Wheelseye','Fleetx'],required:true,unique:true},
+ provider:{type:String,enum:['Wheelseye'],required:true,unique:true},
  enabled:{type:Boolean,default:true},
  baseUrl:{type:String,trim:true},
  credentialsReference:{type:String,required:true},
@@ -132,7 +139,7 @@ const syncLogSchema=new mongoose.Schema({
  result:{type:Object},success:{type:Boolean,default:false},
  totalRegisteredVehicles:{type:Number,default:0},successfulVehicles:{type:Number,default:0},
  failedVehicles:{type:Number,default:0},
- status:{type:String,enum:['Success','Partial','Failed','Skipped']},
+ status:{type:String,enum:['Success','Failed','Skipped']},
  errorDetails:{type:[mongoose.Schema.Types.Mixed],default:[]}
 },{timestamps:true});
 syncLogSchema.index({type:1,startedAt:-1});
@@ -157,14 +164,13 @@ const gpsSyncLockSchema=new mongoose.Schema({
 const syncStatusSchema=new mongoose.Schema({
  key:{type:String,required:true,unique:true},
  lastSyncAt:Date,lastSyncType:{type:String,enum:['AUTO','MANUAL']},
- lastSyncStatus:{type:String,enum:['Successful','Partial','Failed']},
- lastError:{type:String,default:''},providerResults:{type:mongoose.Schema.Types.Mixed,default:{}},lastAutoSyncAt:Date,
+ lastSyncStatus:{type:String,enum:['Successful','Failed']},
+ lastError:{type:String,default:''},lastAutoSyncAt:Date,
  isSyncing:{type:Boolean,default:false},syncStartedAt:Date
 },{timestamps:true});
-const fleetxTokenSchema=new mongoose.Schema({
+const geocodeRequestSlotSchema=new mongoose.Schema({
  key:{type:String,required:true,unique:true},
- token:{type:String,required:true,select:false},
- expiresAt:{type:Date,default:null}
+ nextAllowedAt:{type:Date,required:true}
 },{timestamps:true});
 
 const shareSchema=new mongoose.Schema({
@@ -179,17 +185,45 @@ const geocodeCacheSchema=new mongoose.Schema({
  lat:{type:Number,required:true},
  lng:{type:Number,required:true},
  readableLocation:{type:String},
+ baseReadableLocation:String,basePlaceName:String,addressDistanceKm:Number,
  locality:String,
  city:String,
+ cityOrVillage:String,
  district:String,
  state:String,
  pincode:String,
+ street:String,
+ galiNumber:String,
+ road:String,
+ nearby:String,
  country:String,
- provider:{type:String,enum:['Google','OpenStreetMap','Provider','Coordinate']},
- geocodedAt:Date,
+ provider:{type:String,enum:['GeoNames','Nominatim','LocationIQ','Geoapify','Provider','Coordinate']},
+ layer2Provider:{type:String,enum:['Nominatim','LocationIQ','Geoapify']},
+ geocodedAt:Date,layer2GeocodedAt:Date,layer2FailureUntil:Date,
+ failureUntil:Date,
  expiresAt:{type:Date,required:true}
 },{timestamps:true});
 geocodeCacheSchema.index({expiresAt:1},{expireAfterSeconds:0});
+const geoPlaceSchema=new mongoose.Schema({
+ key:{type:String,required:true,unique:true},
+ countryCode:{type:String,required:true},
+ postalCode:{type:String,required:true},
+ placeName:{type:String,required:true},
+ state:String,stateCode:String,district:String,districtCode:String,
+ subdistrict:String,subdistrictCode:String,
+ location:{
+  type:{type:String,enum:['Point'],required:true},
+  coordinates:{type:[Number],required:true}
+ },
+ accuracy:Number
+},{versionKey:false});
+geoPlaceSchema.index({location:'2dsphere'});
+const geocoderQuotaSchema=new mongoose.Schema({
+ key:{type:String,required:true,unique:true},
+ count:{type:Number,default:0},
+ expiresAt:{type:Date,required:true}
+},{versionKey:false});
+geocoderQuotaSchema.index({expiresAt:1},{expireAfterSeconds:0});
 const sessionSchema=new mongoose.Schema({
  sessionId:{type:String,required:true,unique:true,index:true},
  user:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true,index:true},
@@ -232,8 +266,10 @@ module.exports={
  GpsSyncConfiguration:mongoose.model('GpsSyncConfiguration',gpsSyncConfigurationSchema,'gps_sync_configuration'),
  AppSetting:mongoose.model('AppSetting',appSettingSchema),AuditLog:mongoose.model('AuditLog',auditSchema),
  GeocodeCache:mongoose.model('GeocodeCache',geocodeCacheSchema),
+ GeocodeRequestSlot:mongoose.model('GeocodeRequestSlot',geocodeRequestSlotSchema,'geocode_request_slots'),
+ GeoPlace:mongoose.model('GeoPlace',geoPlaceSchema,'geo_places'),
+ GeocoderQuota:mongoose.model('GeocoderQuota',geocoderQuotaSchema,'geocoder_daily_usage'),
  Session:mongoose.model('Session',sessionSchema),SikkaAiChat:mongoose.model('SikkaAiChat',sikkaAiChatSchema,'SikkaAiChat'),
  GpsSyncLock:mongoose.model('GpsSyncLock',gpsSyncLockSchema),
- SyncStatus:mongoose.model('SyncStatus',syncStatusSchema,'sync_status'),
- FleetxToken:mongoose.model('FleetxToken',fleetxTokenSchema,'fleetx_tokens')
+ SyncStatus:mongoose.model('SyncStatus',syncStatusSchema,'sync_status')
 };

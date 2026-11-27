@@ -7,6 +7,7 @@
     "start": "node server.js",
     "migrate:permissions": "node scripts/migrate-permissions.js",
     "migrate:vehicle-identity": "node scripts/migrateVehicleIdentity.js",
+    "import:geonames": "node scripts/importGeoNamesIndia.js",
     "test": "node --test"
   }
 }

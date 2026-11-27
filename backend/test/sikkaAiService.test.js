@@ -194,12 +194,12 @@ test('returns a Google Maps link and plant for current vehicle location',async()
  const plant={_id:'salt-id',name:'Salt Plant',lat:28.5,lng:77.4,radius:1000,status:'Active'};
  const testModels=makeModels({
   Plant:{find:()=>chain([plant])},
-  Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100'}]),findOne:()=>one({vehicleNumber:'UP14GT0100',status:'Active'})},
+  Vehicle:{find:()=>chain([{vehicleNumber:'UP14GT0100',gpsLink:'Wheelseye'}]),findOne:()=>one({vehicleNumber:'UP14GT0100',gpsLink:'Wheelseye',status:'Active'})},
   VehicleLiveStatus:{find:()=>chain([{
-   vehicleNumber:'UP14GT0100',readableLocation:'Dasna, Uttar Pradesh',speed:'28',ignition:'ON',
+   vehicleNumber:'UP14GT0100',provider:'Wheelseye',readableLocation:'Dasna, Uttar Pradesh',speed:'28',ignition:'ON',
    gpsTime:new Date('2026-11-22T09:30:00.000Z'),lat:28.5,lng:77.4
   }]),findOne:()=>one({
-   vehicleNumber:'UP14GT0100',readableLocation:'Dasna, Uttar Pradesh',speed:'28',ignition:'ON',
+   vehicleNumber:'UP14GT0100',provider:'Wheelseye',readableLocation:'Dasna, Uttar Pradesh',speed:'28',ignition:'ON',
    gpsTime:new Date('2026-11-22T09:30:00.000Z'),lat:28.5,lng:77.4
   })},
   VehiclePlantStay:{find:()=>chain([{vehicle:'UP14GT0100',plant:{_id:'salt-id',name:'Salt Plant'},entryTime:new Date('2026-11-22T08:30:00.000Z')}])}
@@ -231,7 +231,7 @@ test('answers the exact UP14FT9150 Location phrasing from GPS snapshot data',asy
  const answer=await service.answerQuestion('UP14FT9150 Location',{
   models:makeModels({
    Plant:{find:()=>chain([plant])},
-   Vehicle:{find:()=>chain([{vehicleNumber:'UP14FT9150'}]),findOne:()=>one({vehicleNumber:'UP14FT9150',status:'Active'})},
+   Vehicle:{find:()=>chain([   {vehicleNumber:'UP14FT9150',gpsLink:'Wheelseye'}]),findOne:()=>one({vehicleNumber:'UP14FT9150',gpsLink:'Wheelseye',status:'Active'})},
    VehicleLiveStatus:{find:()=>chain([{
     vehicleNumber:'UP14FT9150',address:'Dasna, Uttar Pradesh',speed:'31',ignition:'ON',
     gpsTime:new Date('2026-11-22T09:30:00.000Z'),provider:'Wheelseye',lat:28.5,lng:77.4

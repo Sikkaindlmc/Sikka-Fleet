@@ -18,7 +18,6 @@ const M=require('./models');
 const {normalizePermissions,hasPermission}=require('./permissions');
 const reverseGeocoding=require('./services/reverseGeocodingService');
 const wheelseyeService=require('./services/wheelseyeService');
-const fleetxService=require('./services/fleetxService');
 const {mapProviderPayload}=require('./services/gpsProviderData');
 const {persistMatchedRecords,aggregateSyncOutcome}=require('./services/gpsSyncOutcome');
 const fleetSnapshotService=require('./services/fleetSnapshotService');
@@ -71,13 +70,16 @@ const cronSyncHandler=async(req,res,next)=>{
  }
  try{
   await ensureInitialized();
+  const heartbeatAt=new Date();
+  await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
+   enabled:true,intervalMinutes:30,schedulerMode:'external',
+   schedulerStatus:'running',schedulerHeartbeatAt:heartbeatAt
+  }},{upsert:true});
   const result=await runSync('AUTO');
   if(!result.started)return res.status(200).json({ok:true,skipped:'already running'});
-  const providerStatus=name=>result.result?.providerResults?.[name]?.ok?'ok':'failed';
   return res.status(200).json({
    ok:Boolean(result.success),startedAt:result.startedAt,finishedAt:result.finishedAt,
-   vehiclesSynced:result.totalVehiclesSynced||0,
-   wheelseye:providerStatus('Wheelseye'),fleetx:providerStatus('Fleetx')
+   vehiclesSynced:result.totalVehiclesSynced||0
   });
  }catch(error){
   console.error('[GPS sync] Cron request failed',{
@@ -85,7 +87,7 @@ const cronSyncHandler=async(req,res,next)=>{
   });
   return res.status(500).json({
    ok:false,startedAt:null,finishedAt:new Date(),vehiclesSynced:0,
-   wheelseye:'failed',fleetx:'failed',error:'GPS synchronization failed'
+   error:'GPS synchronization failed'
   });
  }
 };
@@ -95,10 +97,112 @@ app.use('/uploads',express.static(path.join(__dirname,'uploads')));
 
 const isCoordinateText=value=>typeof value==='string'&&/^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/.test(value);
 const readableAddress=record=>{
+ if(record?.addressIsCurrent===false)return null;
  const value=record?.readableLocation||record?.address;
- return typeof value==='string'&&value.trim()&&!isCoordinateText(value)?value.trim():null;
+ return typeof value==='string'&&value.trim()&&!isCoordinateText(value)&&
+  !/^(?:address|location)\s+unavailable$/i.test(value.trim())&&
+  !/\b(?:undefined|null)\b/i.test(value)?value.trim():null;
 };
+const coordinatesText=record=>reverseGeocoding.validCoordinates(record?.lat,record?.lng)
+ ?`${Number(record.lat).toFixed(6)}, ${Number(record.lng).toFixed(6)}`:null;
+const displayLocation=record=>readableAddress(record)||coordinatesText(record)||'Location unavailable';
+const addressFields=location=>location?{
+ readableLocation:location.readableLocation,address:location.readableLocation,
+ street:location.street||'',galiNumber:location.galiNumber||'',road:location.road||'',
+ nearby:location.nearby||'',locality:location.locality||'',city:location.city||'',
+ cityOrVillage:location.cityOrVillage||location.city||'',
+ district:location.district||'',state:location.state||'',pincode:location.pincode||'',
+ country:location.country||'',geocodedAt:location.geocodedAt||null,
+ addressDistanceKm:location.addressDistanceKm??null,
+ geocodingProvider:location.provider||'Provider',
+ addressLat:location.addressLat??null,addressLng:location.addressLng??null,
+ addressIsCurrent:location.addressIsCurrent!==false
+}:{
+ readableLocation:null,address:null,street:'',galiNumber:'',road:'',nearby:'',
+ locality:'',city:'',cityOrVillage:'',district:'',state:'',pincode:'',country:'',
+ geocodedAt:null,addressDistanceKm:null,geocodingProvider:null,addressLat:null,addressLng:null,
+ addressIsCurrent:false
+};
+function queueVehicleAddressLookup(row,previous){
+ if(!row.providerAddress&&previous&&
+  reverseGeocoding.previousLocation(previous,row.lat,row.lng))return;
+ reverseGeocoding.enqueue(row.lat,row.lng,{
+  providerAddress:row.providerAddress,providerFields:row.providerFields,previous
+ }).then(async location=>{
+  if(!location)return;
+  const resolved={
+   ...location,addressLat:location.addressLat??row.lat,addressLng:location.addressLng??row.lng,
+   addressIsCurrent:location.addressIsCurrent!==false
+  };
+  const fields=addressFields(resolved);
+  await Promise.all([
+   M.VehicleLiveStatus.updateOne({
+    vehicleNumber:row.vehicleNumber,lat:row.lat,lng:row.lng,gpsTime:row.gpsTime
+   },{$set:fields}),
+   M.VehicleLocationHistory.updateOne({
+    vehicleNumber:row.vehicleNumber,gpsTime:row.gpsTime,provider:'Wheelseye'
+   },{$set:fields})
+  ]);
+ }).catch(error=>console.warn(`Reverse geocoding failed for ${row.vehicleNumber}: ${error.message}`));
+}
+async function resolveStoredVehicleAddress(record){
+  if(!record||!reverseGeocoding.validCoordinates(record.lat,record.lng))return record;
+  let location;
+  try{location=await reverseGeocoding.resolve(record.lat,record.lng,{previous:record})}
+  catch(error){
+   console.warn(`Reverse geocoding failed for ${record.vehicleNumber}: ${error.message}`);
+   return record;
+  }
+  if(!location){
+   if(readableAddress(record)&&!reverseGeocoding.previousLocation(record,record.lat,record.lng)){
+    const fields=addressFields(null);
+    await Promise.all([
+     M.VehicleLiveStatus.updateOne({
+      vehicleNumber:record.vehicleNumber,provider:'Wheelseye',lat:record.lat,lng:record.lng,gpsTime:record.gpsTime
+     },{$set:fields}),
+     M.VehicleLocationHistory.updateOne({
+      vehicleNumber:record.vehicleNumber,provider:'Wheelseye',gpsTime:record.gpsTime
+     },{$set:fields})
+    ]);
+    return {...record,...fields,addressEnrichmentPending:false};
+   }
+   return record;
+  }
+  const fields=addressFields({
+   ...location,addressLat:location.addressLat??record.lat,addressLng:location.addressLng??record.lng,
+   addressIsCurrent:location.addressIsCurrent!==false
+  });
+  await Promise.all([
+   M.VehicleLiveStatus.updateOne({
+    vehicleNumber:record.vehicleNumber,provider:'Wheelseye',lat:record.lat,lng:record.lng,gpsTime:record.gpsTime
+   },{$set:fields}),
+   M.VehicleLocationHistory.updateOne({
+    vehicleNumber:record.vehicleNumber,provider:'Wheelseye',gpsTime:record.gpsTime
+   },{$set:fields})
+  ]);
+  return {
+   ...record,...fields,
+   addressEnrichmentPending:Boolean(location.addressEnrichmentPending)
+  };
+}
 const haversine=(a,b)=>{const R=6371000,toRad=x=>x*Math.PI/180;const dLat=toRad(b.lat-a.lat),dLng=toRad(b.lng-a.lng);const x=Math.sin(dLat/2)**2+Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLng/2)**2;return R*2*Math.atan2(Math.sqrt(x),Math.sqrt(1-x));};
+function vehicleLocationPayload(record){
+ if(!record)return null;
+ const hasCoordinates=reverseGeocoding.validCoordinates(record.lat,record.lng);
+ return {
+  location:displayLocation(record),
+  addressIsCurrent:Boolean(record.addressIsCurrent&&readableAddress(record)),
+  street:record.street||'',galiNumber:record.galiNumber||'',road:record.road||'',
+  nearby:record.nearby||'',city:record.city||'',
+  cityOrVillage:record.cityOrVillage||record.city||'',
+  district:record.district||'',state:record.state||'',pincode:record.pincode||'',
+  addressDistanceKm:record.addressDistanceKm??null,
+  addressEnrichmentPending:Boolean(record.addressEnrichmentPending),
+  lat:hasCoordinates?Number(record.lat):null,
+  lng:hasCoordinates?Number(record.lng):null,
+  map:hasCoordinates?`https://www.google.com/maps?q=${record.lat},${record.lng}`:null
+ };
+}
 const GPS_SYNC_LOCK_KEY='gps-sync';
 const GPS_SYNC_CONFIG_KEY='global';
 const GPS_SYNC_LOCK_TTL_MS=90000;
@@ -107,8 +211,7 @@ const SYNC_STATUS_KEY='gps-sync';
 const SYNC_STATUS_STALE_MS=5*60*1000;
 const SYNC_STATUS_SCHEDULER_ACTIVE_MS=45*60*1000;
 const GPS_PROVIDER_DEFAULTS={
- Wheelseye:{url:'https://api.wheelseye.com/currentLoc',environmentVariable:'WHEELSEYE_API_URL',credentialsReference:'WHEELSEYE_API_TOKEN'},
- Fleetx:{url:'https://api.fleetx.io',environmentVariable:'FLEETX_BASE_URL',credentialsReference:'FLEETX_BASIC_AUTH, FLEETX_USERNAME, FLEETX_PASSWORD'}
+ Wheelseye:{url:'https://api.wheelseye.com/currentLoc',environmentVariable:'WHEELSEYE_API_URL',credentialsReference:'WHEELSEYE_API_TOKEN'}
 };
 let syncing=false,syncScheduler=null;
 
@@ -220,7 +323,7 @@ async function ensureInitialized(){
    await M.GpsSyncLock.createIndexes().catch(()=>{});
    await M.SyncStatus.createIndexes();
    await M.SyncStatus.updateOne({key:SYNC_STATUS_KEY},{$setOnInsert:{isSyncing:false,lastError:''}},{upsert:true});
-   await M.FleetxToken.createIndexes();
+   await M.GeocodeRequestSlot.createIndexes();
    await M.GpsSyncConfiguration.createIndexes();
    await M.VehiclePlan.createIndexes();
    await seedGpsSettings().catch(()=>{});
@@ -284,7 +387,7 @@ async function getGpsSyncStatus(now=new Date()){
   M.SyncLog.findOne({type:'manual'}).sort({finishedAt:-1}).lean(),
   M.SyncLog.findOne({type:'auto',finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean(),
   M.GpsSyncLock.findOne({key:GPS_SYNC_LOCK_KEY,lockUntil:{$gt:now}}).lean(),
-  M.VehicleLiveStatus.findOne({syncedAt:{$exists:true}}).sort({syncedAt:-1}).select('syncedAt').lean(),
+  M.VehicleLiveStatus.findOne({provider:'Wheelseye',syncedAt:{$exists:true}}).sort({syncedAt:-1}).select('syncedAt').lean(),
   M.GpsSyncConfiguration.findOne({key:GPS_SYNC_CONFIG_KEY}).lean(),
   M.SyncStatus.findOne({key:SYNC_STATUS_KEY}).lean()
  ]);
@@ -293,15 +396,17 @@ async function getGpsSyncStatus(now=new Date()){
   now.getTime()-startedAt<SYNC_STATUS_STALE_MS)||Boolean(activeLock);
  const schedulerHealthy=isGpsSchedulerHealthy(now,syncConfig);
  const autoSyncActive=schedulerHealthy;
- const lastCycleErrors=lastCycle?.result
-  ?Object.entries(lastCycle.result).flatMap(([provider,result])=>
-    Array.isArray(result?.errors)?result.errors.map(error=>({provider,...error})):[])
+ const wheelseyeCycle=lastCycle?.result?.Wheelseye;
+ const lastCycleErrors=Array.isArray(wheelseyeCycle?.errors)
+  ?wheelseyeCycle.errors.map(error=>({provider:'Wheelseye',...error}))
   :[];
- const failureMessage=lastCycle?.result?.error||lastCycle?.result?.reason||
-  lastCycleErrors[0]?.message||lastCycle?.result?.geofenceError||'';
+ const failureMessage=lastCycle?.result?.geofenceError||lastCycle?.result?.error||
+  (wheelseyeCycle?.message?`Wheelseye: ${wheelseyeCycle.message}`:'GPS synchronization failed');
  const status=active?'Sync In Progress':lastCycle?.status==='Skipped'?'Sync Skipped':lastCycle
   ?lastCycle.success?'Sync Successful':'Sync Failed'
   :autoSyncActive?'Scheduler Active':'Scheduler Inactive';
+ const persistedLastSyncStatus=['Successful','Failed'].includes(persistedStatus?.lastSyncStatus)
+  ?persistedStatus.lastSyncStatus:null;
  return {
   serverTime:now,
   autoSyncActive,isSyncing:active,status,
@@ -316,9 +421,9 @@ async function getGpsSyncStatus(now=new Date()){
   lastManualSyncAt:lastManualSync?.finishedAt||lastManualSync?.startedAt||null,
   lastSyncAt:persistedStatus?.lastSyncAt||lastCycle?.finishedAt||lastCycle?.startedAt||null,
   lastSyncType:persistedStatus?.lastSyncType||lastCycle?.type?.toUpperCase()||null,
-  lastSyncStatus:persistedStatus?.lastSyncStatus||
+  lastSyncStatus:persistedLastSyncStatus||
    (lastCycle&&lastCycle.status!=='Skipped'
-    ?lastCycle.success?'Successful':lastCycle.status==='Partial'?'Partial':'Failed'
+    ?lastCycle.success?'Successful':'Failed'
     :null),
   lastSyncSuccess:typeof lastCycle?.success==='boolean'?lastCycle.success:null,
   lastSyncStartedAt:lastCycle?.startedAt||null,
@@ -326,12 +431,9 @@ async function getGpsSyncStatus(now=new Date()){
   lastSyncTotalVehicles:lastCycle?.totalRegisteredVehicles||0,
   lastSyncSuccessfulVehicles:lastCycle?.successfulVehicles||0,
   lastSyncFailedVehicles:lastCycle?.failedVehicles||0,
-  lastError:persistedStatus
-   ?persistedStatus.lastError||''
-   :(lastCycle?.success||lastCycle?.status==='Skipped'?'':failureMessage),
+  lastError:lastCycle?.success||lastCycle?.status==='Skipped'?'':failureMessage,
   totalVehiclesSynced:lastCycle?.result?.totalVehiclesSynced||0,
   failedVehicleCount:lastCycle?.result?.failedVehicleCount||0,
-  failedProviderCount:lastCycle?.result?.failedProviderCount||0,
   gpsDataLastUpdated:gpsData?.syncedAt||null,
   lastCycleErrors:lastCycleErrors.slice(0,20),
   lastCycleGeofenceError:lastCycle?.result?.geofenceError||null,
@@ -372,7 +474,7 @@ async function runSync(type='manual',options={}){
  syncing=true;
  const owner=crypto.randomUUID();
  let lockAcquired=false,statusAcquired=false,lockLost=false,heartbeat=null;
- let cycleStartedAt=attemptedAt,cycleFinishedAt=null,cycleSucceeded=false,cycleStatus='Failed';
+ let cycleStartedAt=attemptedAt,cycleFinishedAt=null,cycleSucceeded=false;
  let cycleFailureMessage='';
  let finalProviderResults={};
  let registeredVehicleCount=0,synchronizedVehicleCount=0,failedVehicleCountForLog=0;
@@ -424,17 +526,16 @@ async function runSync(type='manual',options={}){
    .select('vehicleNumber gpsLink gpsProviders updatedAt createdAt').lean();
   const activeVehicles=[...groupByVehicleNumber(activeVehicleRows).values()].map(records=>
    records.sort((a,b)=>new Date(b.updatedAt||0)-new Date(a.updatedAt||0))[0]
-  );
+  ).filter(vehicle=>vehicleHasProvider(vehicle,'Wheelseye'));
   const vehiclesByNumber=new Map(activeVehicles.map(vehicle=>[normalizeNumber(vehicle.vehicleNumber),vehicle]));
   const registeredNumbers=[...vehiclesByNumber.keys()];
   registeredVehicleCount=registeredNumbers.length;
-  const savedProviderSettings=await M.GpsSetting.find({}).lean();
+  const savedProviderSettings=await M.GpsSetting.find({provider:'Wheelseye'}).lean();
   const providerSettingsByName=new Map(savedProviderSettings.map(setting=>[setting.provider,setting]));
   const synchronizedRegisteredNumbers=new Set();
   const result={};
   const providers=[
-   {name:'Wheelseye',fetch:baseUrl=>wheelseyeService.fetchLive({baseUrl})},
-   {name:'Fleetx',fetch:baseUrl=>fleetxService.fetchLive({baseUrl})}
+   {name:'Wheelseye',fetch:baseUrl=>wheelseyeService.fetchLive({baseUrl})}
   ];
   const providerResponsesByName=new Map(await Promise.all(providers.map(async provider=>{
    const settings=providerSettingsByName.get(provider.name);
@@ -491,56 +592,57 @@ async function runSync(type='manual',options={}){
      isLinked:vehicle=>vehicleHasProvider(vehicle,p.name),
      persistRecord:async(row,vehicle)=>{
       if(lockLost)throw new Error('GPS sync stopped after losing the distributed lock');
-     const previousRecords=await M.VehicleLiveStatus.find({vehicleNumber:vehicleNumberRegex(row.vehicleNumber)})
-      .sort({gpsTime:-1,syncedAt:-1}).lean();
-     const previous=previousRecords[0]||null;
+     const existing=await M.VehicleLiveStatus.findOne({
+      vehicleNumber:vehicleNumberRegex(row.vehicleNumber)
+     }).select('_id').lean();
+     const previous=existing?await M.VehicleLiveStatus.findOne({
+      _id:existing._id,provider:'Wheelseye'
+     }).lean():null;
      const previousGpsTime=previous?.gpsTime?new Date(previous.gpsTime):null;
      if(previousGpsTime&&previousGpsTime>row.gpsTime){
       errorDetails.push({message:'Newer stored GPS data was kept'});
       throw new Error('Newer stored GPS data was kept');
      }
      const syncedAt=new Date();
-     let location=null;
-     try{
-      location=await reverseGeocoding.resolve(row.lat,row.lng,{
-       providerAddress:row.providerAddress,
-       providerFields:row.providerFields,
-       previous:previous?{
-        readableLocation:previous.readableLocation||previous.address,
-        locality:previous.locality,city:previous.city,district:previous.district,state:previous.state,
-        pincode:previous.pincode,country:previous.country,geocodedAt:previous.geocodedAt,
-        geocodingProvider:previous.geocodingProvider,addressLat:previous.addressLat,addressLng:previous.addressLng
-       }:null
-      });
-     }catch(error){console.warn(`Reverse geocoding failed for ${row.vehicleNumber}: ${error.message}`);}
-     const address=location?.readableLocation||readableAddress(previous)||null;
-     const addressIsCurrent=Boolean(location&&location.isCurrent!==false);
-     const addressFields=location?{
-      readableLocation:location.readableLocation,address:location.readableLocation,
-      locality:location.locality||'',city:location.city||'',district:location.district||'',
-      state:location.state||'',pincode:location.pincode||'',country:location.country||'',
-      geocodedAt:location.geocodedAt||null,geocodingProvider:location.provider||'Provider',
-      ...(addressIsCurrent?{addressLat:row.lat,addressLng:row.lng}:{})
-     }:{};
-     const doc={...row,...addressFields,address,normalizedVehicleNumber:row.vehicleNumber,
-      addressIsCurrent,unregistered:!vehicle,stale:false,lastGoodTime:row.gpsTime,syncedAt};
+     const previousAddress=previous?{
+      readableLocation:previous.readableLocation||previous.address,
+      street:previous.street,galiNumber:previous.galiNumber,road:previous.road,nearby:previous.nearby,
+      locality:previous.locality,city:previous.city,cityOrVillage:previous.cityOrVillage,
+      district:previous.district,state:previous.state,
+      pincode:previous.pincode,country:previous.country,geocodedAt:previous.geocodedAt,
+      addressDistanceKm:previous.addressDistanceKm,
+      geocodingProvider:previous.geocodingProvider,addressLat:previous.addressLat,
+      addressLng:previous.addressLng,addressIsCurrent:previous.addressIsCurrent
+     }:null;
+     const providerAddress=typeof row.providerAddress==='string'&&row.providerAddress.trim()
+      ?row.providerAddress:null;
+     const location=providerAddress?{
+      readableLocation:providerAddress,...row.providerFields,provider:'Provider',
+      addressLat:row.lat,addressLng:row.lng,addressIsCurrent:true
+     }:reverseGeocoding.previousLocation(previousAddress,row.lat,row.lng);
+     const resolvedLocation=location?{
+      ...location,addressLat:location.addressLat??row.lat,addressLng:location.addressLng??row.lng,
+      addressIsCurrent:location.addressIsCurrent!==false
+     }:null;
+     const doc={...row,...addressFields(resolvedLocation),
+      normalizedVehicleNumber:row.vehicleNumber,unregistered:false,stale:false,
+      lastGoodTime:row.gpsTime,syncedAt};
      delete doc.providerAddress;
+     delete doc.providerFields;
      await M.VehicleLiveStatus.findOneAndUpdate(
-      previous?{_id:previous._id}:{normalizedVehicleNumber:row.vehicleNumber},
-      {$set:doc},{upsert:!previous,new:true}
+      existing?{_id:existing._id}:{normalizedVehicleNumber:row.vehicleNumber},
+      {$set:doc},{upsert:!existing,new:true}
      );
      await M.VehicleLocationHistory.updateOne(
       {vehicleNumber:row.vehicleNumber,gpsTime:row.gpsTime,provider:row.provider},
-      {$setOnInsert:{vehicle:row.vehicleNumber,vehicleNumber:row.vehicleNumber,lat:row.lat,lng:row.lng,address,
-       readableLocation:location?.readableLocation||address,locality:location?.locality||'',city:location?.city||'',
-       district:location?.district||'',state:location?.state||'',pincode:location?.pincode||'',country:location?.country||'',
-       geocodedAt:location?.geocodedAt||null,geocodingProvider:location?.provider||'Provider',
-       addressLat:addressIsCurrent?row.lat:previous?.addressLat,addressLng:addressIsCurrent?row.lng:previous?.addressLng,
-       addressIsCurrent,providerVehicleId:row.providerVehicleId?String(row.providerVehicleId):undefined,
+      {$setOnInsert:{vehicle:row.vehicleNumber,vehicleNumber:row.vehicleNumber,lat:row.lat,lng:row.lng,
+       ...addressFields(resolvedLocation),providerVehicleId:row.providerVehicleId?String(row.providerVehicleId):undefined,
        driverName:row.driverName,vehicleStatus:row.vehicleStatus,
-       speed:row.speed,ignition:row.ignition,gpsTime:row.gpsTime,provider:row.provider,syncedAt}},
+       speed:row.speed,ignition:row.ignition,ignitionStatus:row.ignitionStatus,
+       gpsTime:row.gpsTime,provider:row.provider,syncedAt}},
       {upsert:true}
      );
+     queueVehicleAddressLookup(row,previousAddress);
      synchronizedRegisteredNumbers.add(row.vehicleNumber);
      synchronizedVehicleCount=synchronizedRegisteredNumbers.size;
      }
@@ -624,10 +726,10 @@ async function runSync(type='manual',options={}){
   const failedVehicleNumbers=registeredNumbers.filter(number=>!synchronizedRegisteredNumbers.has(number));
   if(failedVehicleNumbers.length){
    await M.VehicleLiveStatus.updateMany(
-    {$or:[
-     {normalizedVehicleNumber:{$in:failedVehicleNumbers}},
-     {vehicleNumber:{$in:failedVehicleNumbers.map(vehicleNumberRegex)}}
-    ]},{$set:{stale:true}}
+   {provider:'Wheelseye',$or:[
+    {normalizedVehicleNumber:{$in:failedVehicleNumbers}},
+    {vehicleNumber:{$in:failedVehicleNumbers.map(vehicleNumberRegex)}}
+   ]},{$set:{stale:true}}
    );
   }
   try{await updateGeofence()}
@@ -638,21 +740,19 @@ async function runSync(type='manual',options={}){
   const finishedAt=new Date();
   const totalVehiclesSynced=synchronizedRegisteredNumbers.size;
   const failedVehicleCount=failedVehicleNumbers.length;
-  const outcome=aggregateSyncOutcome(finalProviderResults,{failedVehicleCount,geofenceError});
+  const outcome=aggregateSyncOutcome(finalProviderResults.Wheelseye,{geofenceError});
   const success=outcome.success;
-  cycleStatus=outcome.status;
-  const failedProviderCount=outcome.failedProviderCount;
-  cycleFailureMessage=geofenceError||Object.entries(finalProviderResults)
-   .filter(([,provider])=>provider.enabled!==false&&!provider.ok)
-   .map(([provider,result])=>`${provider}: ${result.reason||'provider failed'}`).join('; ');
+  cycleFailureMessage=geofenceError||
+   (!finalProviderResults.Wheelseye?.ok
+    ?`Wheelseye: ${finalProviderResults.Wheelseye?.reason||'provider failed'}`
+    :'');
   cycleFinishedAt=finishedAt;
   cycleSucceeded=success;
   synchronizedVehicleCount=totalVehiclesSynced;
   failedVehicleCountForLog=failedVehicleCount;
   const summary={
-   ...result,totalVehiclesSynced,failedVehicleCount,failedProviderCount,
-   providerResults:finalProviderResults,geofenceError,
-   status:outcome.status,partialSuccess:outcome.partialSuccess
+   ...result,totalVehiclesSynced,failedVehicleCount,geofenceError,
+   status:outcome.status
   };
   const errorDetails=Object.entries(result).flatMap(([provider,providerResult])=>
    (providerResult.errors||[]).map(error=>({provider,...error}))
@@ -666,8 +766,7 @@ async function runSync(type='manual',options={}){
   });
   return {
    started:true,startedAt,finishedAt,result:summary,success,
-   partialSuccess:summary.partialSuccess,totalVehiclesSynced,failedVehicleCount,
-   failedProviderCount,nextAutoSyncAt:success
+   totalVehiclesSynced,failedVehicleCount,nextAutoSyncAt:success
     ?getNextScheduledSyncAt(finishedAt)
     :new Date(Math.min(getNextScheduledSyncAt(finishedAt).getTime(),finishedAt.getTime()+GPS_SYNC_RETRY_MS))
   };
@@ -686,7 +785,7 @@ async function runSync(type='manual',options={}){
     totalRegisteredVehicles:registeredVehicleCount,
     successfulVehicles:synchronizedVehicleCount,
     failedVehicles:Math.max(failedVehicleCountForLog,registeredVehicleCount-synchronizedVehicleCount),
-    status:synchronizedVehicleCount?'Partial':'Failed',
+    status:'Failed',
     errorDetails:[{message:cycleFailureMessage}]
    });
   }catch(logError){
@@ -724,14 +823,15 @@ async function runSync(type='manual',options={}){
   if(statusAcquired){
    try{
     const finishedAt=cycleFinishedAt||new Date();
-    const finalStatus=cycleSucceeded?'Successful':
-     cycleStatus==='Partial'||synchronizedVehicleCount?'Partial':'Failed';
+    const finalStatus=cycleSucceeded?'Successful':'Failed';
     await M.SyncStatus.updateOne({key:SYNC_STATUS_KEY},{$set:{
      isSyncing:false,lastSyncAt:finishedAt,lastSyncType:statusType,lastSyncStatus:finalStatus,
      lastError:cycleSucceeded?'':cycleFailureMessage||'GPS sync failed',
-     providerResults:finalProviderResults,
      ...(normalizedType==='auto'?{lastAutoSyncAt:finishedAt}:{})
     }});
+    await M.SyncStatus.collection.updateOne(
+     {key:SYNC_STATUS_KEY},{$unset:{providerResults:''}}
+    );
    }catch(error){
     console.error('[GPS sync] Could not persist final sync status',{
      type:normalizedType,message:error.message,stack:error.stack
@@ -754,12 +854,12 @@ async function runSync(type='manual',options={}){
 
 async function updateGeofence(){
  const [active,rawLive,plants,openStays]=await Promise.all([
-  M.Vehicle.find({status:'Active'}).select('vehicleNumber updatedAt createdAt').lean(),
-  M.VehicleLiveStatus.find({stale:{$ne:true}}).lean(),
+  M.Vehicle.find({status:'Active'}).select('vehicleNumber gpsLink gpsProviders updatedAt createdAt').lean(),
+  M.VehicleLiveStatus.find({provider:'Wheelseye',stale:{$ne:true}}).lean(),
   M.Plant.find({status:'Active'}).lean(),
   M.VehiclePlantStay.find({exitTime:null}).lean()
  ]);
- const registered=new Set(groupByVehicleNumber(active).keys());
+ const registered=new Set(groupByVehicleNumber(active.filter(vehicle=>vehicleHasProvider(vehicle,'Wheelseye'))).keys());
  const livesByVehicle=groupByVehicleNumber(rawLive.filter(record=>record.unregistered!==true));
  const staysByVehicle=groupByVehicleNumber(openStays,stay=>stay.vehicle);
  for(const [vehicleNumber,records] of livesByVehicle){
@@ -881,10 +981,11 @@ app.get('/api/sync/status',auth,permission('Dashboard','view'),async(_req,res)=>
   now.getTime()-syncStartedAt<SYNC_STATUS_STALE_MS);
  const schedulerActive=Number.isFinite(autoSyncTime)&&autoSyncTime<=now.getTime()&&
   now.getTime()-autoSyncTime<=SYNC_STATUS_SCHEDULER_ACTIVE_MS;
+ const lastSyncStatus=['Successful','Failed'].includes(status?.lastSyncStatus)
+  ?status.lastSyncStatus:null;
  res.json({
   lastSyncAt:status?.lastSyncAt||null,lastSyncType:status?.lastSyncType||null,
-  lastSyncStatus:status?.lastSyncStatus||null,lastError:status?.lastError||'',
-  providerResults:status?.providerResults||{},
+  lastSyncStatus,lastError:lastSyncStatus==='Failed'?'GPS synchronization failed':'',
   lastAutoSyncAt,nextSyncAt:Number.isFinite(autoSyncTime)
    ?new Date(autoSyncTime+GPS_SYNC_INTERVAL_MS):null,
   isSyncing,syncStartedAt:status?.syncStartedAt||null,
@@ -898,20 +999,29 @@ app.get('/api/vehicles',auth,permission('Vehicle Registry','view'),async(req,res
   const search=normalizeNumber(req.query.search);
   if(search)q.vehicleNumber={$regex:search,$options:'i'};
  }
- if(req.query.status)q.status=req.query.status;if(req.query.fleetType)q.fleetType=req.query.fleetType;if(req.query.provider)q.gpsLink=req.query.provider;
+ if(req.query.status)q.status=req.query.status;
+ if(req.query.fleetType)q.fleetType=req.query.fleetType;
+ if(req.query.provider){
+  if(req.query.provider!=='Wheelseye')return res.status(400).json({error:'Invalid GPS provider'});
+  q.$or=[{gpsLink:'Wheelseye'},{gpsProviders:{$elemMatch:{name:'Wheelseye'}}}];
+ }
  const page=Math.max(1,+req.query.page||1),limit=Math.max(1,Math.min(100,+req.query.limit||20));
  const found=await M.Vehicle.find(q).sort({vehicleNumber:1,status:1,updatedAt:-1,createdAt:1}).lean();
  const unique=[...groupByVehicleNumber(found).values()].map(records=>records[0]);
  const total=unique.length,items=unique.slice((page-1)*limit,page*limit);
- const live=await M.VehicleLiveStatus.find({}).select('vehicleNumber gpsTime').lean();
+ const live=await M.VehicleLiveStatus.find({provider:'Wheelseye'}).select('vehicleNumber gpsTime').lean();
  const liveByNumber=new Map();
  for(const [vehicleNumber,records] of groupByVehicleNumber(live).entries()){
   records.sort((a,b)=>new Date(b.gpsTime||0)-new Date(a.gpsTime||0));
   liveByNumber.set(vehicleNumber,records[0]);
  }
- res.json({items:items.map(vehicle=>({...vehicle,lastGps:liveByNumber.get(normalizeNumber(vehicle.vehicleNumber))?.gpsTime||null})),total,page,pages:Math.ceil(total/limit)});
+ res.json({items:items.map(vehicle=>({
+  ...vehicle,
+  gpsProviderDisplay:vehicleHasProvider(vehicle,'Wheelseye')?'Wheelseye':'No GPS provider',
+  lastGps:liveByNumber.get(normalizeNumber(vehicle.vehicleNumber))?.gpsTime||null
+ })),total,page,pages:Math.ceil(total/limit)});
 });
-app.post('/api/vehicles',auth,permission('Vehicle Registry','edit'),[body('vehicleNumber').trim().notEmpty(),body('fleetType').isIn(['Own Fleet','Contract Fleet']),body('gpsLink').isIn(['Wheelseye','Fleetx']),body('status').isIn(['Active','Inactive'])],async(req,res)=>{
+app.post('/api/vehicles',auth,permission('Vehicle Registry','edit'),[body('vehicleNumber').trim().notEmpty(),body('fleetType').isIn(['Own Fleet','Contract Fleet']),body('gpsLink').equals('Wheelseye'),body('status').isIn(['Active','Inactive'])],async(req,res)=>{
  if(!validationResult(req).isEmpty())return res.status(400).json({error:'Invalid vehicle details'});
  const vehicleNumber=normalizeNumber(req.body.vehicleNumber);
  const match=vehicleNumberRegex(vehicleNumber);
@@ -935,7 +1045,7 @@ app.post('/api/vehicles',auth,permission('Vehicle Registry','edit'),[body('vehic
 app.put('/api/vehicles/:id',auth,permission('Vehicle Registry','edit'),async(req,res)=>{
  const allowedFields=['vehicleNumber','fleetType','gpsLink','status','driver','mobile','plant'];
  const d=Object.fromEntries(allowedFields.filter(key=>Object.prototype.hasOwnProperty.call(req.body,key)).map(key=>[key,req.body[key]]));
- if(d.gpsLink!==undefined&&!['Wheelseye','Fleetx'].includes(d.gpsLink))return res.status(400).json({error:'Invalid GPS provider'});
+ if(d.gpsLink!==undefined&&d.gpsLink!=='Wheelseye')return res.status(400).json({error:'Invalid GPS provider'});
  for(const key of ['driver','mobile','plant'])if(d[key]!==undefined)d[key]=String(d[key]||'').trim();
  d.updatedBy=req.user.sub;
  if(d.vehicleNumber!==undefined){
@@ -968,7 +1078,7 @@ app.post('/api/vehicles/:id/sync',auth,syncPermission,async(req,res)=>{
 app.get('/api/unregistered',auth,permission('Vehicle Registry','view'),async(req,res)=>{
  const [vehicles,records]=await Promise.all([
   M.Vehicle.find({}).select('vehicleNumber').lean(),
-  M.VehicleLiveStatus.find({unregistered:true}).sort({vehicleNumber:1,gpsTime:-1}).lean()
+  M.VehicleLiveStatus.find({unregistered:true,provider:'Wheelseye'}).sort({vehicleNumber:1,gpsTime:-1}).lean()
  ]);
  const registered=new Set(groupByVehicleNumber(vehicles).keys());
  const unique=[...groupByVehicleNumber(records).entries()]
@@ -1048,18 +1158,23 @@ app.get('/api/tracking',auth,permission('GPS Track','view'),async(req,res)=>{
 });
 app.get('/api/tracking/vehicles/:vehicleId',auth,permission('GPS Track','view'),async(req,res)=>{
  if(!mongoose.Types.ObjectId.isValid(req.params.vehicleId))return res.status(400).json({error:'Invalid vehicle ID'});
- const vehicle=await M.Vehicle.findById(req.params.vehicleId).select('vehicleNumber status').lean();
+ const vehicle=await M.Vehicle.findById(req.params.vehicleId).select('vehicleNumber status gpsLink gpsProviders').lean();
  if(!vehicle||vehicle.status!=='Active')return res.status(404).json({error:'Registered vehicle not found'});
+ if(!vehicleHasProvider(vehicle,'Wheelseye'))return res.status(404).json({error:'No GPS provider is configured for this vehicle'});
  const matcher=vehicleNumberRegex(vehicle.vehicleNumber);
  const [records,syncStatus]=await Promise.all([
-  M.VehicleLiveStatus.find({vehicleNumber:matcher}).sort({gpsTime:-1,syncedAt:-1}).lean(),
+  M.VehicleLiveStatus.find({vehicleNumber:matcher,provider:'Wheelseye'}).sort({gpsTime:-1,syncedAt:-1}).lean(),
   getGpsSyncStatus()
  ]);
  const now=new Date();
- const record=records.find(item=>{
+ let record=records.find(item=>{
   const timestamp=new Date(item.gpsTime||NaN).getTime();
   return reverseGeocoding.validCoordinates(item.lat,item.lng)&&Number.isFinite(timestamp)&&timestamp<=now.getTime();
  })||records[0]||null;
+ if(record){
+  try{record=await resolveStoredVehicleAddress(record)}
+  catch(error){console.warn(`Reverse geocoding failed for ${record.vehicleNumber}: ${error.message}`)}
+ }
  const gpsTime=record?.gpsTime?new Date(record.gpsTime):null;
  const hasCoordinates=Boolean(record&&reverseGeocoding.validCoordinates(record.lat,record.lng)&&gpsTime&&
   Number.isFinite(gpsTime.getTime())&&gpsTime<=now);
@@ -1070,9 +1185,16 @@ app.get('/api/tracking/vehicles/:vehicleId',auth,permission('GPS Track','view'),
   gps:record?{
    lat:hasCoordinates?Number(record.lat):null,
    lng:hasCoordinates?Number(record.lng):null,
-   location:readableAddress(record),
+   location:displayLocation(record),
    addressIsCurrent:Boolean(record.addressIsCurrent),
+   street:record.street||'',galiNumber:record.galiNumber||'',road:record.road||'',
+   nearby:record.nearby||'',city:record.city||'',
+   cityOrVillage:record.cityOrVillage||record.city||'',district:record.district||'',
+   state:record.state||'',pincode:record.pincode||'',
+   addressDistanceKm:record.addressDistanceKm??null,
+   addressEnrichmentPending:Boolean(record.addressEnrichmentPending),
    speed:record.speed??null,ignition:record.ignition??null,
+   ignitionStatus:record.ignitionStatus||'UNKNOWN',
    runningStatus:record.runningStatus||'Unknown',
    gpsTime:record.gpsTime||null,
    heading:record.heading==null||record.heading===''||!Number.isFinite(Number(record.heading))?null:Number(record.heading),
@@ -1085,12 +1207,69 @@ app.get('/api/tracking/vehicles/:vehicleId',auth,permission('GPS Track','view'),
   }
  });
 });
+app.post('/api/locations/vehicles/batch',auth,async(req,res)=>{
+ if(!hasPermission(req.user.perms,'Dashboard','view',req.user.isAdmin)&&
+  !hasPermission(req.user.perms,'GPS Track','view',req.user.isAdmin)){
+  return res.status(403).json({error:'No access'});
+ }
+ const ids=req.body?.vehicleIds;
+ if(!Array.isArray(ids)||ids.length>25||
+  ids.some(id=>typeof id!=='string'||!mongoose.Types.ObjectId.isValid(id))){
+  return res.status(400).json({error:'Invalid vehicle list'});
+ }
+ if(!ids.length)return res.json({items:[]});
+ const vehicles=await M.Vehicle.find({
+  _id:{$in:[...new Set(ids)]},status:'Active'
+ }).select('_id vehicleNumber gpsLink gpsProviders').lean();
+ const eligible=vehicles.filter(vehicle=>vehicleHasProvider(vehicle,'Wheelseye'));
+ if(!eligible.length)return res.json({items:[]});
+ const numbers=eligible.map(vehicle=>vehicleNumberRegex(vehicle.vehicleNumber));
+ const liveRecords=await M.VehicleLiveStatus.find({
+  vehicleNumber:{$in:numbers},provider:'Wheelseye'
+ }).sort({gpsTime:-1,syncedAt:-1}).lean();
+ const liveByNumber=new Map();
+ for(const record of liveRecords){
+  const number=normalizeNumber(record.vehicleNumber);
+  if(!liveByNumber.has(number))liveByNumber.set(number,record);
+ }
+ const items=await Promise.all(eligible.map(async vehicle=>{
+  let record=liveByNumber.get(normalizeNumber(vehicle.vehicleNumber));
+  if(record&&reverseGeocoding.validCoordinates(record.lat,record.lng)){
+   try{record=await resolveStoredVehicleAddress(record)}
+   catch(error){
+    console.warn('[Geocoding] Batched location resolution failed',{
+     code:error.code||'request failed'
+    });
+   }
+  }
+  return {vehicleId:String(vehicle._id),...vehicleLocationPayload(record)};
+ }));
+ res.json({items});
+});
+app.get('/api/locations/vehicles/:vehicleId',auth,async(req,res)=>{
+ if(!hasPermission(req.user.perms,'Dashboard','view',req.user.isAdmin)&&
+  !hasPermission(req.user.perms,'GPS Track','view',req.user.isAdmin)){
+  return res.status(403).json({error:'No access'});
+ }
+ if(!mongoose.Types.ObjectId.isValid(req.params.vehicleId))return res.status(400).json({error:'Invalid vehicle ID'});
+ const vehicle=await M.Vehicle.findById(req.params.vehicleId).select('vehicleNumber status gpsLink gpsProviders').lean();
+ if(!vehicle||vehicle.status!=='Active')return res.status(404).json({error:'Registered vehicle not found'});
+ if(!vehicleHasProvider(vehicle,'Wheelseye'))return res.status(404).json({error:'No GPS provider is configured for this vehicle'});
+ const matcher=vehicleNumberRegex(vehicle.vehicleNumber);
+ let record=await M.VehicleLiveStatus.findOne({vehicleNumber:matcher,provider:'Wheelseye'})
+  .sort({gpsTime:-1,syncedAt:-1}).lean();
+ if(record){
+  try{record=await resolveStoredVehicleAddress(record)}
+  catch(error){console.warn(`Reverse geocoding failed for ${record.vehicleNumber}: ${error.message}`)}
+ }
+ res.json(vehicleLocationPayload(record));
+});
 app.get('/api/history/search',auth,permission('GPS Track','view'),async(req,res)=>{
  const vehicleNumber=normalizeNumber(req.query.vehicleNumber);
  const provider=String(req.query.provider||'');
  const from=new Date(String(req.query.from||''));
  const to=new Date(String(req.query.to||''));
- if(!vehicleNumber||!['Wheelseye','FLEETX'].includes(provider)||!Number.isFinite(from.getTime())||!Number.isFinite(to.getTime())||from>to||to>Date.now()){
+ if(!vehicleNumber||provider!=='Wheelseye'||!Number.isFinite(from.getTime())||!Number.isFinite(to.getTime())||from>to||to>Date.now()){
   return res.status(400).json({error:'Select a valid provider, vehicle and past date range'});
  }
  const matcher=vehicleNumberRegex(vehicleNumber);
@@ -1101,14 +1280,14 @@ app.get('/api/history/search',auth,permission('GPS Track','view'),async(req,res)
   provider,gpsTime:{$gte:from,$lte:to},
   $or:[{vehicleNumber:matcher},{vehicle:matcher}]
  }).sort({gpsTime:1}).lean();
- res.json(rows.map(row=>({...row,location:readableAddress(row)||'Address unavailable'})));
+ res.json(rows.map(row=>({...row,location:displayLocation(row)})));
 });
 app.get('/api/history/:vehicle',auth,permission('GPS Track','view'),async(req,res)=>{
  const vehicle=normalizeNumber(req.params.vehicle);const limit=Math.min(500,+req.query.limit||200);
  const matcher=vehicleNumberRegex(vehicle);
- const rows=await M.VehicleLocationHistory.find({$or:[{vehicleNumber:matcher},{vehicle:matcher}]})
+ const rows=await M.VehicleLocationHistory.find({provider:'Wheelseye',$or:[{vehicleNumber:matcher},{vehicle:matcher}]})
   .sort({gpsTime:-1}).limit(limit).lean();
- res.json(rows.map(r=>({...r,location:readableAddress(r)})));
+ res.json(rows.map(r=>({...r,location:displayLocation(r)})));
 });
 
 app.post('/api/plans',auth,permission('Dashboard','edit'),[body('vehicle').trim().notEmpty(),body('planType').isIn(['Loading','Unloading','Maintenance','Waiting','Other']),body('expectedDeparture').optional({checkFalsy:true}).isISO8601()],async(req,res)=>{if(!validationResult(req).isEmpty())return res.status(400).json({error:'Invalid plan'});const plan=await M.VehiclePlan.create({vehicle:req.body.vehicle,plant:req.body.plant,planType:req.body.planType,remarks:req.body.remarks,expectedDeparture:req.body.expectedDeparture,createdBy:req.user.sub,createdByUserId:req.user.sub,createdByName:req.user.fullName});await audit('create_plan',req.user.sub,{vehicle:plan.vehicle,plant:plan.plant},req);res.status(201).json(plan)});
@@ -1200,7 +1379,7 @@ const uploadStorage=process.env.VERCEL==='1'
 const upload=multer({storage:uploadStorage,limits:{fileSize:1024*1024},fileFilter:(q,f,c)=>['image/png','image/svg+xml','image/webp'].includes(f.mimetype)?c(null,true):c(new Error('Invalid icon type'))});
 app.get('/api/gps/settings',auth,permission('GPS Track','view'),async(req,res)=>{
  const [saved,providerStatuses]=await Promise.all([
-  M.GpsSetting.find().lean(),M.GpsProviderStatus.find().lean()
+  M.GpsSetting.find({provider:'Wheelseye'}).lean(),M.GpsProviderStatus.find({provider:'Wheelseye'}).lean()
  ]);
  const settingsByProvider=new Map(saved.map(setting=>[setting.provider,setting]));
  const statusesByProvider=new Map(providerStatuses.map(status=>[status.provider,status]));
@@ -1254,7 +1433,7 @@ async function createLocationShare(vehicleNumber,userId){
 }
 app.post('/api/share',auth,permission('GPS Track','edit'),async(req,res)=>{
  const vehicleNumber=normalizeNumber(req.body.vehicleNumber);
- if(!await M.VehicleLiveStatus.exists({vehicleNumber}))return res.status(404).json({error:'Vehicle not found'});
+ if(!await M.VehicleLiveStatus.exists({vehicleNumber,provider:'Wheelseye'}))return res.status(404).json({error:'Vehicle not found'});
  res.status(201).json(await createLocationShare(vehicleNumber,req.user.sub));
 });
 app.post('/api/tracking/vehicles/:vehicleId/share',auth,permission('GPS Track','edit'),async(req,res)=>{
@@ -1262,12 +1441,12 @@ app.post('/api/tracking/vehicles/:vehicleId/share',auth,permission('GPS Track','
  const vehicle=await M.Vehicle.findById(req.params.vehicleId).select('vehicleNumber status').lean();
  if(!vehicle||vehicle.status!=='Active')return res.status(404).json({error:'Registered vehicle not found'});
  const vehicleMatcher=vehicleNumberRegex(vehicle.vehicleNumber);
- const records=await M.VehicleLiveStatus.find({vehicleNumber:vehicleMatcher}).sort({gpsTime:-1,syncedAt:-1}).select('lat lng').lean();
+ const records=await M.VehicleLiveStatus.find({vehicleNumber:vehicleMatcher,provider:'Wheelseye'}).sort({gpsTime:-1,syncedAt:-1}).select('lat lng').lean();
  if(!records.some(record=>reverseGeocoding.validCoordinates(record.lat,record.lng)))return res.status(404).json({error:'GPS coordinates are unavailable'});
  res.status(201).json(await createLocationShare(vehicle.vehicleNumber,req.user.sub));
 });
 app.post('/api/share/:token/revoke',auth,permission('GPS Track','edit'),async(req,res)=>{await M.ShareLink.findOneAndUpdate({token:req.params.token},{$set:{revoked:true}});res.json({ok:true})});
-app.get('/share/:token',async(req,res)=>{const l=await M.ShareLink.findOne({token:req.params.token,revoked:false,expiresAt:{$gt:new Date()}});if(!l)return res.status(404).send('This location link is invalid or expired');const live=await M.VehicleLiveStatus.findOne({vehicleNumber:l.vehicleNumber});const speed=live?.speed==='N/A'||live?.speed==null?'N/A':`${live.speed} km/h`;res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>${l.vehicleNumber} - Sikka Fleet</title></head><body style="margin:0;font-family:Arial;background:#eef2ff"><h2 style="padding:16px;margin:0">${l.vehicleNumber}</h2><div style="padding:16px"><b>Location:</b> ${live?.address||'No data'}<br><b>GPS time:</b> ${live?.gpsTime?.toLocaleString('en-IN')||'No data'}<br><b>Speed:</b> ${speed}<br><b>IGN:</b> ${live?.ignition||'N/A'}${live?.stale?'<br><b>GPS data:</b> Stale':''}</div></body></html>`)});
+app.get('/share/:token',async(req,res)=>{const l=await M.ShareLink.findOne({token:req.params.token,revoked:false,expiresAt:{$gt:new Date()}});if(!l)return res.status(404).send('This location link is invalid or expired');const live=await M.VehicleLiveStatus.findOne({vehicleNumber:l.vehicleNumber,provider:'Wheelseye'});const speed=live?.speed==null?'N/A':String(live.speed);const location=live?displayLocation(live):'No data';const map=live&&reverseGeocoding.validCoordinates(live.lat,live.lng)?`<a href="https://www.google.com/maps?q=${live.lat},${live.lng}" target="_blank" rel="noreferrer">Open map</a>`:'';res.type('html').send(`<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>${l.vehicleNumber} - Sikka Fleet</title></head><body style="margin:0;font-family:Arial;background:#eef2ff"><h2 style="padding:16px;margin:0">${l.vehicleNumber}</h2><div style="padding:16px"><b>Location:</b> ${location} ${map}<br><b>GPS time:</b> ${live?.gpsTime?.toLocaleString('en-IN')||'No data'}<br><b>Speed:</b> ${speed}<br><b>IGN:</b> ${live?.ignition==null?'N/A':String(live.ignition)}${live?.stale?'<br><b>GPS data:</b> Stale':''}</div></body></html>`)});
 
 function escapeRegex(value){return value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
 app.post('/api/ai/chat',auth,permission('Sikka AI','view'),aiChatLimiter,
@@ -1302,7 +1481,14 @@ app.post('/api/ai/chat',auth,permission('Sikka AI','view'),aiChatLimiter,
      ?'कृपया पासवर्ड, टोकन या API key चैट में साझा न करें। संवेदनशील टेक्स्ट हिस्ट्री में सेव नहीं किया गया।'
      :'Please do not share passwords, tokens, or API keys in chat. Sensitive text was not saved to chat history.'}
     :await sikkaAiService.answerQuestion(question,{
-     models:M,now:askedAt,previousLanguage:previousChat?.language,permissions:authorizedPages
+     models:M,now:askedAt,previousLanguage:previousChat?.language,permissions:authorizedPages,
+     resolveLocation:async record=>{
+      try{return await resolveStoredVehicleAddress(record)}
+      catch(error){
+       console.warn(`Reverse geocoding failed for ${record.vehicleNumber}: ${error.message}`);
+       return record;
+      }
+     }
     });
   }
   catch(error){
@@ -1402,6 +1588,7 @@ app.get('/api/ai/history/records',auth,permission('Sikka AI','view'),permission(
   if(!vehicleNumbers.length)return res.json({rows:[],total:0,offset,limit});
   filter={
    $or:[{vehicleNumber:{$in:vehicleNumbers}},{vehicle:{$in:vehicleNumbers}}],
+   provider:'Wheelseye',
    gpsTime:{$gte:from,$lte:to}
   };
  }else{
@@ -1409,7 +1596,7 @@ app.get('/api/ai/history/records',auth,permission('Sikka AI','view'),permission(
   if(!await M.Vehicle.exists({vehicleNumber:matcher,status:'Active'})){
    return res.status(404).json({error:'Vehicle number was not found in the active registry.'});
   }
-  filter={$or:[{vehicleNumber:matcher},{vehicle:matcher}],gpsTime:{$gte:from,$lte:to}};
+  filter={$or:[{vehicleNumber:matcher},{vehicle:matcher}],provider:'Wheelseye',gpsTime:{$gte:from,$lte:to}};
  }
  const [records,total]=await Promise.all([
   M.VehicleLocationHistory.find(filter).sort({gpsTime:1}).skip(offset).limit(limit).lean(),
@@ -1594,9 +1781,8 @@ async function executeDueGpsSync(){
    (!Number.isFinite(scheduledTime)||scheduledTime>now.getTime()&&retryTime<scheduledTime);
   const result=await runSync('auto',{retry:isRetry});
   console.info('[GPS sync] Automatic cycle finished',{
-   started:result.started,success:result.success,partialSuccess:result.partialSuccess,
+   started:result.started,success:result.success,
    totalVehiclesSynced:result.totalVehiclesSynced,failedVehicleCount:result.failedVehicleCount,
-   failedProviderCount:result.failedProviderCount
   });
   if(!result.started){
    const retryAt=new Date(Date.now()+GPS_SYNC_RETRY_MS);

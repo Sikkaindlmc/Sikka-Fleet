@@ -38,13 +38,12 @@ function coordinate(value,min,max){
 }
 
 function normalizeIgnitionStatus(value){
- if(value==null||value==='')return 'N/A';
  if(value===true||value===1)return 'ON';
  if(value===false||value===0)return 'OFF';
- const status=String(value).trim().toLowerCase();
- if(/^(on|true|1|running)$/.test(status)||/ignition.*on/.test(status))return 'ON';
- if(/^(off|false|0|stopped)$/.test(status)||/ignition.*off/.test(status))return 'OFF';
- return 'N/A';
+ const status=String(value??'').trim().toUpperCase();
+ if(['ON','TRUE','1'].includes(status))return 'ON';
+ if(['OFF','FALSE','0'].includes(status))return 'OFF';
+ return 'UNKNOWN';
 }
 
 function normalizeRunningStatus(value,speed,ignition){
@@ -61,6 +60,10 @@ function normalizeRunningStatus(value,speed,ignition){
 function providerFields(record){
  const addressParts=typeof record.address==='object'&&record.address?record.address:{};
  return {
+  street:record.street||record.STREET||addressParts.house_number||addressParts.plot_number||addressParts.plot||'',
+  galiNumber:record.galiNumber||record.gali||addressParts.gali||'',
+  road:record.road||record.ROAD||addressParts.road||addressParts.pedestrian||addressParts.residential||'',
+  nearby:record.nearby||record.landmark||addressParts.amenity||addressParts.shop||addressParts.tourism||addressParts.leisure||addressParts.historic||'',
   locality:record.locality||record.LOCALITY||addressParts.locality||addressParts.suburb||'',
   city:record.city||record.CITY||addressParts.city||'',
   district:record.district||record.DISTRICT||addressParts.district||'',
@@ -71,24 +74,22 @@ function providerFields(record){
 }
 
 function mapRecord(record,provider,startedAt){
- const fleetx=provider==='Fleetx';
- const rawNumber=firstValue(record,fleetx?['vehicleNumber']:[
+ const rawNumber=firstValue(record,[
   'vehicleNumber','vehicleNo','registrationNo','registration_number','vehicle_number','vehicle',
   'rcNumber','name','VEHICLE_NUMBER','VEHICLE_NAME','vehicle_name'
  ]);
- const rawLatitude=firstValue(record,fleetx?['latitude']: [
+ const rawLatitude=firstValue(record,[
   'latitude','lat','LATITUDE','location.lat','location.latitude','gpsLocation.lat','currentLocation.lat'
  ]);
- const rawLongitude=firstValue(record,fleetx?['longitude']: [
+ const rawLongitude=firstValue(record,[
   'longitude','lng','lon','LONGITUDE','location.lng','location.longitude','gpsLocation.lng','currentLocation.lng'
  ]);
- const rawSpeed=firstValue(record,fleetx?['speed']:['speed','vehicleSpeed','currentSpeed','speedKph','SPEED']);
- const rawIgnition=firstValue(record,fleetx?['otherAttributes.ignition','ignition']: [
-  'ignition','ignitionStatus','engineStatus','engine_status','IGNITION','IGNITION_STATUS','ignition_status'
- ]);
- const rawTime=firstValue(record,fleetx?['lastUpdatedAt']: [
+ const rawSpeed=firstValue(record,['speed','vehicleSpeed','currentSpeed','speedKph','SPEED']);
+ const rawIgnition=record.ignition??null;
+ const rawTime=firstValue(record,[
   'gpsTime','timestamp','time','locationTime','lastSeen','updatedAt','lastUpdate','deviceTime',
-  'TIMESTAMP','TIME','CREATE_DATE','gps_time','dttimeInEpoch','dttime','createdDate','createdDateReadable'
+  'TIMESTAMP','TIME','CREATE_DATE','gps_time','dttimeInEpoch','dttime','createdDate',
+  'createdDateReadable','lastUpdatedAt'
  ]);
  const number=normalizeVehicleNumber(rawNumber);
  const lat=coordinate(rawLatitude,-90,90);
@@ -102,32 +103,33 @@ function mapRecord(record,provider,startedAt){
  else if(gpsTime>startedAt)reason='future timestamp';
  if(reason)return {reason};
 
- const rawHeading=firstValue(record,fleetx?['otherAttributes.course']:['heading','course','bearing','COURSE']);
+ const rawHeading=firstValue(record,['heading','course','bearing','COURSE']);
  const numericHeading=rawHeading===null?null:Number(rawHeading);
  const heading=Number.isFinite(numericHeading)?((numericHeading%360)+360)%360:null;
  const ignitionForStatus=normalizeIgnitionStatus(rawIgnition);
  const runningStatus=normalizeRunningStatus(
-  firstValue(record,fleetx?['currentStatus','status']:['runningStatus','running_status','movementStatus','MOVEMENT_STATUS']),
+  firstValue(record,['runningStatus','running_status','movementStatus','MOVEMENT_STATUS']),
   rawSpeed,ignitionForStatus
  );
+ const rawAddress=firstValue(record,[
+  'readableLocation','formattedAddress','fullAddress','currentAddress','ADDRESS',
+  'location.address','address.formattedAddress','address.formatted_address',
+  'address.fullAddress','address.display_name','address.label','address'
+ ]);
  return {
-  vehicleNumber:number,lat,lng,speed:rawSpeed,ignition:rawIgnition,gpsTime,
-  provider:fleetx?'FLEETX':'Wheelseye',heading,
-  providerAddress:firstValue(record,fleetx?['address']: [
-   'readableLocation','formattedAddress','fullAddress','address','currentAddress','ADDRESS',
-   'location.address','address.formattedAddress','address.formatted_address','address.fullAddress'
-  ])||'',
+  vehicleNumber:number,lat,lng,speed:rawSpeed,ignition:rawIgnition,
+  ignitionStatus:normalizeIgnitionStatus(rawIgnition),gpsTime,
+  provider:'Wheelseye',heading,
+  providerAddress:typeof rawAddress==='string'?rawAddress:'',
   providerFields:providerFields(record),runningStatus,
-  providerVehicleId:fleetx?record.vehicleId:
-   record.vehicleId??record.VEHICLE_ID??record.vehicle_id??record.id,
-  driverName:fleetx?record.driverName:
-   record.driverName??record.DRIVER_NAME??record.driver_name,
-  vehicleStatus:fleetx?record.currentStatus??record.status:
-   record.vehicleStatus??record.STATUS??record.status
+  providerVehicleId:record.vehicleId??record.VEHICLE_ID??record.vehicle_id??record.id,
+  driverName:record.driverName??record.DRIVER_NAME??record.driver_name,
+  vehicleStatus:record.vehicleStatus??record.STATUS??record.status
  };
 }
 
 function mapProviderPayload(payload,provider,{now=new Date()}={}){
+ if(provider!=='Wheelseye')throw new Error('Unsupported GPS provider');
  const sourceRows=findRows(payload)||[];
  const result={records:[],received:sourceRows.length,rejected:{}};
  for(const source of sourceRows){
@@ -141,4 +143,4 @@ function mapProviderPayload(payload,provider,{now=new Date()}={}){
  return result;
 }
 
-module.exports={mapProviderPayload,parseGpsTime};
+module.exports={mapProviderPayload,parseGpsTime,normalizeIgnitionStatus};

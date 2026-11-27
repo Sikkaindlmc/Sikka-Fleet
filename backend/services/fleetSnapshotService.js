@@ -1,12 +1,19 @@
 const {
  normalizeVehicleNumber,groupByVehicleNumber,vehicleNumberRegex
 }=require('./vehicleIdentity');
+const {normalizeIgnitionStatus}=require('./gpsProviderData');
 const vehicleNumberKey=normalizeVehicleNumber;
 
 function readableAddress(record){
+ if(record?.addressIsCurrent===false&&validGps(record))return `${record.lat}, ${record.lng}`;
  const value=record?.readableLocation||record?.address;
- return typeof value==='string'&&value.trim()&&!/^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/.test(value)
-  ?value.trim():null;
+ if(typeof value==='string'&&value.trim()&&
+  !/^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/.test(value)&&
+  !/^(?:address|location)\s+unavailable$/i.test(value.trim())&&
+  !/\b(?:undefined|null)\b/i.test(value)){
+  return value;
+ }
+ return validGps(record)?`${record.lat}, ${record.lng}`:'Location unavailable';
 }
 
 function elapsedStay(entryTime,now){
@@ -16,7 +23,9 @@ function elapsedStay(entryTime,now){
 }
 
 function validGps(record){
- return Number.isFinite(Number(record?.lat))&&Number(record.lat)>=-90&&Number(record.lat)<=90&&
+ return record?.lat!==null&&record?.lat!==undefined&&String(record.lat).trim()!==''&&
+  record?.lng!==null&&record?.lng!==undefined&&String(record.lng).trim()!==''&&
+  Number.isFinite(Number(record.lat))&&Number(record.lat)>=-90&&Number(record.lat)<=90&&
   Number.isFinite(Number(record?.lng))&&Number(record.lng)>=-180&&Number(record.lng)<=180;
 }
 
@@ -59,6 +68,11 @@ function preferredLive(records,vehicle){
   return new Date(b.gpsTime||0)-new Date(a.gpsTime||0)||
    new Date(b.syncedAt||b.updatedAt||0)-new Date(a.syncedAt||a.updatedAt||0);
  })[0];
+}
+
+function hasWheelsEyeProvider(vehicle){
+ return String(vehicle?.gpsLink||'').toUpperCase()==='WHEELSEYE'||
+  (vehicle?.gpsProviders||[]).some(link=>String(link?.name||'').toUpperCase()==='WHEELSEYE');
 }
 
 function selectCurrentStays(records,liveByNumber,plants,registeredNumbers){
@@ -130,11 +144,13 @@ async function getCurrentVehicle(models,vehicleNumber,{includeInactive=false}={}
  const storedNumber=normalizeVehicleNumber(vehicle.vehicleNumber);
  const matcher=vehicleNumberRegex(storedNumber);
  const [allLive,allStays,plants]=await Promise.all([
-  models.VehicleLiveStatus.find({vehicleNumber:matcher}).lean(),
+  models.VehicleLiveStatus.find({vehicleNumber:matcher,provider:'Wheelseye'}).lean(),
   models.VehiclePlantStay.find({vehicle:matcher,exitTime:null}).populate('plant').lean(),
   models.Plant.find({status:'Active'}).lean()
  ]);
- const live=preferredLive(allLive.filter(item=>normalizeVehicleNumber(item.vehicleNumber)===storedNumber),vehicle)||null;
+ const live=hasWheelsEyeProvider(vehicle)
+  ?preferredLive(allLive.filter(item=>normalizeVehicleNumber(item.vehicleNumber)===storedNumber&&item.provider==='Wheelseye'),vehicle)||null
+  :null;
  const stayRecords=allStays.filter(item=>normalizeVehicleNumber(item.vehicle)===storedNumber);
  const stays=selectCurrentStays(stayRecords,new Map([[storedNumber,live]]),plants,new Set([storedNumber]));
  const stay=stays.get(storedNumber)||null;
@@ -146,32 +162,41 @@ async function getOperationalSnapshot(models,now=new Date(),{includeMetadata=tru
   models.Plant.find({status:'Active'}).lean(),
   models.Vehicle.find({status:'Active'}).select('vehicleNumber fleetType gpsLink providerVehicleId gpsProviders driver mobile plant createdAt updatedAt').lean(),
   models.VehiclePlantStay.find({exitTime:null}).populate('plant').lean(),
-  includeMetadata?models.GpsProviderStatus.find().lean():Promise.resolve([]),
-  includeMetadata?models.SyncLog.findOne().sort({startedAt:-1}).lean():Promise.resolve(null)
+  includeMetadata?models.GpsProviderStatus.find({provider:'Wheelseye'}).lean():Promise.resolve([]),
+  includeMetadata?models.SyncLog.findOne().sort({startedAt:-1})
+   .select('startedAt finishedAt type success status totalRegisteredVehicles successfulVehicles failedVehicles').lean():Promise.resolve(null)
  ]);
  const vehicles=[...groupByVehicleNumber(rawVehicles).entries()].map(([vehicleNumber,records])=>({
   ...preferredVehicle(records),vehicleNumber,normalizedVehicleNumber:vehicleNumber
  }));
+ const wheelsEyeVehicles=vehicles.filter(hasWheelsEyeProvider);
  const vehicleByNumber=new Map(vehicles.map(vehicle=>[vehicleNumberKey(vehicle.vehicleNumber),vehicle]));
- const registeredNumbers=new Set(vehicleByNumber.keys());
- const rawLive=await models.VehicleLiveStatus.find({}).lean();
+ const wheelsEyeNumbers=new Set(wheelsEyeVehicles.map(vehicle=>vehicleNumberKey(vehicle.vehicleNumber)));
+ const rawLive=await models.VehicleLiveStatus.find({provider:'Wheelseye'}).lean();
  const liveByNumber=new Map();
  for(const [vehicleNumber,records] of groupByVehicleNumber(rawLive).entries()){
   const vehicle=vehicleByNumber.get(vehicleNumber);
-  if(!vehicle)continue;
+  if(!vehicle||!wheelsEyeNumbers.has(vehicleNumber))continue;
   const selected=preferredLive(records,vehicle);
   if(selected)liveByNumber.set(vehicleNumber,{...selected,vehicleNumber,normalizedVehicleNumber:vehicleNumber});
  }
  const live=[...liveByNumber.values()].sort((a,b)=>a.vehicleNumber.localeCompare(b.vehicleNumber));
- const currentStays=selectCurrentStays(rawStays,liveByNumber,plants,registeredNumbers);
+ const currentStays=selectCurrentStays(rawStays,liveByNumber,plants,wheelsEyeNumbers);
  const groups=plants.map(plant=>{
   const rows=[...currentStays.values()].filter(stay=>stay.plant&&String(stay.plant._id)===String(plant._id)).map(stay=>{
    const gps=liveByNumber.get(vehicleNumberKey(stay.vehicle));
    return {
-    vehicleNumber:stay.vehicle,entryTime:stay.entryTime,...elapsedStay(stay.entryTime,now),
+    vehicleNumber:stay.vehicle,
+    vehicleId:String(vehicleByNumber.get(vehicleNumberKey(stay.vehicle))?._id||''),
+    entryTime:stay.entryTime,...elapsedStay(stay.entryTime,now),
     location:readableAddress(gps),addressIsCurrent:Boolean(gps?.addressIsCurrent),
+    street:gps?.street||'',galiNumber:gps?.galiNumber||'',road:gps?.road||'',
+    nearby:gps?.nearby||'',city:gps?.city||'',cityOrVillage:gps?.cityOrVillage||gps?.city||'',
+    district:gps?.district||'',
+    state:gps?.state||'',pincode:gps?.pincode||'',
     lat:gps?.lat??null,lng:gps?.lng??null,gpsTime:gps?.gpsTime??null,
     speed:gps?.speed??'N/A',ignition:gps?.ignition??'N/A',
+    ignitionStatus:normalizeIgnitionStatus(gps?.ignitionStatus??gps?.ignition),
     provider:gps?.provider||null,hasGps:Boolean(gps),stale:Boolean(gps?.stale)
    };
   });
@@ -196,20 +221,29 @@ async function getOperationalSnapshot(models,now=new Date(),{includeMetadata=tru
   vehicleNumber:record.vehicleNumber,
   leftPlant:lastStayByVehicle.get(record.vehicleNumber)?.plant?.name||'Not recorded',
   location:readableAddress(record),addressIsCurrent:Boolean(record.addressIsCurrent),
+  street:record.street||'',galiNumber:record.galiNumber||'',road:record.road||'',
+  nearby:record.nearby||'',city:record.city||'',cityOrVillage:record.cityOrVillage||record.city||'',
+  district:record.district||'',
+  state:record.state||'',pincode:record.pincode||'',
   latitude:record.lat,longitude:record.lng,lastGpsUpdatedAt:record.gpsTime,
-  speed:record.speed,ignition:record.ignition,provider:record.provider,stale:Boolean(record.stale)
+  speed:record.speed,ignition:record.ignition,
+  ignitionStatus:normalizeIgnitionStatus(record.ignitionStatus??record.ignition),
+  provider:record.provider,stale:Boolean(record.stale)
  }));
- const trackingRows=vehicles.map(vehicle=>{
+ const trackingRows=wheelsEyeVehicles.map(vehicle=>{
   const record=liveByNumber.get(vehicleNumberKey(vehicle.vehicleNumber));
   return record?{
-   ...record,location:readableAddress(record),fleetType:vehicle.fleetType,
+   ...record,vehicleId:String(vehicle._id||''),location:readableAddress(record),fleetType:vehicle.fleetType,
    driver:vehicle.driver||'',driverName:record.driverName||vehicle.driver||'',
    mobile:vehicle.mobile||'',plant:vehicle.plant||''
   }:{
-   vehicleNumber:vehicle.vehicleNumber,normalizedVehicleNumber:vehicleNumberKey(vehicle.vehicleNumber),
-   provider:vehicle.gpsLink,fleetType:vehicle.fleetType,driver:vehicle.driver||'',
+   vehicleId:String(vehicle._id||''),vehicleNumber:vehicle.vehicleNumber,
+   normalizedVehicleNumber:vehicleNumberKey(vehicle.vehicleNumber),
+   provider:'Wheelseye',fleetType:vehicle.fleetType,driver:vehicle.driver||'',
    mobile:vehicle.mobile||'',plant:vehicle.plant||'',speed:'N/A',ignition:'N/A',
-   runningStatus:'Unknown',location:null,stale:false,noGpsData:true
+   ignitionStatus:'UNKNOWN',
+   runningStatus:'Unknown',location:'Location unavailable',addressIsCurrent:false,
+   lat:null,lng:null,stale:false,noGpsData:true
   };
  }).sort((a,b)=>a.vehicleNumber.localeCompare(b.vehicleNumber));
  const freshRows=trackingRows.filter(record=>!record.stale&&!record.noGpsData);
@@ -220,21 +254,22 @@ async function getOperationalSnapshot(models,now=new Date(),{includeMetadata=tru
   transit:{count:transitRows.length,rows:transitRows},
   live:trackingRows,
   liveRecords:live,
-  registeredVehicles:vehicles.map(vehicle=>({
+  registeredVehicles:wheelsEyeVehicles.map(vehicle=>({
    vehicleNumber:vehicle.vehicleNumber,
-   provider:vehicle.gpsLink||liveByNumber.get(vehicle.vehicleNumber)?.provider,
+   provider:'Wheelseye',
    providerVehicleId:vehicle.providerVehicleId||liveByNumber.get(vehicle.vehicleNumber)?.providerVehicleId
   })),
-  registeredCount:vehicles.length,
+  registeredCount:wheelsEyeVehicles.length,
   summary:{
    moving:freshRows.filter(record=>record.runningStatus==='Moving').length,
    stopped:freshRows.filter(record=>record.runningStatus==='Stopped').length,
-   ignitionOn:freshRows.filter(record=>record.ignition==='ON').length,
-   ignitionOff:freshRows.filter(record=>record.ignition==='OFF').length,
-   notResponding:Math.max(0,vehicles.length-new Set(freshRows.map(record=>record.vehicleNumber)).size),
+   ignitionOn:trackingRows.filter(record=>normalizeIgnitionStatus(record.ignitionStatus??record.ignition)==='ON').length,
+   ignitionOff:trackingRows.filter(record=>normalizeIgnitionStatus(record.ignitionStatus??record.ignition)==='OFF').length,
+   ignitionUnknown:trackingRows.filter(record=>normalizeIgnitionStatus(record.ignitionStatus??record.ignition)==='UNKNOWN').length,
+   notResponding:Math.max(0,wheelsEyeVehicles.length-new Set(freshRows.map(record=>record.vehicleNumber)).size),
    apiErrors:providers.filter(provider=>provider.status==='Error').length
   },
-  providers,lastSync
+  providers:providers.filter(provider=>provider.provider==='Wheelseye'),lastSync
  };
 }
 

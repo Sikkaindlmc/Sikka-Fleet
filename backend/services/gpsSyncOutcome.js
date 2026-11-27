@@ -22,18 +22,10 @@ async function persistMatchedRecords({
  return {receivedNumbers,savedNumbers,vehicleNumberMismatches,saveErrors};
 }
 
-function aggregateSyncOutcome(providerResults,{failedVehicleCount=0,geofenceError=null}={}){
- const enabled=Object.values(providerResults).filter(result=>result.enabled!==false);
- const succeeded=enabled.filter(result=>result.ok);
- const allEnabledSucceeded=enabled.length>0&&succeeded.length===enabled.length;
- const anyEnabledSucceeded=succeeded.length>0;
- const status=allEnabledSucceeded&&failedVehicleCount===0&&!geofenceError
-  ?'Successful'
-  :anyEnabledSucceeded||failedVehicleCount>0?'Partial':'Failed';
+function aggregateSyncOutcome(providerResult,{geofenceError=null}={}){
+ const success=Boolean(providerResult?.ok&&!geofenceError);
  return {
-  status,success:status==='Successful',partialSuccess:status==='Partial',
-  enabledProviderCount:enabled.length,succeededProviderCount:succeeded.length,
-  failedProviderCount:enabled.length-succeeded.length
+  status:success?'Successful':'Failed',success
  };
 }
 

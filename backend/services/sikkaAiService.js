@@ -247,13 +247,22 @@ function formatDuration(value){
 }
 
 function readableLocation(record){
+ if(record?.addressIsCurrent===false&&validCoordinates(record?.lat,record?.lng)){
+  return `${record.lat}, ${record.lng}`;
+ }
  const value=record?.readableLocation||record?.address;
- return typeof value==='string'&&value.trim()&&!/^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/.test(value)
-  ?value.trim():'Readable location unavailable';
+ if(typeof value==='string'&&value.trim()&&
+  !/^\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*$/.test(value)&&
+  !/^(?:address|location)\s+unavailable$/i.test(value.trim())&&
+  !/\b(?:undefined|null)\b/i.test(value)){
+  return value;
+ }
+ return validCoordinates(record?.lat,record?.lng)?`${record.lat}, ${record.lng}`:'Location unavailable';
 }
 
 function validCoordinates(lat,lng){
- return lat!=null&&lng!=null&&Number.isFinite(Number(lat))&&Number.isFinite(Number(lng))&&
+ return lat!=null&&lng!=null&&String(lat).trim()!==''&&String(lng).trim()!==''&&
+  Number.isFinite(Number(lat))&&Number.isFinite(Number(lng))&&
   Number(lat)>=-90&&Number(lat)<=90&&Number(lng)>=-180&&Number(lng)<=180;
 }
 
@@ -263,7 +272,7 @@ function hasGpsConfiguration(vehicle){
 }
 
 function isSupportedGpsRecord(record){
- return !record?.provider||record.provider===GPS_PROVIDER;
+ return record?.provider===GPS_PROVIDER;
 }
 
 function isCurrentGpsRecord(record,now){
@@ -297,8 +306,8 @@ async function getAiGpsVehicleRows(models,now){
  const [registered,liveRecords,plants,openStays]=await Promise.all([
   models.Vehicle.find({status:'Active'})
    .select('vehicleNumber gpsLink gpsProviders status').lean(),
-  models.VehicleLiveStatus.find({})
-   .select('vehicleNumber lat lng address readableLocation gpsTime syncedAt updatedAt stale provider speed ignition runningStatus vehicleStatus').lean(),
+  models.VehicleLiveStatus.find({provider:GPS_PROVIDER})
+   .select('vehicleNumber lat lng address readableLocation street galiNumber road nearby locality city cityOrVillage district state pincode addressIsCurrent gpsTime syncedAt updatedAt stale provider speed ignition runningStatus vehicleStatus').lean(),
   models.Plant.find({status:'Active'}).lean(),
   models.VehiclePlantStay.find({exitTime:null}).populate('plant').lean()
  ]);
@@ -309,9 +318,9 @@ async function getAiGpsVehicleRows(models,now){
  const rows=[];
  for(const [vehicleNumber,vehicles] of registeredByNumber){
   const vehicle=vehicles[0];
+  if(!hasGpsConfiguration(vehicle))continue;
   const records=(liveByNumber.get(vehicleNumber)||[]).filter(isSupportedGpsRecord);
   const lastGps=latestGpsRecord(records,now);
-  if(!hasGpsConfiguration(vehicle)&&!records.some(record=>record.provider||validCoordinates(record.lat,record.lng)))continue;
   const current=isCurrentGpsRecord(lastGps,now);
   const currentStays=staysByNumber.get(vehicleNumber)||[];
   const candidatePlants=[];
@@ -334,14 +343,20 @@ async function getAiGpsVehicleRows(models,now){
     candidatePlants.push({plant,stay,confirmed:false});
    }
   }
-  const provider=lastGps?.provider||vehicle.gpsLink||
-   (vehicle.gpsProviders||[]).find(item=>item?.name===GPS_PROVIDER)?.name||'N/A';
+  const provider=lastGps?.provider||GPS_PROVIDER;
   const status=current
    ?lastGps.runningStatus||'GPS current'
    :lastGps?'Stale':'GPS data unavailable';
   const base={
-   vehicleNumber,provider,lat:lastGps?.lat??null,lng:lastGps?.lng??null,
-   location:lastGps?readableLocation(lastGps):null,
+   vehicleId:String(vehicle._id||''),vehicleNumber,provider,lat:lastGps?.lat??null,lng:lastGps?.lng??null,
+   location:lastGps?readableLocation(lastGps):'Location unavailable',
+   street:lastGps?.street||'',galiNumber:lastGps?.galiNumber||'',road:lastGps?.road||'',
+   nearby:lastGps?.nearby||'',city:lastGps?.city||'',
+   cityOrVillage:lastGps?.cityOrVillage||lastGps?.city||'',district:lastGps?.district||'',
+   state:lastGps?.state||'',pincode:lastGps?.pincode||'',
+   addressIsCurrent:Boolean(lastGps?.addressIsCurrent),
+   map:lastGps&&validCoordinates(lastGps.lat,lastGps.lng)
+    ?`https://www.google.com/maps?q=${lastGps.lat},${lastGps.lng}`:null,
    gpsTime:lastGps?.gpsTime||null,lastUpdate:lastGps?.syncedAt||lastGps?.updatedAt||null,
    status,stale:Boolean(lastGps&&!current),currentGps:current,
    plantName:confirmedPlant?.name||null,
@@ -362,9 +377,14 @@ function mapHistoryRecord(record){
   time:record.gpsTime,
   lastUpdate:record.syncedAt||null,
   address:readableLocation(record),
+  street:record.street||'',galiNumber:record.galiNumber||'',road:record.road||'',
+  nearby:record.nearby||'',city:record.city||'',
+  cityOrVillage:record.cityOrVillage||record.city||'',district:record.district||'',
+  state:record.state||'',pincode:record.pincode||'',
+  addressIsCurrent:Boolean(record.addressIsCurrent),
   lat:record.lat??null,
   lng:record.lng??null,
-  provider:record.provider||'N/A',
+  provider:record.provider||GPS_PROVIDER,
   status:record.vehicleStatus||'N/A',
   speed:record.speed??'N/A',
   ignition:record.ignition??'N/A',
@@ -493,7 +513,7 @@ function cleanChatQuestion(value){
  return String(value||'').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g,' ');
 }
 
-async function answerQuestion(question,{models=M,now=new Date(),previousLanguage,permissions}={}){
+async function answerQuestion(question,{models=M,now=new Date(),previousLanguage,permissions,resolveLocation}={}){
  const query=String(question||'').trim();
  const language=detectLanguage(query,previousLanguage);
  if(!query.trim())return answerText(
@@ -550,7 +570,7 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
 
  if(/\b(sync|provider|gps status|connection|data status)\b/.test(normalized)){
   if(!hasPageAccess(permissions,'gpsTrack'))return accessDenied(language,'gpsTrack');
-  const providers=await models.GpsProviderStatus.find()
+  const providers=await models.GpsProviderStatus.find({provider:GPS_PROVIDER})
    .select('provider status lastSuccessTime vehicleCount vehiclesReceived vehiclesNotResponding')
    .lean();
   return answerText(
@@ -604,7 +624,7 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   );
   const storedNumber=registered.vehicleNumber;
   const matcher=vehicleNumberRegex(storedNumber);
-  const vehicleFilter={$or:[{vehicleNumber:matcher},{vehicle:matcher}],provider:{$in:[null,GPS_PROVIDER]}};
+  const vehicleFilter={$or:[{vehicleNumber:matcher},{vehicle:matcher}],provider:GPS_PROVIDER};
   const filter={...vehicleFilter,gpsTime:{$gte:start,$lte:end}};
   const [records,total]=await Promise.all([
    models.VehicleLocationHistory.find(filter).sort({gpsTime:1}).limit(20).lean(),
@@ -643,7 +663,7 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   );
   const filter={
    $or:[{vehicleNumber:{$in:vehicleNumbers}},{vehicle:{$in:vehicleNumbers}}],
-   provider:{$in:[null,GPS_PROVIDER]},
+   provider:GPS_PROVIDER,
    gpsTime:{$gte:start,$lte:end}
   };
   const [records,total]=await Promise.all([
@@ -815,7 +835,10 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   const cutoff=getHistoryCutoff(now);
   const liveTime=liveRecord?.gpsTime?new Date(liveRecord.gpsTime):null;
   const liveIsRecent=isCurrentGpsRecord(liveRecord,now)&&liveTime>=cutoff;
-  const live=liveIsRecent?liveRecord:null;
+  let live=liveIsRecent?liveRecord:null;
+  if(live&&typeof resolveLocation==='function'&&validCoordinates(live.lat,live.lng)){
+   live=await resolveLocation(live);
+  }
   let lastKnown=liveRecord&&liveIsRecent?liveRecord:null;
   if(!lastKnown){
    const history=await models.VehicleLocationHistory.find({
@@ -824,7 +847,7 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
       {vehicleNumber:vehicleNumberRegex(vehicle.vehicleNumber)},
       {vehicle:vehicleNumberRegex(vehicle.vehicleNumber)}
      ]},
-     {provider:{$in:[null,GPS_PROVIDER]}},
+     {provider:GPS_PROVIDER},
      {gpsTime:{$gte:cutoff,$lte:now}}
     ]
    }).sort({gpsTime:-1}).limit(1).lean();
@@ -839,7 +862,9 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
      'vehicleUnavailable',{vehicleNumber},language
     );
    }
-   const location=record?readableLocation(record):null;
+   const resolvedRecord=record&&typeof resolveLocation==='function'&&validCoordinates(record.lat,record.lng)
+    ?await resolveLocation(record):record;
+   const location=resolvedRecord?readableLocation(resolvedRecord):null;
    const gpsTime=record?.gpsTime||null;
    const map=record&&validCoordinates(record.lat,record.lng)
     ?`https://www.google.com/maps?q=${record.lat},${record.lng}`:null;
@@ -848,10 +873,16 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
     :localized(language,'Live GPS data for this vehicle is not available, and no last-known record was found in the permitted 45-day range.','इस वाहन का लाइव GPS डेटा उपलब्ध नहीं है और अनुमत 45 दिनों में पिछला रिकॉर्ड नहीं मिला।');
    return answerText(text,'vehicleMissing',{
     vehicleNumber,location,speed:record?.speed??'N/A',ignition:record?.ignition??'N/A',
-    gpsTime,provider:record?.provider||liveRecord?.provider||vehicle.gpsLink||'N/A',
+    gpsTime,provider:record?.provider||liveRecord?.provider||(hasGpsConfiguration(vehicle)?GPS_PROVIDER:'No GPS provider'),
+    addressIsCurrent:Boolean(resolvedRecord?.addressIsCurrent),
     plantName:'Availability not confirmed',nearestPlantName:stay?.plant?.name||null,
-    lastUpdate:record?.syncedAt||record?.updatedAt||null,
-    lat:record?.lat??null,lng:record?.lng??null,map,stale:true
+    lastUpdate:resolvedRecord?.syncedAt||resolvedRecord?.updatedAt||null,
+    street:resolvedRecord?.street||'',galiNumber:resolvedRecord?.galiNumber||'',
+    road:resolvedRecord?.road||'',nearby:resolvedRecord?.nearby||'',
+    city:resolvedRecord?.city||'',cityOrVillage:resolvedRecord?.cityOrVillage||resolvedRecord?.city||'',
+    district:resolvedRecord?.district||'',
+    state:resolvedRecord?.state||'',pincode:resolvedRecord?.pincode||'',
+    lat:resolvedRecord?.lat??null,lng:resolvedRecord?.lng??null,map,stale:true
    },language);
   }
   const stayDate=stay?.entryTime?new Date(stay.entryTime):null;
@@ -871,11 +902,16 @@ async function answerQuestion(question,{models=M,now=new Date(),previousLanguage
   const ignition=live.ignition==null?'N/A':String(live.ignition);
   const map=validCoordinates(live.lat,live.lng)?`https://www.google.com/maps?q=${live.lat},${live.lng}`:null;
   const text=language==='hi'
-   ?`${vehicleNumber} की लोकेशन: ${location}। स्पीड: ${speed}; IGN: ${ignition}; GPS समय: ${live.gpsTime?new Date(live.gpsTime).toLocaleString('en-IN',{timeZone:TIME_ZONE}):'N/A'}; प्रदाता: ${live.provider||vehicle.gpsLink||'N/A'}; स्थिति: ${live.runningStatus||live.vehicleStatus||'Unknown'}; प्लांट: ${plantName}${!plantConfirmed&&nearestPlantName?`; निकटतम प्लांट: ${nearestPlantName}`:''}${stayAllowed?`; प्रवेश: ${new Date(stay.entryTime).toLocaleString('en-IN',{timeZone:TIME_ZONE})}; ठहराव: ${formatDuration(stayDuration)}`:stay?' प्लांट में 45 दिनों से अधिक समय से है':''}।`
-   :`${vehicleNumber} location: ${location}. Speed: ${speed}; ignition: ${ignition}; GPS time: ${live.gpsTime?new Date(live.gpsTime).toLocaleString('en-IN',{timeZone:TIME_ZONE}):'N/A'}; provider: ${live.provider||vehicle.gpsLink||'N/A'}; status: ${live.runningStatus||live.vehicleStatus||'Unknown'}; plant: ${plantName}${!plantConfirmed&&nearestPlantName?`; nearest plant: ${nearestPlantName}`:''}${stayAllowed?`; entry: ${new Date(stay.entryTime).toLocaleString('en-IN',{timeZone:TIME_ZONE})}; stay: ${formatDuration(stayDuration)}`:stay?' in plant for more than 45 days':''}.`;
+   ?`${vehicleNumber} की लोकेशन: ${location}। स्पीड: ${speed}; IGN: ${ignition}; GPS समय: ${live.gpsTime?new Date(live.gpsTime).toLocaleString('en-IN',{timeZone:TIME_ZONE}):'N/A'}; प्रदाता: ${live.provider||GPS_PROVIDER}; स्थिति: ${live.runningStatus||live.vehicleStatus||'Unknown'}; प्लांट: ${plantName}${!plantConfirmed&&nearestPlantName?`; निकटतम प्लांट: ${nearestPlantName}`:''}${stayAllowed?`; प्रवेश: ${new Date(stay.entryTime).toLocaleString('en-IN',{timeZone:TIME_ZONE})}; ठहराव: ${formatDuration(stayDuration)}`:stay?' प्लांट में 45 दिनों से अधिक समय से है':''}।`
+   :`${vehicleNumber} location: ${location}. Speed: ${speed}; ignition: ${ignition}; GPS time: ${live.gpsTime?new Date(live.gpsTime).toLocaleString('en-IN',{timeZone:TIME_ZONE}):'N/A'}; provider: ${live.provider||GPS_PROVIDER}; status: ${live.runningStatus||live.vehicleStatus||'Unknown'}; plant: ${plantName}${!plantConfirmed&&nearestPlantName?`; nearest plant: ${nearestPlantName}`:''}${stayAllowed?`; entry: ${new Date(stay.entryTime).toLocaleString('en-IN',{timeZone:TIME_ZONE})}; stay: ${formatDuration(stayDuration)}`:stay?' in plant for more than 45 days':''}.`;
   return answerText(text,'vehicle',{
    vehicleNumber,location,speed,ignition,gpsTime:live.gpsTime||null,
-   lastUpdate:live.syncedAt||live.updatedAt||null,provider:live.provider||vehicle.gpsLink||'N/A',
+   lastUpdate:live.syncedAt||live.updatedAt||null,provider:live.provider||GPS_PROVIDER,
+   addressIsCurrent:Boolean(live.addressIsCurrent),
+   street:live.street||'',galiNumber:live.galiNumber||'',road:live.road||'',
+   nearby:live.nearby||'',city:live.city||'',cityOrVillage:live.cityOrVillage||live.city||'',
+   district:live.district||'',
+   state:live.state||'',pincode:live.pincode||'',
    plantName,nearestPlantName,plantConfirmed,status:live.runningStatus||live.vehicleStatus||'Unknown',
    entryTime:stayAllowed?stay.entryTime:null,
    stay:stayDuration?formatDuration(stayDuration):stay?'45+ days':null,

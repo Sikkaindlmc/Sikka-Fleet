@@ -1,6 +1,6 @@
 const test=require('node:test');
 const assert=require('node:assert/strict');
-const {getOperationalSnapshot}=require('../services/fleetSnapshotService');
+const {getOperationalSnapshot,readableAddress}=require('../services/fleetSnapshotService');
 
 const now=new Date('2026-11-22T10:00:00.000Z');
 const chain=rows=>({
@@ -8,6 +8,12 @@ const chain=rows=>({
  sort(){return this},
  populate(){return this},
  lean(){return Promise.resolve(rows)}
+});
+
+test('snapshot address falls back to coordinates instead of an unavailable sentinel',()=>{
+ assert.equal(readableAddress({
+  lat:28.6692,lng:77.4538,readableLocation:'Address unavailable'
+ }),'28.6692, 77.4538');
 });
 
 test('snapshot counts one registered vehicle once across provider/live/stay duplicates',async()=>{
@@ -33,8 +39,8 @@ test('snapshot counts one registered vehicle once across provider/live/stay dupl
   VehicleLiveStatus:{find:()=>chain([
    {vehicleNumber:'UP14GT0100',provider:'Wheelseye',gpsTime:new Date('2026-11-22T08:00:00Z'),lat:28,lng:77,stale:false},
    {vehicleNumber:'UP 14-GT-0100',provider:'Wheelseye',gpsTime:new Date('2026-11-22T09:00:00Z'),lat:28,lng:77,stale:false},
-   {vehicleNumber:'DL01AA1234',provider:'Wheelseye',gpsTime:new Date('2026-11-22T09:30:00Z'),lat:28.2,lng:77.2,stale:false},
-   {vehicleNumber:'MH02BB9876',provider:'Wheelseye',gpsTime:new Date('2026-11-22T09:45:00Z'),lat:28.0002,lng:77.0002,stale:false}
+   {vehicleNumber:'DL01AA1234',provider:'Wheelseye',gpsTime:new Date('2026-11-22T09:30:00Z'),lat:28.2,lng:77.2,ignition:false,stale:false},
+   {vehicleNumber:'MH02BB9876',provider:'Wheelseye',gpsTime:new Date('2026-11-22T09:45:00Z'),lat:28.0002,lng:77.0002,ignition:true,stale:false}
   ])},
   GpsProviderStatus:{find:()=>chain([])},
   SyncLog:{findOne:()=>chain(null)}
@@ -45,6 +51,9 @@ test('snapshot counts one registered vehicle once across provider/live/stay dupl
  assert.equal(snapshot.live.length,4);
  assert.equal(snapshot.live.find(record=>record.vehicleNumber==='KA03CC4567').noGpsData,true);
  assert.equal(snapshot.summary.notResponding,1);
+ assert.equal(snapshot.summary.ignitionOn,1);
+ assert.equal(snapshot.summary.ignitionOff,1);
+ assert.equal(snapshot.summary.ignitionUnknown,2);
  const truck=snapshot.live.find(record=>record.vehicleNumber==='UP14GT0100');
  assert.equal(truck.provider,'Wheelseye');
  assert.deepEqual(snapshot.plants.map(plant=>plant.count),[2,0]);
