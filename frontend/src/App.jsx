@@ -13,6 +13,7 @@ import './permissions.css';
 import './chat.css';
 import './gps.css';
 import './error.css';
+import {getErrorMessage,getGpsSyncErrorDetails,isGpsSyncSuccessful,isRecordResponse,normalizeDashboardData} from './errorHandling.js';
 
 const API_BASE_URL=String(import.meta.env.VITE_API_BASE_URL||'/api').trim().replace(/\/+$/,'');
 axios.defaults.baseURL=API_BASE_URL;axios.defaults.withCredentials=true;
@@ -301,43 +302,51 @@ function Layout(){
 function NavLink({to,name,icon:Icon,onClick}){const loc=useLocation();const navigate=useNavigate();const active=loc.pathname===to||loc.pathname.startsWith(to+'/');return <button className={`nav-link ${active?'active':''}`} onClick={()=>{navigate(to);onClick?.()}}><Icon size={19}/><span>{name}</span></button>}
 
 function objectRows(value){return Array.isArray(value)?value.filter(item=>item&&typeof item==='object'&&!Array.isArray(item)):[]}
-function dashboardData(value){
- const response=value&&typeof value==='object'&&!Array.isArray(value)?value:{};
- const transit=response.transit&&typeof response.transit==='object'&&!Array.isArray(response.transit)?response.transit:{};
- const count=value=>{const number=Number(value);return Number.isFinite(number)&&number>=0?number:0};
- return {
-  ...response,
-  plants:objectRows(response.plants).map(plant=>({...plant,count:count(plant.count),rows:objectRows(plant.rows)})),
-  transit:{...transit,count:count(transit.count),rows:objectRows(transit.rows)}
- };
+const GPS_SYNC_SUMMARY_FIELDS=[
+ ['Active Registered Vehicles','activeRegisteredVehicles'],
+ ['Successfully Synced','successfullySyncedVehicles'],
+ ['GPS Not Available','activeVehiclesWithoutGpsData'],
+ ['Inactive Vehicles Skipped','inactiveVehiclesSkipped'],
+ ['Unregistered Records Ignored','unregisteredGpsRecordsIgnored'],
+ ['Actual Errors','actualErrors']
+];
+function gpsSyncSummaryFields(summary){
+ if(!isRecordResponse(summary))return [];
+ return GPS_SYNC_SUMMARY_FIELDS
+  .filter(([,key])=>Number.isFinite(summary[key]))
+  .map(([label,key])=>[label,summary[key]]);
+}
+function gpsSyncSummaryText(summary){
+ const fields=gpsSyncSummaryFields(summary);
+ return fields.length?fields.map(([label,value])=>`${label}: ${value}`).join('; '):'';
 }
 function Dashboard(){
  const {user}=useAuth();
  const canManage=canEdit(user,'dashboard');
  const canSync=canManage||canEdit(user,'gpsTrack');
  const canTrack=canView(user,'gpsTrack');
- const [data,setData]=useState(null);const [syncStatus,setSyncStatus]=useState(null);const [loadError,setLoadError]=useState(null);const [countdown,setCountdown]=useState('--:--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
+ const [data,setData]=useState(null);const [syncStatus,setSyncStatus]=useState(null);const [countdown,setCountdown]=useState('--:--:--');const [plantModal,setPlantModal]=useState(null);const [transitModal,setTransitModal]=useState(false);const [planModal,setPlanModal]=useState(null);const [planDetails,setPlanDetails]=useState(null);const [plan,setPlan]=useState({planType:'Loading',remarks:'',expectedDeparture:''});const [planSaving,setPlanSaving]=useState(false);const [plansVersion,setPlansVersion]=useState(0);
  const loadInFlight=useRef(false);const refreshQueued=useRef(false);const syncInFlight=useRef(false);const previousSyncAt=useRef(null);
  const transitLocationBatch=useLocationBatch(transitModal,data?.transit?.rows||[]);
  const loadSyncStatus=async()=>{
   try{
-   const nextStatus=(await axios.get('/sync/status')).data;
+   const responseData=(await axios.get('/sync/status')).data;
+   const nextStatus=isRecordResponse(responseData)?responseData:null;
    const previous=previousSyncAt.current;
-   previousSyncAt.current=nextStatus.lastSyncAt||null;
+   previousSyncAt.current=nextStatus?.lastSyncAt||null;
    setSyncStatus(nextStatus);
-   if(previous&&nextStatus.lastSyncAt&&new Date(nextStatus.lastSyncAt)>new Date(previous))void load(true);
-  }catch(error){showToast(error.response?.data?.error||'Failed to load GPS sync status','error')}
+   if(previous&&nextStatus?.lastSyncAt&&new Date(nextStatus.lastSyncAt)>new Date(previous))void load(true);
+  }catch(error){setSyncStatus(null);showToast(getErrorMessage(error,'Failed to load GPS sync status'),'error')}
  };
  const load=async(silent=false)=>{
   if(loadInFlight.current){if(silent)refreshQueued.current=true;return}
   loadInFlight.current=true;
   try{
    const r=await axios.get('/dashboard');
-   const responseData=dashboardData(r.data);
+   const responseData=normalizeDashboardData(r.data);
    setData(responseData);
-   setLoadError(null);
   }
-  catch(error){if(!silent){setData(null);setLoadError(error);showToast('Cannot reach server','error')}}
+  catch(error){if(!silent){setData(normalizeDashboardData(null));showToast(getErrorMessage(error,'Dashboard data is temporarily unavailable'),'error')}}
   finally{
    loadInFlight.current=false;
    if(refreshQueued.current){refreshQueued.current=false;void load(true)}
@@ -375,18 +384,15 @@ function Dashboard(){
   void loadSyncStatus();
   try{
    const response=await axios.post('/sync');
-   const result=response.data;
-   const details=Object.values(result.result||{}).flatMap(providerResult=>providerResult.errors||[])
-    .slice(0,2).map(error=>error.vehicleNumber?`${error.vehicleNumber}: ${error.message}`:error.message).join('; ');
-   showToast(result.success
-    ?`GPS sync successful: ${result.totalVehiclesSynced||0} vehicle(s) synchronized.${result.warnings?.length?` ${result.warnings.join('; ')}`:''}`
-    :result.message||result.error||result.result?.message||details||'GPS synchronization did not complete',
-    result.success?'success':'error');
+   const result=isRecordResponse(response.data)?response.data:{};
+   const details=getGpsSyncErrorDetails(result).slice(0,2).join('; ');
+   const succeeded=isGpsSyncSuccessful(result);
+   const message=succeeded
+    ?`GPS sync successful: ${Number(result.totalVehiclesSynced)||0} vehicle(s) synchronized.${gpsSyncSummaryText(result.result?.syncSummary)?` ${gpsSyncSummaryText(result.result.syncSummary)}.`:''}${Array.isArray(result.warnings)&&result.warnings.length?` ${result.warnings.join('; ')}`:''}`
+    :getErrorMessage(result,details||'GPS synchronization did not complete');
+   showToast(message,succeeded?'success':'error');
   }catch(error){
-   const message=error.response?.status===409
-    ?error.response?.data?.reason||'A GPS synchronization is already running. Please wait for it to finish.'
-    :error.response?.data?.reason||error.response?.data?.error||error.message||'GPS synchronization did not complete';
-   showToast(message,'error');
+   showToast(getErrorMessage(error,'GPS synchronization did not complete'),'error');
   }
   finally{
    window.dispatchEvent(new CustomEvent('gps-sync-complete'));
@@ -430,7 +436,6 @@ function Dashboard(){
   }catch(e){showToast(e.response?.data?.error||'Failed to save plan','error')}
   finally{setPlanSaving(false)}
  };
- if(loadError)return <ErrorPage title="Cannot reach server" details={loadError.message} onRetry={load}/>
  if(!data)return <Skeleton/>
  return <>
  <section className="dashboard-page">
@@ -438,24 +443,25 @@ function Dashboard(){
    <div className="dashboard-title"><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div>
    <div className="dashboard-sync-grid">
     <article className="dashboard-info-card dashboard-next-sync">
-     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{syncStatus?.schedulerStatus==='Active'?`${syncStatus.nextSyncAt?`${fmtIst(syncStatus.nextSyncAt)} IST · `:''}Scheduler active - every 30 min`:'Inactive'}</p>{syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
+     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{!syncStatus?'Status unavailable':syncStatus.schedulerStatus==='Active'?`${syncStatus.nextSyncAt?`${fmtIst(syncStatus.nextSyncAt)} IST · `:''}Scheduler active - every 30 min`:'Inactive'}</p>{syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
      <Timer aria-hidden="true"/>
     </article>
     <article className="dashboard-info-card dashboard-sync-state">
-      <div><h2>GPS sync</h2><strong className="dashboard-sync-state-value" role="status">{isSyncing&&<span className="dashboard-sync-spinner" aria-hidden="true"/>}{isSyncing?'Sync In Progress':syncStatus?.lastSyncStatus||'No sync recorded'}</strong><p>{syncStatus?.schedulerStatus==='Active'?'Scheduler active - every 30 min':'Inactive'}</p>{syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
+      <div><h2>GPS sync</h2><strong className="dashboard-sync-state-value" role="status">{isSyncing&&<span className="dashboard-sync-spinner" aria-hidden="true"/>}{isSyncing?'Sync In Progress':syncStatus?syncStatus.lastSyncStatus||'No sync recorded':'Status unavailable'}</strong><p>{!syncStatus?'Status unavailable':syncStatus.schedulerStatus==='Active'?'Scheduler active - every 30 min':'Inactive'}</p>{syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
      <Navigation aria-hidden="true"/>
     </article>
     {canSync&&<AnimatedButton variant="blue" className="dashboard-manual-sync" loading={isSyncing} disabled={isSyncing} onClick={sync} aria-label="GPS Sync">
      {!isSyncing&&<RefreshCw size={22} aria-hidden="true"/>}<span>{isSyncing?'Syncing...':'GPS Sync'}</span>
     </AnimatedButton>}
     <article className="dashboard-info-card dashboard-last-sync">
-     <div><h2>Last Sync</h2><p>{fmtIst(syncStatus?.lastSyncAt)}</p><p>{syncStatus?.lastSyncType?`${syncStatus.lastSyncType} - ${syncStatus.lastSyncStatus||'Unknown'}`:'No sync recorded'}</p>{syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
+     <div><h2>Last Sync</h2><p>{syncStatus?fmtIst(syncStatus.lastSyncAt):'Status unavailable'}</p><p>{!syncStatus?'Status unavailable':syncStatus.lastSyncType?`${syncStatus.lastSyncType} - ${syncStatus.lastSyncStatus||'Unknown'}`:'No sync recorded'}</p>{syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}{gpsSyncSummaryFields(syncStatus?.lastSyncSummary).length>0&&<dl className="dashboard-sync-summary" aria-label="Last GPS synchronization results">{gpsSyncSummaryFields(syncStatus.lastSyncSummary).map(([label,value])=><div key={label}><dt>{label}</dt><dd>{value}</dd></div>)}</dl>}</div>
      <History aria-hidden="true"/>
     </article>
    </div>
   </div>
   <div className="widget-grid dashboard-stats">
-   {data.plants.map((p,i)=>{
+   {!data.plantsAvailable&&<div className="dashboard-widget-unavailable" role="status">Plant widget data is temporarily unavailable.</div>}
+   {data.plantsAvailable&&data.plants.map((p,i)=>{
     const plantType=String(p.plant||'').toLowerCase().includes('tea')?'tea':
      String(p.plant||'').toLowerCase().includes('salt')?'salt':'plant';
     const ignition=getIgnitionCounts(p.rows);
@@ -465,8 +471,8 @@ function Dashboard(){
     </motion.button>;
    })}
    <motion.button className="plant-widget transit dashboard-stat-card" onClick={()=>setTransitModal(true)} initial={{opacity:0,y:15}} animate={{opacity:1,y:0}}>
-    <span className="dashboard-stat-main"><span className="widget-icon"><MapPinned size={30}/></span><span className="dashboard-stat-copy"><small>Outside</small><Count value={data.transit.count}/><em>active vehicles</em></span></span>
-    <IgnitionFooter counts={getIgnitionCounts(data.transit.rows)}/>
+    <span className="dashboard-stat-main"><span className="widget-icon"><MapPinned size={30}/></span><span className="dashboard-stat-copy"><small>Outside</small>{data.transitAvailable?<Count value={data.transit.count}/>:<strong className="dashboard-widget-fallback">Unavailable</strong>}<em>active vehicles</em></span></span>
+    {data.transitAvailable?<IgnitionFooter counts={getIgnitionCounts(data.transit.rows)}/>:<span className="dashboard-widget-fallback">Widget data unavailable</span>}
    </motion.button>
   </div>
  </section>
@@ -936,20 +942,22 @@ function Gps(){
   return()=>clearInterval(interval);
  },[data.syncStatus?.nextAutoSyncAt,data.syncStatus?.schedulerStatus,data.serverClockOffsetMs]);
  const manualSync=async()=>{
-  if(syncing)return;
+  if(syncing||data.syncStatus?.isSyncing){
+   showToast('A GPS synchronization is already running. Please wait for it to finish.','error');
+   return;
+  }
   setSyncing(true);
   try{
    const response=await axios.post('/sync');
-   const result=response.data;
-   if(result.success){
-    showToast(`GPS sync successful: ${result.totalVehiclesSynced||0} vehicle(s) synchronized.${result.warnings?.length?` ${result.warnings.join('; ')}`:''}`);
-   }else{
-    const details=Object.values(result.result||{}).flatMap(providerResult=>providerResult.errors||[])
-     .slice(0,2).map(error=>error.vehicleNumber?`${error.vehicleNumber}: ${error.message}`:error.message).join('; ');
-    showToast(result.message||result.error||result.result?.message||details||'GPS synchronization did not complete','error');
-   }
+   const result=isRecordResponse(response.data)?response.data:{};
+   const details=getGpsSyncErrorDetails(result).slice(0,2).join('; ');
+   const succeeded=isGpsSyncSuccessful(result);
+   const message=succeeded
+    ?`GPS sync successful: ${Number(result.totalVehiclesSynced)||0} vehicle(s) synchronized.${gpsSyncSummaryText(result.result?.syncSummary)?` ${gpsSyncSummaryText(result.result.syncSummary)}.`:''}${Array.isArray(result.warnings)&&result.warnings.length?` ${result.warnings.join('; ')}`:''}`
+    :getErrorMessage(result,details||'GPS synchronization did not complete');
+   showToast(message,succeeded?'success':'error');
   }catch(error){
-   showToast(error.response?.data?.reason||error.response?.data?.error||error.message||'GPS synchronization did not complete','error');
+   showToast(getErrorMessage(error,'GPS synchronization did not complete'),'error');
   }finally{
    await load();
    window.dispatchEvent(new CustomEvent('gps-sync-complete'));
@@ -967,12 +975,12 @@ function Gps(){
   const providerRecords=data.live.filter(v=>v.provider==='Wheelseye');
   const count=providerRecords.filter(v=>!v.stale&&!v.noGpsData).length;
   const staleCount=providerRecords.filter(v=>v.stale).length;
-  return <div className={`provider-widget ${status.toLowerCase()}`}><b>{n}</b><span className="badge">{status==='Error'?'Failed':status}</span><div><small>Registered</small><strong>{p.vehicleCount||0}</strong></div><div><small>Reporting</small><strong>{count}</strong></div><div><small>Failed vehicles</small><strong>{p.vehiclesNotResponding||0}</strong></div><div><small>Stale data</small><strong>{staleCount}</strong></div><div><small>Last successful sync (IST)</small><strong>{fmtIst(p.lastSuccessTime)}</strong></div>{status==='Error'&&<em>{p.lastErrorMessage||'Provider request failed'} ({p.lastErrorCode||'N/A'})</em>}</div>
+  return <div className={`provider-widget ${status.toLowerCase()}`}><b>{n}</b><span className="badge">{status==='Error'?'Failed':status}</span><div><small>Registered</small><strong>{p.vehicleCount||0}</strong></div><div><small>Reporting</small><strong>{count}</strong></div><div><small>GPS not available</small><strong>{p.vehiclesNotResponding||0}</strong></div><div><small>Actual errors</small><strong>{p.syncErrors||0}</strong></div><div><small>Inactive skipped</small><strong>{p.inactiveVehiclesSkipped||0}</strong></div><div><small>Unregistered ignored</small><strong>{p.unregisteredRecordsIgnored||0}</strong></div><div><small>Stale data</small><strong>{staleCount}</strong></div><div><small>Last successful sync (IST)</small><strong>{fmtIst(p.lastSuccessTime)}</strong></div>{status==='Error'&&<em>{p.lastErrorMessage||'Provider request failed'} ({p.lastErrorCode||'N/A'})</em>}</div>
  };
  const syncStatus=data.syncStatus||{};
  if(pageLoading)return <Skeleton/>;
  if(pageError)return <ErrorPage title="Cannot reach server" details={pageError.message} onRetry={load}/>;
- return <><div className="page-head"><div><p className="eyebrow">Live operations</p><h1>GPS Track</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} onClick={manualSync}><RefreshCw size={17}/> Manual Sync</AnimatedButton>}<AnimatedButton variant="ghost" onClick={load}><RefreshCw size={17}/> Refresh</AnimatedButton></div></div><div className="tabs"><AnimatedButton variant={tab==='tracking'?'blue':'ghost'} onClick={()=>setTab('tracking')}>Tracking</AnimatedButton><AnimatedButton variant={tab==='history'?'blue':'ghost'} onClick={()=>setTab('history')}>History</AnimatedButton>{canManage&&<AnimatedButton variant={tab==='setting'?'blue':'ghost'} onClick={()=>setTab('setting')}>Setting</AnimatedButton>}</div>
+ return <><div className="page-head"><div><p className="eyebrow">Live operations</p><h1>GPS Track</h1></div><div className="sync-controls">{canManage&&<AnimatedButton variant="green" loading={syncing} disabled={syncing||syncStatus.isSyncing} onClick={manualSync}><RefreshCw size={17}/> Manual Sync</AnimatedButton>}<AnimatedButton variant="ghost" onClick={load}><RefreshCw size={17}/> Refresh</AnimatedButton></div></div><div className="tabs"><AnimatedButton variant={tab==='tracking'?'blue':'ghost'} onClick={()=>setTab('tracking')}>Tracking</AnimatedButton><AnimatedButton variant={tab==='history'?'blue':'ghost'} onClick={()=>setTab('history')}>History</AnimatedButton>{canManage&&<AnimatedButton variant={tab==='setting'?'blue':'ghost'} onClick={()=>setTab('setting')}>Setting</AnimatedButton>}</div>
  {tab==='tracking'?<>
  <div className="gps-sync-status">
   <div><small>Auto Sync</small><b className={syncStatus.autoSyncActive?'sync-active':'sync-inactive'}>{syncStatus.autoSyncActive?'Active':'Inactive'}</b></div>
@@ -980,23 +988,35 @@ function Gps(){
   <div><small>Last Successful Sync (IST)</small><b>{fmtIst(syncStatus.lastSuccessfulSyncAt)}</b></div>
   <div><small>Last Manual Sync (IST)</small><b>{fmtIst(syncStatus.lastManualSyncAt)}</b></div>
   <div><small>Total Vehicles Synced</small><b>{syncStatus.totalVehiclesSynced||0}</b></div>
-  <div><small>Vehicles not responding</small><b>{syncStatus.failedVehicleCount||0}</b></div>
+  <div><small>Actual sync errors</small><b>{syncStatus.failedVehicleCount||0}</b></div>
   <div><small>GPS Data Last Updated (IST)</small><b>{fmtIst(syncStatus.gpsDataLastUpdated)}</b></div>
  </div>
- <div className="gps-stats">{[['Registered',data.registeredCount||0],['WheelsEye received',data.providers.find(p=>p.provider==='Wheelseye')?.vehiclesReceived||0],['Moving',data.summary?.moving||0],['Stopped',data.summary?.stopped||0],['IGN ON',data.summary?.ignitionOn||0],['IGN OFF',data.summary?.ignitionOff||0],['Not Responding',data.summary?.notResponding||0],['API Errors',data.summary?.apiErrors||0]].map(([label,value])=><div className="gps-stat" key={label}><small>{label}</small><b>{value}</b></div>)}</div>
+ <div className="gps-stats">{[['Registered',data.registeredCount||0],['WheelsEye received',data.providers.find(p=>p.provider==='Wheelseye')?.vehiclesReceived||0],['Moving',data.summary?.moving||0],['Stopped',data.summary?.stopped||0],['IGN ON',data.summary?.ignitionOn||0],['IGN OFF',data.summary?.ignitionOff||0],['GPS Not Available',data.summary?.notResponding||0],['Provider API Errors',data.summary?.apiErrors||0]].map(([label,value])=><div className="gps-stat" key={label}><small>{label}</small><b>{value}</b></div>)}</div>
  <div className="provider-grid">{providerWidget('Wheelseye')}</div>
  {(syncStatus.lastCycleErrors?.length>0||syncStatus.lastCycleGeofenceError)&&<div className="gps-sync-errors"><b>Last synchronization issues</b>{syncStatus.lastCycleGeofenceError&&<p>Plant status update: {syncStatus.lastCycleGeofenceError}</p>}{syncStatus.lastCycleErrors?.length>0&&<ul>{syncStatus.lastCycleErrors.map((error,index)=><li key={`${error.provider}-${error.vehicleNumber||index}-${index}`}>{error.provider}{error.vehicleNumber?` / ${error.vehicleNumber}`:''}: {error.message||'Synchronization failed'}{error.code?` (code ${error.code})`:''}</li>)}</ul>}</div>}
  <div className="gps-layout"><div className="gps-map"><OpenStreetMap vehicles={live} selectedVehicleNumber={selected?.vehicleNumber} onSelect={setSelected} settings={settings}/></div>
  <div className="gps-list">
   <div className="filters"><div className="search-box"><Search/><input placeholder="Search" value={search} onChange={e=>setSearch(e.target.value.toUpperCase())}/></div><select value={running} onChange={e=>setRunning(e.target.value)}><option value="">Running Status</option><option value="running">Moving</option><option value="stopped">Stopped</option></select></div>
-  <Table headers={['Vehicle','Provider','Fleet Type','Running','IGN','Speed','GPS data','Live Location','Coordinates','Driver','GPS time',...(canTrack?['Track Now']:[]),...(canManage?['Share']:[])]} rows={live.map(v=>{
+  <Table headers={['Vehicle','Provider','Fleet Type','Running','IGN','Speed','GPS data','Full address','Latitude','Longitude','Street / Plot','Sector','Nearest location','Distance','City / Village','District','Division','PIN Code','State','Country','Location provider','Nearby provider','Last updated','Driver',...(canTrack?['Track Now']:[]),...(canManage?['Share']:[])]} rows={live.map(v=>{
    const resolved=gpsLocationBatch.items[v.vehicleId];
    const ignition=getIgnitionStatus(v.ignitionStatus??v.ignition);
    return [<button className="vehicle-select" onClick={()=>setSelected(v)}>{v.vehicleNumber}</button>,v.noGpsData?'No GPS data':'WheelsEye',v.fleetType||'-',v.runningStatus||'Unknown',<span className={`ignition ${ignition==='ON'?'on':ignition==='OFF'?'off':''}`}>{ignition}</span>,speedText(v),v.noGpsData?'No GPS data':v.stale?'Stale':'Live',<LocationText
     location={resolved?.location||v.location} current={resolved?.addressIsCurrent??v.addressIsCurrent}
     lat={resolved?.lat??v.lat} lng={resolved?.lng??v.lng} map={resolved?.map}
     vehicleId={v.vehicleId} loading={gpsLocationBatch.isLoading(v)}
-   />,v.noGpsData?'N/A':formatCoordinates(v.lat,v.lng),v.driverName||v.driver||'-',fmt(v.gpsTime),
+   />,formatCoordinate(resolved?.lat??v.lat),formatCoordinate(resolved?.lng??v.lng),
+   [resolved?.street??v.street,resolved?.plotNumber??v.plotNumber??v.houseNumber].filter(Boolean).join(' / ')||'N/A',
+   resolved?.sector||v.sector||'N/A',
+   resolved?.nearestLocation||v.nearestLocation||'N/A',
+   (resolved?.nearestLocationDistanceMeters??v.nearestLocationDistanceMeters)!=null
+    ?`${resolved?.nearestLocationDistanceMeters??v.nearestLocationDistanceMeters} m`:'N/A',
+   resolved?.cityOrVillage||v.cityOrVillage||v.city||'N/A',
+   resolved?.district||v.district||'N/A',resolved?.division||v.division||'N/A',
+   resolved?.pincode||v.pincode||'N/A',resolved?.state||v.state||'N/A',
+   resolved?.country||v.country||'N/A',
+   resolved?.geocodingProvider||v.geocodingProvider||'N/A',
+   resolved?.nearbyProvider||v.nearbyProvider||'N/A',
+   fmt(v.gpsTime),v.driverName||v.driver||'-',
    ...(canTrack?[<AnimatedButton key={`track-${v.vehicleNumber}`} variant="blue" disabled={v.noGpsData} onClick={()=>window.open(`/live-tracking/${encodeURIComponent(v.vehicleId)}`,'_blank','noopener,noreferrer')}>Track Now</AnimatedButton>]:[]),
    ...(canManage?[<AnimatedButton key={`share-${v.vehicleNumber}`} variant="blue" disabled={v.noGpsData} onClick={()=>share(v)}><Share2 size={16}/></AnimatedButton>]:[])];
   })}/>

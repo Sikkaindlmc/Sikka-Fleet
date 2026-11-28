@@ -62,11 +62,13 @@ const liveSchema=new mongoose.Schema({
  address:String,heading:Number,unregistered:{type:Boolean,default:false},stale:{type:Boolean,default:false},
  lastGoodTime:Date,runningStatus:{type:String,enum:['Moving','Stopped','Idle','Unknown'],default:'Unknown'},
  providerVehicleId:String,driverName:String,vehicleStatus:String,
- readableLocation:String,street:String,galiNumber:String,road:String,nearby:String,
- locality:String,city:String,cityOrVillage:String,district:String,state:String,pincode:String,country:String,
+ readableLocation:String,street:String,plotNumber:String,houseNumber:String,galiNumber:String,road:String,
+ building:String,sector:String,nearby:String,nearestLocation:String,nearestLocationCategory:String,
+ nearestLocationDistanceMeters:Number,nearbyProvider:String,locality:String,city:String,
+ cityOrVillage:String,district:String,division:String,state:String,pincode:String,country:String,
  geocodedAt:Date,addressLat:Number,addressLng:Number,addressIsCurrent:{type:Boolean,default:false},
  addressDistanceKm:Number,
- geocodingProvider:{type:String,enum:['GeoNames','Nominatim','LocationIQ','Geoapify','Provider','Coordinate']}
+ geocodingProvider:{type:String,enum:['Google','GeoNames','Nominatim','LocationIQ','Geoapify','Provider','Coordinate']}
 },{timestamps:true});
 liveSchema.pre('validate',function(){
  const normalized=normalizeVehicleNumber(this.vehicleNumber);
@@ -78,8 +80,10 @@ liveSchema.index({normalizedVehicleNumber:1},{unique:true,partialFilterExpressio
 const historySchema=new mongoose.Schema({
  vehicle:{type:String,required:true,index:true,set:normalizeVehicleNumber},
  vehicleNumber:{type:String,set:value=>value?normalizeVehicleNumber(value):value},lat:Number,lng:Number,address:String,
- readableLocation:String,street:String,galiNumber:String,road:String,nearby:String,
- locality:String,city:String,cityOrVillage:String,district:String,state:String,pincode:String,country:String,
+ readableLocation:String,street:String,plotNumber:String,houseNumber:String,galiNumber:String,road:String,
+ building:String,sector:String,nearby:String,nearestLocation:String,nearestLocationCategory:String,
+ nearestLocationDistanceMeters:Number,nearbyProvider:String,locality:String,city:String,
+ cityOrVillage:String,district:String,division:String,state:String,pincode:String,country:String,
  geocodedAt:Date,addressLat:Number,addressLng:Number,addressIsCurrent:{type:Boolean,default:false},
  addressDistanceKm:Number,geocodingProvider:String,
  providerVehicleId:String,driverName:String,vehicleStatus:String,
@@ -122,6 +126,8 @@ const providerStatusSchema=new mongoose.Schema({
  provider:{type:String,enum:['Wheelseye'],unique:true},status:{type:String,enum:['Connected','Disconnected','Error'],default:'Disconnected'},
  lastAttemptTime:Date,lastSuccessTime:Date,lastErrorMessage:String,lastErrorCode:Number,lastErrorTime:Date,vehicleCount:{type:Number,default:0},
  vehiclesReceived:{type:Number,default:0},vehiclesNotResponding:{type:Number,default:0},
+ syncErrors:{type:Number,default:0},inactiveVehiclesSkipped:{type:Number,default:0},
+ unregisteredRecordsIgnored:{type:Number,default:0},
  apiResponseStatus:Number
 },{timestamps:true});
 const gpsSettingSchema=new mongoose.Schema({
@@ -186,7 +192,9 @@ const geocodeCacheSchema=new mongoose.Schema({
  lng:{type:Number,required:true},
  readableLocation:{type:String},
  baseReadableLocation:String,basePlaceName:String,addressDistanceKm:Number,
- locality:String,
+ locality:String,plotNumber:String,houseNumber:String,building:String,sector:String,
+ nearestLocation:String,nearestLocationCategory:String,nearestLocationDistanceMeters:Number,
+ nearbyProvider:String,nearbyFetchedAt:Date,nearbyFailureUntil:Date,division:String,
  city:String,
  cityOrVillage:String,
  district:String,
@@ -197,7 +205,7 @@ const geocodeCacheSchema=new mongoose.Schema({
  road:String,
  nearby:String,
  country:String,
- provider:{type:String,enum:['GeoNames','Nominatim','LocationIQ','Geoapify','Provider','Coordinate']},
+ provider:{type:String,enum:['Google','GeoNames','Nominatim','LocationIQ','Geoapify','Provider','Coordinate']},
  layer2Provider:{type:String,enum:['Nominatim','LocationIQ','Geoapify']},
  geocodedAt:Date,layer2GeocodedAt:Date,layer2FailureUntil:Date,
  failureUntil:Date,

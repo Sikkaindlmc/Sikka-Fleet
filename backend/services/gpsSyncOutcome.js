@@ -30,6 +30,77 @@ function buildNormalizedLookup(vehiclesByNumber) {
   return lookup;
 }
 
+function partitionProviderRecords({
+  records,
+  vehicles,
+  providerName,
+  isLinked = () => true
+}) {
+  const activeByNumber = new Map();
+  const inactiveNumbers = new Set();
+  const activeNumbers = new Set();
+  for (const vehicle of Array.isArray(vehicles) ? vehicles : []) {
+    const number = normalizeVehicleNumber(vehicle?.vehicleNumber);
+    if (!number) continue;
+    if (vehicle.status === 'Active') {
+      activeNumbers.add(number);
+      if (!activeByNumber.has(number)) activeByNumber.set(number, vehicle);
+    } else if (!activeNumbers.has(number)) {
+      inactiveNumbers.add(number);
+    }
+  }
+  for (const number of activeNumbers) inactiveNumbers.delete(number);
+
+  const uniqueRecords = new Map();
+  let duplicateRecordCount = 0;
+  let unidentifiedRecordCount = 0;
+  for (const record of Array.isArray(records) ? records : []) {
+    const number = normalizeVehicleNumber(record?.vehicleNumber);
+    if (!number) {
+      unidentifiedRecordCount++;
+      continue;
+    }
+    const normalizedRecord = { ...record, vehicleNumber: number };
+    const previous = uniqueRecords.get(number);
+    if (!previous) {
+      uniqueRecords.set(number, normalizedRecord);
+      continue;
+    }
+    duplicateRecordCount++;
+    const previousTime = new Date(previous.gpsTime || 0).getTime();
+    const currentTime = new Date(normalizedRecord.gpsTime || 0).getTime();
+    if (Number.isFinite(currentTime) && currentTime > previousTime) {
+      uniqueRecords.set(number, normalizedRecord);
+    }
+  }
+
+  const eligibleRecords = [];
+  const inactiveVehicleNumbers = new Set();
+  const unregisteredVehicleNumbers = new Set();
+  const providerNotLinkedVehicleNumbers = new Set();
+  for (const [number, record] of uniqueRecords) {
+    const activeVehicle = activeByNumber.get(number);
+    if (activeVehicle && isLinked(activeVehicle, providerName)) {
+      eligibleRecords.push(record);
+    } else if (activeVehicle) {
+      providerNotLinkedVehicleNumbers.add(number);
+    } else if (inactiveNumbers.has(number)) {
+      inactiveVehicleNumbers.add(number);
+    } else {
+      unregisteredVehicleNumbers.add(number);
+    }
+  }
+
+  return {
+    eligibleRecords,
+    inactiveVehicleNumbers,
+    unregisteredVehicleNumbers,
+    providerNotLinkedVehicleNumbers,
+    duplicateRecordCount,
+    unidentifiedRecordCount
+  };
+}
+
 /**
  * Saves every GPS record that belongs to a registered vehicle linked to
  * the given provider (WheelsEye).
@@ -53,6 +124,7 @@ async function persistMatchedRecords({
   const receivedNumbers = new Set();
   const savedNumbers = new Set();
   const mismatchedNumbers = new Set();
+  const skippedNumbers = new Set();
   const errors = [];
   let vehicleNumberMismatches = 0;
   let saveErrors = 0;
@@ -78,7 +150,12 @@ async function persistMatchedRecords({
         return;
       }
       receivedNumbers.add(number);
-      await persistRecord(record, vehicle);
+      const persisted = await persistRecord(record, vehicle);
+      if (persisted === false) {
+        receivedNumbers.delete(number);
+        skippedNumbers.add(number);
+        return;
+      }
       savedNumbers.add(number);
     } catch (error) {
       saveErrors++;
@@ -108,6 +185,7 @@ async function persistMatchedRecords({
     vehicleNumberMismatches,
     saveErrors,
     mismatchedNumbers,
+    skippedNumbers,
     errors,
     totalRecords: list.length
   };
@@ -125,8 +203,8 @@ async function persistMatchedRecords({
  *
  * Rules:
  *  - WheelsEye request failed                         -> Failed
- *  - WheelsEye OK but 0 records                       -> Failed
- *  - records came but none matched a registered vehicle -> Failed
+ *  - a successful response with no active GPS records -> Successful
+ *  - inactive/unregistered records are ignored         -> not a sync failure
  *  - vehicles matched but none could be saved         -> Failed
  *  - some vehicles saved, some failed                 -> Successful (with warnings)
  *  - GPS saved but plant/geofence calculation failed  -> Successful (with warning),
@@ -146,22 +224,14 @@ function aggregateSyncOutcome(providerResult, { geofenceError = null, persistenc
             'WheelsEye GPS request failed'
         );
   } else if (persistence) {
-    const total = persistence.totalRecords || 0;
-    const received = persistence.receivedNumbers ? persistence.receivedNumbers.size : 0;
     const saved = persistence.savedNumbers ? persistence.savedNumbers.size : 0;
     const saveErrors = persistence.saveErrors || 0;
-    const mismatches = persistence.vehicleNumberMismatches || 0;
 
-    if (total === 0) {
-      error = 'WheelsEye returned no vehicle records';
-    } else if (received === 0) {
-      error = `None of the ${total} WheelsEye records matched a registered vehicle linked to WheelsEye`;
-    } else if (saved === 0) {
+    if (saveErrors > 0 && saved === 0) {
       const first = persistence.errors && persistence.errors[0];
       error = `Could not save GPS data for any vehicle${first ? `: ${first.message}` : ''}`;
     } else {
       if (saveErrors > 0) warnings.push(`${saveErrors} vehicle(s) could not be saved`);
-      if (mismatches > 0) warnings.push(`${mismatches} record(s) did not match a registered vehicle`);
     }
   }
 
@@ -173,10 +243,9 @@ function aggregateSyncOutcome(providerResult, { geofenceError = null, persistenc
   const stats = persistence
     ? {
         records: persistence.totalRecords || 0,
-        matched: persistence.receivedNumbers ? persistence.receivedNumbers.size : 0,
         saved: persistence.savedNumbers ? persistence.savedNumbers.size : 0,
-        mismatches: persistence.vehicleNumberMismatches || 0,
-        saveErrors: persistence.saveErrors || 0
+        saveErrors: persistence.saveErrors || 0,
+        ...(providerResult?.syncSummary || {})
       }
     : null;
 
@@ -191,4 +260,9 @@ function aggregateSyncOutcome(providerResult, { geofenceError = null, persistenc
   };
 }
 
-module.exports = { persistMatchedRecords, aggregateSyncOutcome, normalizeVehicleNumber };
+module.exports = {
+  persistMatchedRecords,
+  partitionProviderRecords,
+  aggregateSyncOutcome,
+  normalizeVehicleNumber
+};

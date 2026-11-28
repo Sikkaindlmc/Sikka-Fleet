@@ -59,3 +59,8 @@ test('WheelsEye records without real coordinates or timestamps are rejected',()=
 test('unsupported GPS provider payloads are rejected',()=>{
  assert.throws(()=>mapProviderPayload({data:[]},'Other'),/Unsupported GPS provider/);
 });
+
+test('provider payloads distinguish a valid empty records list from an unexpected response shape',()=>{
+ assert.equal(mapProviderPayload({data:[]},'Wheelseye').validResponse,true);
+ assert.equal(mapProviderPayload({unexpected:[]},'Wheelseye').validResponse,false);
+});

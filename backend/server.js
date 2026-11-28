@@ -20,7 +20,9 @@ const {normalizePermissions,hasPermission}=require('./permissions');
 const reverseGeocoding=require('./services/reverseGeocodingService');
 const wheelseyeService=require('./services/wheelseyeService');
 const {mapProviderPayload}=require('./services/gpsProviderData');
-const {persistMatchedRecords,aggregateSyncOutcome}=require('./services/gpsSyncOutcome');
+const {
+ persistMatchedRecords,partitionProviderRecords,aggregateSyncOutcome
+}=require('./services/gpsSyncOutcome');
 const fleetSnapshotService=require('./services/fleetSnapshotService');
 const sikkaAiService=require('./services/sikkaAiService');
 const {aiChatRequestValidators,getAiChatValidationError}=require('./services/aiChatValidation');
@@ -131,18 +133,25 @@ const coordinatesText=record=>reverseGeocoding.validCoordinates(record?.lat,reco
 const displayLocation=record=>readableAddress(record)||coordinatesText(record)||'Location unavailable';
 const addressFields=location=>location?{
  readableLocation:location.readableLocation,address:location.readableLocation,
- street:location.street||'',galiNumber:location.galiNumber||'',road:location.road||'',
- nearby:location.nearby||'',locality:location.locality||'',city:location.city||'',
+ street:location.street||'',plotNumber:location.plotNumber||location.houseNumber||'',
+ houseNumber:location.houseNumber||location.plotNumber||'',galiNumber:location.galiNumber||'',
+ road:location.road||'',building:location.building||'',sector:location.sector||'',
+ nearby:location.nearby||'',nearestLocation:location.nearestLocation||'',
+ nearestLocationCategory:location.nearestLocationCategory||'',
+ nearestLocationDistanceMeters:location.nearestLocationDistanceMeters??null,
+ nearbyProvider:location.nearbyProvider||'',locality:location.locality||'',city:location.city||'',
  cityOrVillage:location.cityOrVillage||location.city||'',
- district:location.district||'',state:location.state||'',pincode:location.pincode||'',
+ district:location.district||'',division:location.division||'',state:location.state||'',pincode:location.pincode||'',
  country:location.country||'',geocodedAt:location.geocodedAt||null,
  addressDistanceKm:location.addressDistanceKm??null,
  geocodingProvider:location.provider||'Provider',
  addressLat:location.addressLat??null,addressLng:location.addressLng??null,
  addressIsCurrent:location.addressIsCurrent!==false
 }:{
- readableLocation:null,address:null,street:'',galiNumber:'',road:'',nearby:'',
- locality:'',city:'',cityOrVillage:'',district:'',state:'',pincode:'',country:'',
+ readableLocation:null,address:null,street:'',plotNumber:'',houseNumber:'',galiNumber:'',road:'',
+ building:'',sector:'',nearby:'',nearestLocation:'',nearestLocationCategory:'',
+ nearestLocationDistanceMeters:null,nearbyProvider:'',locality:'',city:'',cityOrVillage:'',
+ district:'',division:'',state:'',pincode:'',country:'',
  geocodedAt:null,addressDistanceKm:null,geocodingProvider:null,addressLat:null,addressLng:null,
  addressIsCurrent:false
 };
@@ -207,12 +216,26 @@ function vehicleLocationPayload(record){
  return {
   location:displayLocation(record),
   addressIsCurrent:Boolean(record.addressIsCurrent&&readableAddress(record)),
-  street:record.street||'',galiNumber:record.galiNumber||'',road:record.road||'',
-  nearby:record.nearby||'',city:record.city||'',
+  street:record.street||'',plotNumber:record.plotNumber||record.houseNumber||'',
+  houseNumber:record.houseNumber||record.plotNumber||'',galiNumber:record.galiNumber||'',
+  road:record.road||'',building:record.building||'',sector:record.sector||'',
+  nearby:record.nearby||'',nearestLocation:record.nearestLocation||'',
+  nearestLocationCategory:record.nearestLocationCategory||'',
+  nearestLocationDistanceMeters:record.nearestLocationDistanceMeters??null,
+  nearbyProvider:record.nearbyProvider||'',geocodingProvider:record.geocodingProvider||null,
+  city:record.city||'',
   cityOrVillage:record.cityOrVillage||record.city||'',
-  district:record.district||'',state:record.state||'',pincode:record.pincode||'',
+  district:record.district||'',division:record.division||'',state:record.state||'',pincode:record.pincode||'',
   addressDistanceKm:record.addressDistanceKm??null,
   addressEnrichmentPending:Boolean(record.addressEnrichmentPending),
+  street:record.street||'',plotNumber:record.plotNumber||record.houseNumber||'',
+  houseNumber:record.houseNumber||record.plotNumber||'',sector:record.sector||'',
+  nearestLocation:record.nearestLocation||'',
+  nearestLocationCategory:record.nearestLocationCategory||'',
+  nearestLocationDistanceMeters:record.nearestLocationDistanceMeters??null,
+  nearbyProvider:record.nearbyProvider||'',
+  division:record.division||'',pincode:record.pincode||'',country:record.country||'',
+  geocodingProvider:record.geocodingProvider||null,
   lat:hasCoordinates?Number(record.lat):null,
   lng:hasCoordinates?Number(record.lng):null,
   map:hasCoordinates?`https://www.google.com/maps?q=${record.lat},${record.lng}`:null
@@ -269,6 +292,16 @@ function vehicleHasProvider(vehicle,provider){
   (vehicle.gpsProviders||[]).some(link=>normalizeProvider(link.name)===target);
 }
 
+function uniqueRegistryVehicles(records){
+ return [...groupByVehicleNumber(Array.isArray(records)?records:[]).values()].map(group=>
+  group.sort((a,b)=>
+   Number(b.status==='Active')-Number(a.status==='Active')||
+   new Date(b.updatedAt||0)-new Date(a.updatedAt||0)||
+   new Date(a.createdAt||0)-new Date(b.createdAt||0)
+  )[0]
+ );
+}
+
 function defaultProviderUrl(provider){
  const settings=GPS_PROVIDER_DEFAULTS[provider];
  const url=new URL(process.env[settings.environmentVariable]||settings.url);
@@ -284,7 +317,7 @@ async function seedGpsSettings(){
    provider,enabled:true,baseUrl:defaultProviderUrl(provider),
    credentialsReference:defaults.credentialsReference,
    lastSyncStatus:'Disconnected',lastSyncError:''
-  }},{upsert:true,new:true});
+  }},{upsert:true,returnDocument:'after'});
  }
 }
 
@@ -449,6 +482,7 @@ async function getGpsSyncStatus(now=new Date()){
   lastError:lastCycle?.status==='Skipped'?'':failureMessage,
   totalVehiclesSynced:lastCycle?.result?.totalVehiclesSynced||0,
   failedVehicleCount:lastCycle?.result?.failedVehicleCount||0,
+  lastSyncSummary:lastCycle?.result?.syncSummary||null,
   gpsDataLastUpdated:gpsData?.syncedAt||null,
   lastCycleErrors:lastCycleErrors.slice(0,20),
   lastCycleGeofenceError:lastCycle?.result?.geofenceError||null,
@@ -463,7 +497,7 @@ async function acquireGpsSyncLock(owner,now,type){
    key:GPS_SYNC_LOCK_KEY,
    $or:[{lockUntil:{$lte:now}},{lockUntil:{$exists:false}}]
   },{$set:{owner,type,acquiredAt:now,lockUntil:new Date(now.getTime()+GPS_SYNC_LOCK_TTL_MS)}},
-  {upsert:true,new:true});
+  {upsert:true,returnDocument:'after'});
   return lock?.owner===owner;
  }catch(error){
   if(error.code===11000)return false;
@@ -500,6 +534,12 @@ async function runSync(type='manual',options={}){
  let finalProviderResults={};
  let gpsPersistence=null;
  let registeredVehicleCount=0,synchronizedVehicleCount=0,failedVehicleCountForLog=0;
+ const activeRegistryNumbers=new Set();
+ const reportedActiveNumbers=new Set();
+ const inactiveVehicleNumbersSkipped=new Set();
+ const unregisteredGpsNumbersIgnored=new Set();
+ let unidentifiedGpsRecordsIgnored=0;
+ let actualSyncErrorCount=0;
  try{
   const existingStatus=await M.SyncStatus.findOne({key:SYNC_STATUS_KEY}).lean();
   if(existingStatus?.isSyncing&&isGpsSyncStale(existingStatus.syncStartedAt,attemptedAt)){
@@ -525,7 +565,7 @@ async function runSync(type='manual',options={}){
     {syncStartedAt:{$lte:new Date(attemptedAt.getTime()-10*60*1000)}}
    ]
   },{$set:{isSyncing:true,syncStartedAt:attemptedAt,lastSyncType:statusType,lastError:''}},
-  {new:true});
+  {returnDocument:'after'});
   if(!statusLock)return await logSkippedSync(normalizedType,'Sync already running',attemptedAt);
   statusAcquired=true;
   lockAcquired=await acquireGpsSyncLock(owner,attemptedAt,normalizedType);
@@ -560,14 +600,11 @@ async function runSync(type='manual',options={}){
    };
    await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:schedulerUpdate},{upsert:true});
   }
-  const activeVehicleRows=await M.Vehicle.find({status:'Active'})
-   .select('vehicleNumber gpsLink gpsProviders updatedAt createdAt').lean();
-  const activeVehicles=[...groupByVehicleNumber(activeVehicleRows).values()].map(records=>
-   records.sort((a,b)=>new Date(b.updatedAt||0)-new Date(a.updatedAt||0))[0]
-  ).filter(vehicle=>vehicleHasProvider(vehicle,'Wheelseye'));
-  const vehiclesByNumber=new Map(activeVehicles.map(vehicle=>[normalizeNumber(vehicle.vehicleNumber),vehicle]));
-  const registeredNumbers=[...vehiclesByNumber.keys()];
-  registeredVehicleCount=registeredNumbers.length;
+  let registryRows=await M.Vehicle.find({})
+   .select('vehicleNumber normalizedVehicleNumber gpsLink gpsProviders status updatedAt createdAt').lean();
+  let registryVehicles=uniqueRegistryVehicles(registryRows);
+  let activeVehicles=registryVehicles.filter(vehicle=>vehicle.status==='Active');
+  registeredVehicleCount=activeVehicles.length;
   const savedProviderSettings=await M.GpsSetting.find({provider:'Wheelseye'}).lean();
   const providerSettingsByName=new Map(savedProviderSettings.map(setting=>[setting.provider,setting]));
   const synchronizedRegisteredNumbers=new Set();
@@ -575,6 +612,7 @@ async function runSync(type='manual',options={}){
   const providers=[
    {name:'Wheelseye',fetch:baseUrl=>wheelseyeService.fetchLive({baseUrl})}
   ];
+  const eligibleRegistryNumbers=new Set();
   console.error('[gps-sync] request started',{type:normalizedType,provider:'Wheelseye'});
   const providerResponsesByName=new Map(await Promise.all(providers.map(async provider=>{
    const settings=providerSettingsByName.get(provider.name);
@@ -586,26 +624,52 @@ async function runSync(type='manual',options={}){
     return [provider.name,{error}];
    }
   })));
+  registryRows=await M.Vehicle.find({})
+   .select('vehicleNumber normalizedVehicleNumber gpsLink gpsProviders status updatedAt createdAt').lean();
+  registryVehicles=uniqueRegistryVehicles(registryRows);
+  activeVehicles=registryVehicles.filter(vehicle=>vehicle.status==='Active');
+  activeRegistryNumbers.clear();
+  for(const vehicle of activeVehicles){
+   const number=normalizeNumber(vehicle.vehicleNumber);
+   if(number)activeRegistryNumbers.add(number);
+  }
+  registeredVehicleCount=activeRegistryNumbers.size;
   for(const p of providers){
    if(lockLost)throw new Error('GPS sync stopped after losing the distributed lock');
    const providerSettings=providerSettingsByName.get(p.name);
    const registered=activeVehicles.filter(vehicle=>vehicleHasProvider(vehicle,p.name));
+   const vehiclesByNumber=new Map(registered.map(vehicle=>[normalizeNumber(vehicle.vehicleNumber),vehicle]));
    const registeredNumbers=registered.map(vehicle=>normalizeNumber(vehicle.vehicleNumber));
+   const providerActiveNumbers=new Set(registeredNumbers);
+   for(const number of registeredNumbers)eligibleRegistryNumbers.add(number);
    const errorDetails=[];
+   let receivedActiveCount=0,syncedActiveCount=0,unavailableActiveCount=registered.length;
+   let inactiveSkippedCount=0,unregisteredIgnoredCount=0;
    const providerResult={enabled:providerSettings?.enabled!==false,ok:false,status:'failed',
-    returnedVehicles:0,validRecords:0,rejected:{},reason:''};
+    returnedVehicles:0,validRecords:0,rejected:{},reason:'',actualErrorCount:0};
    if(providerSettings?.enabled===false){
     const disabledAt=new Date();
     await M.GpsProviderStatus.findOneAndUpdate({provider:p.name},{$set:{
      status:'Disconnected',lastAttemptTime:disabledAt,vehicleCount:registered.length,
-     vehiclesReceived:0,vehiclesNotResponding:0,lastErrorMessage:'',lastErrorCode:null,lastErrorTime:null
+     vehiclesReceived:0,vehiclesNotResponding:registered.length,syncErrors:0,
+     inactiveVehiclesSkipped:0,unregisteredRecordsIgnored:0,
+     lastErrorMessage:'',lastErrorCode:null,lastErrorTime:null
     }},{upsert:true});
     await M.GpsSetting.updateOne({provider:p.name},{$set:{
      lastSyncStatus:'Disabled',lastSyncError:'',lastSyncedAt:disabledAt
     }});
+    providerResult.ok=true;
     providerResult.status='disabled';
     providerResult.reason='provider disabled';
-    result[p.name]={status:'Disabled',count:0,syncedCount:0,failedCount:0,message:'Provider is disabled'};
+    providerResult.syncSummary={
+     activeRegisteredVehicles:registered.length,successfullySyncedVehicles:0,
+     activeVehiclesWithoutGpsData:registered.length,inactiveVehiclesSkipped:0,
+     unregisteredGpsRecordsIgnored:0,actualErrors:0
+    };
+    result[p.name]={
+     status:'Disabled',count:0,syncedCount:0,failedCount:registered.length,
+     actualErrorCount:0,syncSummary:providerResult.syncSummary,message:'Provider is disabled'
+    };
     finalProviderResults[p.name]=providerResult;
     continue;
    }
@@ -614,23 +678,43 @@ async function runSync(type='manual',options={}){
     if(fetched?.error)throw fetched.error;
     const response=fetched?.response;
     const mapped=mapProviderPayload(response.data,p.name,{now:startedAt});
-    let rows=mapped.records;
+    if(!mapped.validResponse)throw new Error(`${p.name} response did not contain a vehicle records list`);
+    const rows=mapped.records;
+    providerResult.ok=true;
     providerResult.returnedVehicles=mapped.received;
     providerResult.validRecords=rows.length;
     providerResult.rejected=mapped.rejected;
     console.error('[gps-sync] records received',{
      provider:p.name,received:mapped.received,valid:rows.length,rejected:mapped.rejected
     });
-    const newestByNumber=new Map();
-    for(const row of rows){
-     const vehicleNumber=normalizeNumber(row.vehicleNumber);
+    const currentRows=rows.filter(row=>{
      const gpsTime=new Date(row.gpsTime);
-     if(!vehicleNumber||!Number.isFinite(gpsTime.getTime())||gpsTime>startedAt)continue;
-     const current=newestByNumber.get(vehicleNumber);
-     if(!current||gpsTime>new Date(current.gpsTime))newestByNumber.set(vehicleNumber,{...row,vehicleNumber,gpsTime});
+     return Number.isFinite(gpsTime.getTime())&&gpsTime<=startedAt;
+    });
+    const partition=partitionProviderRecords({
+     records:currentRows,vehicles:registryVehicles,providerName:p.name,
+     isLinked:vehicle=>vehicleHasProvider(vehicle,p.name)
+    });
+    for(const number of partition.inactiveVehicleNumbers)inactiveVehicleNumbersSkipped.add(number);
+    for(const number of partition.unregisteredVehicleNumbers)unregisteredGpsNumbersIgnored.add(number);
+    for(const number of partition.eligibleRecords.map(row=>row.vehicleNumber))reportedActiveNumbers.add(number);
+    unidentifiedGpsRecordsIgnored+=partition.unidentifiedRecordCount;
+    const providerNotLinkedNumbers=new Set(partition.providerNotLinkedVehicleNumbers);
+    if(partition.inactiveVehicleNumbers.size||partition.unregisteredVehicleNumbers.size||
+     partition.providerNotLinkedVehicleNumbers.size||partition.duplicateRecordCount||
+     partition.unidentifiedRecordCount){
+     console.warn('[gps-sync] ignored provider GPS records',{
+      provider:p.name,
+      inactiveVehiclesSkipped:partition.inactiveVehicleNumbers.size,
+      unregisteredRecordsIgnored:partition.unregisteredVehicleNumbers.size,
+      providerNotLinkedRecords:partition.providerNotLinkedVehicleNumbers.size,
+      duplicateRecordsIgnored:partition.duplicateRecordCount,
+      unidentifiedRecordsIgnored:partition.unidentifiedRecordCount,
+      unregisteredVehicleNumbers:[...partition.unregisteredVehicleNumbers].slice(0,10)
+     });
     }
     const saved=await persistMatchedRecords({
-     records:[...newestByNumber.values()],vehiclesByNumber,providerName:p.name,
+     records:partition.eligibleRecords,vehiclesByNumber,providerName:p.name,
      isLinked:vehicle=>vehicleHasProvider(vehicle,p.name),
      persistRecord:async(row,vehicle)=>{
       if(lockLost)throw new Error('GPS sync stopped after losing the distributed lock');
@@ -640,6 +724,48 @@ async function runSync(type='manual',options={}){
      const previous=existing?await M.VehicleLiveStatus.findOne({
       _id:existing._id,provider:'Wheelseye'
      }).lean():null;
+     const current=await M.Vehicle.findById(vehicle._id)
+      .select('vehicleNumber status gpsLink gpsProviders').lean();
+     const currentNumber=normalizeNumber(current?.vehicleNumber);
+     if(!current){
+      providerActiveNumbers.delete(row.vehicleNumber);
+      activeRegistryNumbers.delete(row.vehicleNumber);
+      eligibleRegistryNumbers.delete(row.vehicleNumber);
+      unregisteredGpsNumbersIgnored.add(row.vehicleNumber);
+      reportedActiveNumbers.delete(row.vehicleNumber);
+      registeredVehicleCount=activeRegistryNumbers.size;
+      return false;
+     }
+     if(current.status!=='Active'){
+      providerActiveNumbers.delete(row.vehicleNumber);
+      activeRegistryNumbers.delete(row.vehicleNumber);
+      eligibleRegistryNumbers.delete(row.vehicleNumber);
+      inactiveVehicleNumbersSkipped.add(row.vehicleNumber);
+      reportedActiveNumbers.delete(row.vehicleNumber);
+      registeredVehicleCount=activeRegistryNumbers.size;
+      return false;
+     }
+     if(currentNumber!==row.vehicleNumber){
+      providerActiveNumbers.delete(row.vehicleNumber);
+      activeRegistryNumbers.delete(row.vehicleNumber);
+      eligibleRegistryNumbers.delete(row.vehicleNumber);
+      if(vehicleHasProvider(current,p.name)){
+       providerActiveNumbers.add(currentNumber);
+       eligibleRegistryNumbers.add(currentNumber);
+      }
+      activeRegistryNumbers.add(currentNumber);
+      unregisteredGpsNumbersIgnored.add(row.vehicleNumber);
+      reportedActiveNumbers.delete(row.vehicleNumber);
+      registeredVehicleCount=activeRegistryNumbers.size;
+      return false;
+     }
+     if(!vehicleHasProvider(current,p.name)){
+      providerActiveNumbers.delete(row.vehicleNumber);
+      eligibleRegistryNumbers.delete(row.vehicleNumber);
+      providerNotLinkedNumbers.add(row.vehicleNumber);
+      reportedActiveNumbers.delete(row.vehicleNumber);
+      return false;
+     }
      const previousGpsTime=previous?.gpsTime?new Date(previous.gpsTime):null;
      if(previousGpsTime&&previousGpsTime>row.gpsTime){
       errorDetails.push({message:'Newer stored GPS data was kept'});
@@ -659,7 +785,7 @@ async function runSync(type='manual',options={}){
      delete doc.providerFields;
      await M.VehicleLiveStatus.findOneAndUpdate(
       existing?{_id:existing._id}:{normalizedVehicleNumber:row.vehicleNumber},
-      {$set:doc},{upsert:!existing,new:true}
+      {$set:doc},{upsert:!existing,returnDocument:'after'}
      );
      await M.VehicleLocationHistory.updateOne(
       {vehicleNumber:row.vehicleNumber,gpsTime:row.gpsTime,provider:row.provider},
@@ -687,44 +813,59 @@ async function runSync(type='manual',options={}){
     if(saved.vehicleNumberMismatches){
      providerResult.rejected['vehicle number mismatch']=saved.vehicleNumberMismatches;
     }
+    for(const number of saved.skippedNumbers){
+     if(!reportedActiveNumbers.has(number))continue;
+     reportedActiveNumbers.delete(number);
+    }
     const syncedNumbers=saved.savedNumbers;
     const receivedRegistered=saved.receivedNumbers;
     const receivedAssignedNumbers=registeredNumbers.filter(number=>receivedRegistered.has(number));
+    receivedActiveCount=receivedAssignedNumbers.length;
+    syncedActiveCount=syncedNumbers.size;
+    unavailableActiveCount=Math.max(
+     0,[...providerActiveNumbers].filter(number=>!receivedRegistered.has(number)).length
+    );
+    inactiveSkippedCount=inactiveVehicleNumbersSkipped.size;
+    unregisteredIgnoredCount=unregisteredGpsNumbersIgnored.size;
+    for(const number of receivedAssignedNumbers)reportedActiveNumbers.add(number);
     const updatedNumbers=[...syncedNumbers];
     if(updatedNumbers.length){
      await M.VehicleLiveStatus.updateMany({vehicleNumber:{$in:updatedNumbers}},{$set:{stale:false}});
     }
     const completedAt=new Date();
-    const assignedNumbers=new Set(registeredNumbers);
-    const failedCount=registered.length-[...syncedNumbers].filter(number=>assignedNumbers.has(number)).length;
-    const providerHadData=registered.length===0
-     ?rows.length>0
-     :receivedAssignedNumbers.length>0&&syncedNumbers.size>0;
-    providerResult.ok=providerHadData;
-    providerResult.status=providerHadData?'ok':'failed';
-    if(!providerHadData){
-     const rejectionSummary=Object.entries(mapped.rejected).map(([reason,count])=>`${count} ${reason}`).join(', ');
-     providerResult.reason=rows.length===0
-      ?`0 valid records of ${mapped.received}${rejectionSummary?`: ${rejectionSummary}`:''}`
-      :registered.length>0&&receivedAssignedNumbers.length===0
-       ?`${rows.length} valid records; 0 matched registry`
-       :saved.saveErrors>0?'matched GPS records could not be saved':'no GPS records saved';
-    }
+    const failedCount=unavailableActiveCount;
+    providerResult.ok=true;
+    providerResult.status=saved.saveErrors?'partial':'ok';
+    providerResult.actualErrorCount=saved.saveErrors;
+    providerResult.reason=saved.saveErrors
+     ?`${saved.saveErrors} GPS record(s) could not be saved`:'';
+    providerResult.syncSummary={
+     activeRegisteredVehicles:providerActiveNumbers.size,
+     successfullySyncedVehicles:syncedNumbers.size,
+     activeVehiclesWithoutGpsData:unavailableActiveCount,
+     inactiveVehiclesSkipped:inactiveSkippedCount,
+     unregisteredGpsRecordsIgnored:unregisteredIgnoredCount,
+     providerNotLinkedRecordsIgnored:providerNotLinkedNumbers.size,
+     duplicateProviderRecordsIgnored:partition.duplicateRecordCount,
+     actualErrors:saved.saveErrors
+    };
     await M.GpsProviderStatus.findOneAndUpdate({provider:p.name},{$set:{
-     status:providerHadData?'Connected':'Error',lastAttemptTime:completedAt,
-     ...(providerHadData?{lastSuccessTime:completedAt}:{}),
-     lastErrorMessage:providerResult.reason,lastErrorCode:null,
-     lastErrorTime:providerHadData?null:completedAt,vehicleCount:registered.length,
+     status:'Connected',lastAttemptTime:completedAt,lastSuccessTime:completedAt,
+     lastErrorMessage:'',lastErrorCode:null,lastErrorTime:null,vehicleCount:providerActiveNumbers.size,
      vehiclesReceived:receivedAssignedNumbers.length,vehiclesNotResponding:failedCount,
+     syncErrors:saved.saveErrors,inactiveVehiclesSkipped:inactiveSkippedCount,
+     unregisteredRecordsIgnored:unregisteredIgnoredCount,
      apiResponseStatus:response.status||200
     }}, {upsert:true});
     await M.GpsSetting.updateOne({provider:p.name},{$set:{
-     lastSyncStatus:providerHadData?'Connected':'Error',
-     lastSyncError:providerResult.reason,lastSyncedAt:completedAt
+     lastSyncStatus:'Connected',lastSyncError:'',lastSyncedAt:completedAt
     }});
     result[p.name]={
-     status:providerHadData?'Connected':'Error',count:syncedNumbers.size,syncedCount:syncedNumbers.size,
+     status:'Connected',count:syncedNumbers.size,syncedCount:syncedNumbers.size,
      failedCount,vehiclesReceived:receivedAssignedNumbers.length,
+     inactiveVehiclesSkipped:inactiveSkippedCount,
+     unregisteredRecordsIgnored:unregisteredIgnoredCount,
+     actualErrorCount:saved.saveErrors,syncSummary:providerResult.syncSummary,
      message:providerResult.reason,errors:errorDetails.slice(0,30)
     };
    }catch(e){
@@ -735,11 +876,23 @@ async function runSync(type='manual',options={}){
     providerResult.status='failed';
     providerResult.reason=reason;
     providerResult.message=message;
+    providerResult.actualErrorCount=(providerResult.actualErrorCount||0)+1;
+    providerResult.syncSummary={
+     activeRegisteredVehicles:providerActiveNumbers.size,
+     successfullySyncedVehicles:syncedActiveCount,
+     activeVehiclesWithoutGpsData:unavailableActiveCount,
+     inactiveVehiclesSkipped:inactiveSkippedCount,
+     unregisteredGpsRecordsIgnored:unregisteredIgnoredCount,
+     actualErrors:providerResult.actualErrorCount
+    };
     try{
      await M.GpsProviderStatus.findOneAndUpdate({provider:p.name},{$set:{
       status:'Error',lastAttemptTime:new Date(),lastErrorMessage:message,
-      lastErrorCode:code,lastErrorTime:new Date(),vehicleCount:registered.length,
-      vehiclesNotResponding:registered.length
+      lastErrorCode:code,lastErrorTime:new Date(),vehicleCount:providerActiveNumbers.size,
+      vehiclesReceived:receivedActiveCount,vehiclesNotResponding:unavailableActiveCount,
+      syncErrors:providerResult.actualErrorCount,
+      inactiveVehiclesSkipped:inactiveSkippedCount,
+      unregisteredRecordsIgnored:unregisteredIgnoredCount
      }},{upsert:true});
      await M.GpsSetting.updateOne({provider:p.name},{$set:{
       lastSyncStatus:'Error',lastSyncError:message,lastSyncedAt:new Date()
@@ -750,14 +903,19 @@ async function runSync(type='manual',options={}){
      });
     }
     result[p.name]={
-     status:'Error',count:0,syncedCount:0,failedCount:registered.length,
+     status:'Error',count:syncedActiveCount,syncedCount:syncedActiveCount,
+     failedCount:unavailableActiveCount,vehiclesReceived:receivedActiveCount,
+     actualErrorCount:providerResult.actualErrorCount,
+     inactiveVehiclesSkipped:inactiveSkippedCount,
+     unregisteredRecordsIgnored:unregisteredIgnoredCount,
+     syncSummary:providerResult.syncSummary,
      message,code,errors:[...errorDetails,{provider:p.name,message,code}].slice(0,30)
     };
    }finally{
     finalProviderResults[p.name]=providerResult;
    }
   }
-  const failedVehicleNumbers=registeredNumbers.filter(number=>!synchronizedRegisteredNumbers.has(number));
+  const failedVehicleNumbers=[...eligibleRegistryNumbers].filter(number=>!synchronizedRegisteredNumbers.has(number));
   if(failedVehicleNumbers.length){
    await M.VehicleLiveStatus.updateMany(
    {provider:'Wheelseye',$or:[
@@ -768,7 +926,20 @@ async function runSync(type='manual',options={}){
   }
   const finishedAt=new Date();
   const totalVehiclesSynced=synchronizedRegisteredNumbers.size;
-  const failedVehicleCount=failedVehicleNumbers.length;
+  actualSyncErrorCount=Object.values(finalProviderResults).reduce((total,providerResult)=>
+   total+(Number(providerResult?.actualErrorCount)||0),0
+  );
+  const failedVehicleCount=actualSyncErrorCount;
+  const activeVehiclesWithoutGpsData=[...activeRegistryNumbers]
+   .filter(number=>!reportedActiveNumbers.has(number)).length;
+  const syncSummary={
+   activeRegisteredVehicles:activeRegistryNumbers.size,
+   successfullySyncedVehicles:totalVehiclesSynced,
+   activeVehiclesWithoutGpsData,
+   inactiveVehiclesSkipped:inactiveVehicleNumbersSkipped.size,
+   unregisteredGpsRecordsIgnored:unregisteredGpsNumbersIgnored.size+unidentifiedGpsRecordsIgnored,
+   actualErrors:actualSyncErrorCount
+  };
   const outcome=aggregateSyncOutcome(finalProviderResults.Wheelseye,{persistence:gpsPersistence});
   const success=outcome.success;
   cycleFailureMessage=outcome.error||outcome.warnings.join('; ');
@@ -777,11 +948,12 @@ async function runSync(type='manual',options={}){
   synchronizedVehicleCount=totalVehiclesSynced;
   failedVehicleCountForLog=failedVehicleCount;
   const summary={
-   ...result,totalVehiclesSynced,failedVehicleCount,geofenceError:null,
+   ...result,totalVehiclesSynced,failedVehicleCount,syncSummary,geofenceError:null,
    status:outcome.status,message:outcome.message,warnings:outcome.warnings
   };
   const errorDetails=Object.entries(result).flatMap(([provider,providerResult])=>
-   (providerResult.errors||[]).map(error=>({provider,...error}))
+   (Array.isArray(providerResult?.errors)?providerResult.errors:[])
+    .map(error=>({provider,...error}))
   );
   const syncLog=await M.SyncLog.create({
    type:normalizedType,startedAt,finishedAt,result:summary,success,
@@ -858,7 +1030,7 @@ async function runSync(type='manual',options={}){
     result:{error:cycleFailureMessage,message:cycleFailureMessage,warnings:[]},success:false,
     totalRegisteredVehicles:registeredVehicleCount,
     successfulVehicles:synchronizedVehicleCount,
-    failedVehicles:Math.max(failedVehicleCountForLog,registeredVehicleCount-synchronizedVehicleCount),
+    failedVehicles:Math.max(1,failedVehicleCountForLog),
     status:'Failed',
     errorDetails:[{message:cycleFailureMessage}]
    });
@@ -1021,12 +1193,18 @@ app.get('/api/auth/me',auth,async(req,res)=>{
 
 app.get('/api/dashboard',auth,permission('Dashboard','view'),async(req,res)=>{
  const [snapshot,syncStatus]=await Promise.all([
-  fleetSnapshotService.getOperationalSnapshot(M),getGpsSyncStatus()
+  fleetSnapshotService.getOperationalSnapshot(M),
+  getGpsSyncStatus().catch(error=>{
+   console.error('[dashboard] GPS sync status unavailable',{
+    message:error.message,stack:error.stack
+   });
+   return null;
+  })
  ]);
  res.json({
   plants:snapshot.plants,transit:snapshot.transit,
-  lastSync:syncStatus.lastSyncAt,
-  nextSyncAt:syncStatus.nextAutoSyncAt,syncStatus,
+  lastSync:syncStatus?.lastSyncAt||null,
+  nextSyncAt:syncStatus?.nextAutoSyncAt||null,syncStatus,
   providers:snapshot.providers
  });
 });
@@ -1043,15 +1221,22 @@ app.post('/api/sync',auth,syncPermission,async(req,res)=>{
   const result=await runSync('MANUAL');
   return res.status(result.started?200:409).json(result);
  }catch(error){
-  console.error('[gps-sync] manual request failed',{message:error.message,stack:error.stack});
-  return res.status(500).json({error:error.message||String(error)});
+  const referenceCode=`GPS-${crypto.randomInt(1000,10000)}`;
+  console.error('[gps-sync] manual request failed',{
+   referenceCode,message:error.message||String(error),stack:error.stack||'No stack available'
+  });
+  return res.status(500).json({
+   error:'GPS synchronization could not be completed. Please try again.',
+   referenceCode
+  });
  }
 });
 app.get('/api/sync/status',auth,permission('Dashboard','view'),async(_req,res)=>{
  const now=new Date();
- const [status,config]=await Promise.all([
+ const [status,config,lastCycle]=await Promise.all([
   M.SyncStatus.findOne({key:SYNC_STATUS_KEY}).lean(),
-  M.GpsSyncConfiguration.findOne({key:GPS_SYNC_CONFIG_KEY}).lean()
+  M.GpsSyncConfiguration.findOne({key:GPS_SYNC_CONFIG_KEY}).lean(),
+  M.SyncLog.findOne({finishedAt:{$exists:true}}).sort({finishedAt:-1}).lean()
  ]);
  const syncStartedAt=new Date(status?.syncStartedAt||0).getTime();
  const isSyncing=Boolean(status?.isSyncing&&syncStartedAt<=now.getTime()&&
@@ -1062,6 +1247,7 @@ app.get('/api/sync/status',auth,permission('Dashboard','view'),async(_req,res)=>
  res.json({
   lastSyncAt:status?.lastSyncAt||null,lastSyncType:status?.lastSyncType||null,
   lastSyncStatus,lastError:status?.lastError||'',
+  lastSyncSummary:lastCycle?.result?.syncSummary||null,
   lastAutoSyncAt:status?.lastAutoSyncAt||null,
   nextSyncAt:schedulerActive?getNextGpsExecutionAt(now,config||{},null):null,
   isSyncing,syncStartedAt:status?.syncStartedAt||null,
@@ -1134,7 +1320,7 @@ app.put('/api/vehicles/:id',auth,permission('Vehicle Registry','edit'),async(req
   if(duplicate)return res.status(409).json({error:'Duplicate vehicle number'});
  }
  try{
-  const v=await M.Vehicle.findByIdAndUpdate(req.params.id,d,{new:true,runValidators:true});
+  const v=await M.Vehicle.findByIdAndUpdate(req.params.id,d,{returnDocument:'after',runValidators:true});
   if(!v)return res.status(404).json({error:'Vehicle not found'});
   await audit('edit_vehicle',req.user.sub,{vehicleNumber:v.vehicleNumber},req);
   res.json(v);
@@ -1205,7 +1391,7 @@ app.put('/api/plants/:id',auth,permission('Plant','edit'),validatePlant(),async(
  if(await M.Plant.exists({plantId,_id:{$ne:req.params.id}}))return res.status(409).json({error:'Plant ID already exists'});
  const data={plantId,name:req.body.name.trim(),address:req.body.address.trim(),lng:Number(req.body.lng),lat:Number(req.body.lat),radius:Number(req.body.radius)};
  try{
-  const plant=await M.Plant.findByIdAndUpdate(req.params.id,{$set:data},{new:true,runValidators:true});
+  const plant=await M.Plant.findByIdAndUpdate(req.params.id,{$set:data},{returnDocument:'after',runValidators:true});
   if(!plant)return res.status(404).json({error:'Plant not found'});
   await audit('edit_plant',req.user.sub,{plantId:plant.plantId,name:plant.name},req);
   res.json(plant);
@@ -1263,10 +1449,17 @@ app.get('/api/tracking/vehicles/:vehicleId',auth,permission('GPS Track','view'),
    lng:hasCoordinates?Number(record.lng):null,
    location:displayLocation(record),
    addressIsCurrent:Boolean(record.addressIsCurrent),
-   street:record.street||'',galiNumber:record.galiNumber||'',road:record.road||'',
-   nearby:record.nearby||'',city:record.city||'',
+   street:record.street||'',plotNumber:record.plotNumber||record.houseNumber||'',
+   houseNumber:record.houseNumber||record.plotNumber||'',galiNumber:record.galiNumber||'',
+   road:record.road||'',building:record.building||'',sector:record.sector||'',
+   nearby:record.nearby||'',nearestLocation:record.nearestLocation||'',
+   nearestLocationCategory:record.nearestLocationCategory||'',
+   nearestLocationDistanceMeters:record.nearestLocationDistanceMeters??null,
+   nearbyProvider:record.nearbyProvider||'',geocodingProvider:record.geocodingProvider||null,
+   city:record.city||'',
    cityOrVillage:record.cityOrVillage||record.city||'',district:record.district||'',
-   state:record.state||'',pincode:record.pincode||'',
+   division:record.division||'',state:record.state||'',pincode:record.pincode||'',
+   country:record.country||'',
    addressDistanceKm:record.addressDistanceKm??null,
    addressEnrichmentPending:Boolean(record.addressEnrichmentPending),
    speed:record.speed??null,ignition:record.ignition??null,
@@ -1381,7 +1574,7 @@ app.put('/api/plans/:id',auth,permission('Dashboard','edit'),[
  if(!Object.keys(updates).length)return res.status(400).json({error:'No plan changes provided'});
  updates.updatedByUserId=req.user.sub;
  updates.updatedByName=req.user.fullName;
- const plan=await M.VehiclePlan.findByIdAndUpdate(req.params.id,{$set:updates},{new:true,runValidators:true});
+ const plan=await M.VehiclePlan.findByIdAndUpdate(req.params.id,{$set:updates},{returnDocument:'after',runValidators:true});
  if(!plan)return res.status(404).json({error:'Plan not found'});
  await audit('edit_plan',req.user.sub,{vehicle:plan.vehicle,plant:plan.plant},req);
  res.json(plan);
@@ -1480,7 +1673,7 @@ app.put('/api/gps/settings/:provider',auth,permission('GPS Track','edit'),async(
  if(!baseUrl)return res.status(400).json({error:'Enter a valid HTTPS URL for this GPS provider without credentials or secret query parameters'});
  const setting=await M.GpsSetting.findOneAndUpdate({provider},{$set:{
   enabled:req.body.enabled,baseUrl,credentialsReference:GPS_PROVIDER_DEFAULTS[provider].credentialsReference
- }},{upsert:true,new:true,runValidators:true});
+ }},{upsert:true,returnDocument:'after',runValidators:true});
  await audit('edit_gps_provider_settings',req.user.sub,{provider,enabled:setting.enabled},req);
  res.json({
   provider:setting.provider,enabled:setting.enabled,baseUrl:setting.baseUrl,
@@ -1777,7 +1970,7 @@ async function executeExternalGpsSync(){
  let config=await M.GpsSyncConfiguration.findOneAndUpdate(
   {key:GPS_SYNC_CONFIG_KEY},
   {$setOnInsert:{enabled:true,intervalMinutes:30,schedulerStatus:'starting'}},
-  {upsert:true,new:true}
+  {upsert:true,returnDocument:'after'}
  ).lean();
  if(config.enabled===false){
   await M.GpsSyncConfiguration.updateOne({key:GPS_SYNC_CONFIG_KEY},{$set:{
@@ -1907,7 +2100,7 @@ async function startGpsSyncScheduler(){
  const config=await M.GpsSyncConfiguration.findOneAndUpdate(
   {key:GPS_SYNC_CONFIG_KEY},
   {$setOnInsert:{enabled:true,intervalMinutes:30,schedulerStatus:'starting'}},
-  {upsert:true,new:true}
+  {upsert:true,returnDocument:'after'}
  ).lean();
  if(config.enabled===false){
   syncScheduler={timer:null,nextAt:null,enabled:false,heartbeat:null};

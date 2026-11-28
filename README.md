@@ -21,29 +21,28 @@ The backend environment is already configured in `backend/.env`. Keep this file 
 
 ## Maps and readable locations
 
-The backend looks up the nearest imported GeoNames India postal-area point
-using MongoDB's 2dsphere index. The address and distance are cached in MongoDB
-for 30 days; an unsuccessful lookup is retried after five minutes. Sync queues
-address resolution without waiting, and location popups resolve missing
-addresses in a batch. If no place is available, the UI shows six-decimal
-coordinates and a Google Maps link.
+Reverse geocoding runs only on the backend. Configure `GOOGLE_GEOCODING_API_KEY`
+to use Google as the primary address source. If that lookup fails or is not
+configured, the service uses OpenStreetMap Nominatim, followed by the imported
+GeoNames India postal-area database. If none can resolve an address, current
+GPS coordinates remain the explicit fallback.
 
-To optionally enrich a GeoNames result with street or landmark details, set
-`GEOCODER_PROVIDER` to `locationiq` or `geoapify` and set `GEOCODER_API_KEY`.
-For a self-hosted Nominatim instance, set `GEOCODER_PROVIDER=nominatim`,
-`NOMINATIM_REVERSE_URL` to that instance's HTTPS `/reverse` endpoint, and
-optionally set `GEOCODER_USER_AGENT`. The backend rejects the public
-`nominatim.openstreetmap.org` host; it has no public Nominatim default. Vercel
-cannot host Nominatim itself, so the self-hosted service must run separately
-and be reachable from the Vercel backend. Do not use the public Nominatim
-service for this vehicle-tracking workload.
+OpenStreetMap Overpass is queried independently for nearby mapped features
+within 100 metres. The closest named or addressable feature and its measured
+distance are stored with the address. Results are cached in MongoDB at five
+decimal places; concurrent requests for the same coordinates share one lookup.
+The Overpass client uses bounded retries, a timeout, public endpoint failover,
+and a shared request interval. GPS synchronization queues address resolution
+without waiting for external geocoding.
 
-Only the selected provider is called, by the backend. Requests have a
-five-second timeout, two retries with backoff, a shared one-request-per-second
-MongoDB limit, a conservative daily quota, and a five-minute failure retry
-window. The GeoNames address remains available if enrichment is disabled or
-fails. Optional endpoint overrides are `LOCATIONIQ_REVERSE_URL` and
-`GEOAPIFY_REVERSE_URL`.
+Set `GEOCODER_USER_AGENT` to identify the application when using OpenStreetMap.
+`NOMINATIM_REVERSE_URL` may point to a compatible service endpoint. Optional
+`OVERPASS_API_URL` and `OVERPASS_FALLBACK_URL` values take precedence over the
+built-in public Overpass endpoint list. Public OSM services are best-effort;
+cached results and offline GeoNames data remain available during outages.
+
+The backend never sends Google credentials to the browser. Configure
+`GOOGLE_GEOCODING_API_KEY` in `backend/.env` and in the deployment environment.
 
 ### Import the GeoNames India postal file once
 
@@ -101,13 +100,10 @@ Use the root `npm run build` command and set the Output Directory to
 variables in Vercel for every required environment: `MONGO_URI` (or
 `MONGODB_URI`), `MONGODB_DB_NAME`, `JWT_SECRET`, `ADMIN_USERNAME`,
 `ADMIN_PASSWORD`, `WHEELSEYE_API_TOKEN` (plus `WHEELSEYE_API_URL` if needed),
-`CRON_SECRET`, and `GEOCODER_PROVIDER`. `GEOCODER_API_KEY` is required for
-LocationIQ or Geoapify. Self-hosted Nominatim additionally uses
-`NOMINATIM_REVERSE_URL` and optionally `GEOCODER_USER_AGENT`.
-`LOCATIONIQ_REVERSE_URL` and
-`GEOAPIFY_REVERSE_URL` are optional overrides; their defaults are listed in
-`backend/.env.example`. The offline GeoNames address lookup requires no
-geocoder key.
+`CRON_SECRET`, and `GOOGLE_GEOCODING_API_KEY` for primary Google reverse
+geocoding. The backend can use Nominatim and Overpass without a key; set
+`GEOCODER_USER_AGENT` and optionally configure the endpoint overrides described
+above. The offline GeoNames address lookup requires no geocoder key.
 The frontend uses same-origin `/api` by default; only set the build-time
 `VITE_API_BASE_URL` when deploying the API on a different origin. Set
 `ALLOWED_ORIGINS` to a comma-separated list of exact trusted origins if the API
@@ -158,8 +154,16 @@ Express serves the built frontend on port 5000 in production.
 
 ## GPS synchronization
 
-Manual Sync and the protected cron endpoint synchronize WheelsEye. A failed or
-empty response does not replace the last good GPS data.
+Manual Sync and the protected cron endpoint synchronize active Vehicle Registry
+entries linked to WheelsEye. Vehicle numbers are normalized before matching;
+inactive, deleted, duplicate, and unregistered provider rows are not persisted.
+Ignored inactive and unregistered rows are logged separately and do not count
+as synchronization errors. Sync results report active registrations, successful
+updates, vehicles without GPS data, ignored records, and actual errors. A failed
+or empty response does not replace the last good GPS data.
+
+FleetX synchronization is not currently implemented or configured in this
+backend; only the WheelsEye provider is supported.
 
 Plant plans are automatically removed one hour after the vehicle's GPS-recorded
 exit from that plant. Plans created after the recorded exit are not affected.

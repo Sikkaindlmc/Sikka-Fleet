@@ -130,9 +130,10 @@ function mapRecord(record,provider,startedAt){
 
 function mapProviderPayload(payload,provider,{now=new Date()}={}){
  if(provider!=='Wheelseye')throw new Error('Unsupported GPS provider');
- const sourceRows=findRows(payload)||[];
- const result={records:[],received:sourceRows.length,rejected:{}};
- for(const source of sourceRows){
+ const sourceRows=findRows(payload);
+ const rows=sourceRows||[];
+ const result={records:[],received:rows.length,rejected:{},validResponse:Array.isArray(sourceRows)};
+ for(const source of rows){
   const mapped=mapRecord(source,provider,now);
   if(mapped.reason){
    result.rejected[mapped.reason]=(result.rejected[mapped.reason]||0)+1;
