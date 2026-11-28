@@ -123,17 +123,12 @@ const addressFields=location=>location?{
  geocodedAt:null,addressDistanceKm:null,geocodingProvider:null,addressLat:null,addressLng:null,
  addressIsCurrent:false
 };
-function queueVehicleAddressLookup(row,previous){
- if(!row.providerAddress&&previous&&
-  reverseGeocoding.previousLocation(previous,row.lat,row.lng))return;
- reverseGeocoding.enqueue(row.lat,row.lng,{
-  providerAddress:row.providerAddress,providerFields:row.providerFields,previous
- }).then(async location=>{
-  if(!location)return;
-  const resolved={
+function queueVehicleAddressLookup(row){
+ reverseGeocoding.enqueue(row.lat,row.lng).then(async location=>{
+  const resolved=location?{
    ...location,addressLat:location.addressLat??row.lat,addressLng:location.addressLng??row.lng,
    addressIsCurrent:location.addressIsCurrent!==false
-  };
+  }:null;
   const fields=addressFields(resolved);
   await Promise.all([
    M.VehicleLiveStatus.updateOne({
@@ -154,19 +149,16 @@ async function resolveStoredVehicleAddress(record){
    return record;
   }
   if(!location){
-   if(readableAddress(record)&&!reverseGeocoding.previousLocation(record,record.lat,record.lng)){
-    const fields=addressFields(null);
-    await Promise.all([
-     M.VehicleLiveStatus.updateOne({
-      vehicleNumber:record.vehicleNumber,provider:'Wheelseye',lat:record.lat,lng:record.lng,gpsTime:record.gpsTime
-     },{$set:fields}),
-     M.VehicleLocationHistory.updateOne({
-      vehicleNumber:record.vehicleNumber,provider:'Wheelseye',gpsTime:record.gpsTime
-     },{$set:fields})
-    ]);
-    return {...record,...fields,addressEnrichmentPending:false};
-   }
-   return record;
+   const fields=addressFields(null);
+   await Promise.all([
+    M.VehicleLiveStatus.updateOne({
+     vehicleNumber:record.vehicleNumber,provider:'Wheelseye',lat:record.lat,lng:record.lng,gpsTime:record.gpsTime
+    },{$set:fields}),
+    M.VehicleLocationHistory.updateOne({
+     vehicleNumber:record.vehicleNumber,provider:'Wheelseye',gpsTime:record.gpsTime
+    },{$set:fields})
+   ]);
+   return {...record,...fields,addressEnrichmentPending:false};
   }
   const fields=addressFields({
    ...location,addressLat:location.addressLat??record.lat,addressLng:location.addressLng??record.lng,
@@ -604,27 +596,7 @@ async function runSync(type='manual',options={}){
       throw new Error('Newer stored GPS data was kept');
      }
      const syncedAt=new Date();
-     const previousAddress=previous?{
-      readableLocation:previous.readableLocation||previous.address,
-      street:previous.street,galiNumber:previous.galiNumber,road:previous.road,nearby:previous.nearby,
-      locality:previous.locality,city:previous.city,cityOrVillage:previous.cityOrVillage,
-      district:previous.district,state:previous.state,
-      pincode:previous.pincode,country:previous.country,geocodedAt:previous.geocodedAt,
-      addressDistanceKm:previous.addressDistanceKm,
-      geocodingProvider:previous.geocodingProvider,addressLat:previous.addressLat,
-      addressLng:previous.addressLng,addressIsCurrent:previous.addressIsCurrent
-     }:null;
-     const providerAddress=typeof row.providerAddress==='string'&&row.providerAddress.trim()
-      ?row.providerAddress:null;
-     const location=providerAddress?{
-      readableLocation:providerAddress,...row.providerFields,provider:'Provider',
-      addressLat:row.lat,addressLng:row.lng,addressIsCurrent:true
-     }:reverseGeocoding.previousLocation(previousAddress,row.lat,row.lng);
-     const resolvedLocation=location?{
-      ...location,addressLat:location.addressLat??row.lat,addressLng:location.addressLng??row.lng,
-      addressIsCurrent:location.addressIsCurrent!==false
-     }:null;
-     const doc={...row,...addressFields(resolvedLocation),
+     const doc={...row,...addressFields(null),
       normalizedVehicleNumber:row.vehicleNumber,unregistered:false,stale:false,
       lastGoodTime:row.gpsTime,syncedAt};
      delete doc.providerAddress;
@@ -642,7 +614,7 @@ async function runSync(type='manual',options={}){
        gpsTime:row.gpsTime,provider:row.provider,syncedAt}},
       {upsert:true}
      );
-     queueVehicleAddressLookup(row,previousAddress);
+     queueVehicleAddressLookup(row);
      synchronizedRegisteredNumbers.add(row.vehicleNumber);
      synchronizedVehicleCount=synchronizedRegisteredNumbers.size;
      }
