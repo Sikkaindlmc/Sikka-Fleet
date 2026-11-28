@@ -3,8 +3,13 @@ const assert=require('node:assert/strict');
 const {
  GPS_SYNC_INTERVAL_MS,GPS_SYNC_RETRY_MS,GPS_SYNC_HEARTBEAT_MS,
  GPS_SYNC_EXTERNAL_HEARTBEAT_MAX_AGE_MS,isGpsSchedulerHealthy,isGpsSchedulerSecretValid,
- getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt
+ getNextScheduledSyncAt,getNextAutoSyncAt,getNextGpsExecutionAt,getGpsRetryAt
 }=require('../services/gpsSyncSchedule');
+
+test('a failed GPS sync is retryable exactly five minutes later',()=>{
+ const now=new Date('2026-11-25T05:30:00.000Z');
+ assert.equal(getGpsRetryAt(now).getTime()-now.getTime(),GPS_SYNC_RETRY_MS);
+});
 
 test('scheduler health requires a recent persisted heartbeat and running status',()=>{
  const now=new Date('2026-11-25T05:30:00.000Z');
@@ -23,6 +28,9 @@ test('scheduler health requires a recent persisted heartbeat and running status'
  assert.equal(isGpsSchedulerHealthy(now,{...recentConfig,enabled:false}),false);
  assert.equal(isGpsSchedulerHealthy(now,{
   ...recentConfig,schedulerHeartbeatAt:new Date(now.getTime()+1000)
+ }),true);
+ assert.equal(isGpsSchedulerHealthy(now,{
+  ...recentConfig,schedulerHeartbeatAt:new Date(now.getTime()+60001)
  }),false);
 });
 

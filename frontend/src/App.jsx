@@ -379,12 +379,13 @@ function Dashboard(){
    const details=Object.values(result.result||{}).flatMap(providerResult=>providerResult.errors||[])
     .slice(0,2).map(error=>error.vehicleNumber?`${error.vehicleNumber}: ${error.message}`:error.message).join('; ');
    showToast(result.success
-    ?`GPS sync successful: ${result.totalVehiclesSynced||0} vehicle(s) synchronized.`
-    :`GPS sync failed.${details?` ${details}`:''}` ,result.success?'success':'error');
+    ?`GPS sync successful: ${result.totalVehiclesSynced||0} vehicle(s) synchronized.${result.warnings?.length?` ${result.warnings.join('; ')}`:''}`
+    :result.message||result.error||result.result?.message||details||'GPS synchronization did not complete',
+    result.success?'success':'error');
   }catch(error){
    const message=error.response?.status===409
     ?error.response?.data?.reason||'A GPS synchronization is already running. Please wait for it to finish.'
-    :error.response?.data?.reason||error.response?.data?.error||'Sync failed';
+    :error.response?.data?.reason||error.response?.data?.error||error.message||'GPS synchronization did not complete';
    showToast(message,'error');
   }
   finally{
@@ -437,7 +438,7 @@ function Dashboard(){
    <div className="dashboard-title"><p className="eyebrow">Fleet operations</p><h1>Dashboard</h1></div>
    <div className="dashboard-sync-grid">
     <article className="dashboard-info-card dashboard-next-sync">
-     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{syncStatus?.schedulerStatus==='Active'?`${syncStatus.nextSyncAt?`${fmtIst(syncStatus.nextSyncAt)} IST · `:''}Scheduler active - every 30 min`:'Inactive'}</p></div>
+     <div><h2>Next sync</h2><strong role="timer">{countdown}</strong><p>{syncStatus?.schedulerStatus==='Active'?`${syncStatus.nextSyncAt?`${fmtIst(syncStatus.nextSyncAt)} IST · `:''}Scheduler active - every 30 min`:'Inactive'}</p>{syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
      <Timer aria-hidden="true"/>
     </article>
     <article className="dashboard-info-card dashboard-sync-state">
@@ -448,7 +449,7 @@ function Dashboard(){
      {!isSyncing&&<RefreshCw size={22} aria-hidden="true"/>}<span>{isSyncing?'Syncing...':'GPS Sync'}</span>
     </AnimatedButton>}
     <article className="dashboard-info-card dashboard-last-sync">
-     <div><h2>Last Sync</h2><p>{fmtIst(syncStatus?.lastSyncAt)}</p><p>{syncStatus?.lastSyncType?`${syncStatus.lastSyncType} - ${syncStatus.lastSyncStatus||'Unknown'}`:'No sync recorded'}</p></div>
+     <div><h2>Last Sync</h2><p>{fmtIst(syncStatus?.lastSyncAt)}</p><p>{syncStatus?.lastSyncType?`${syncStatus.lastSyncType} - ${syncStatus.lastSyncStatus||'Unknown'}`:'No sync recorded'}</p>{syncStatus?.lastError&&<small role="alert">{syncStatus.lastError}</small>}</div>
      <History aria-hidden="true"/>
     </article>
    </div>
@@ -941,14 +942,14 @@ function Gps(){
    const response=await axios.post('/sync');
    const result=response.data;
    if(result.success){
-    showToast(`GPS sync successful: ${result.totalVehiclesSynced||0} vehicle(s) synchronized.`);
+    showToast(`GPS sync successful: ${result.totalVehiclesSynced||0} vehicle(s) synchronized.${result.warnings?.length?` ${result.warnings.join('; ')}`:''}`);
    }else{
     const details=Object.values(result.result||{}).flatMap(providerResult=>providerResult.errors||[])
      .slice(0,2).map(error=>error.vehicleNumber?`${error.vehicleNumber}: ${error.message}`:error.message).join('; ');
-    showToast(`GPS sync failed.${details?` ${details}`:''}`,'error');
+    showToast(result.message||result.error||result.result?.message||details||'GPS synchronization did not complete','error');
    }
   }catch(error){
-   showToast(error.response?.data?.reason||error.response?.data?.error||'Manual GPS sync failed.','error');
+   showToast(error.response?.data?.reason||error.response?.data?.error||error.message||'GPS synchronization did not complete','error');
   }finally{
    await load();
    window.dispatchEvent(new CustomEvent('gps-sync-complete'));

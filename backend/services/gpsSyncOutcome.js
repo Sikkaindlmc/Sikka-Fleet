@@ -137,11 +137,14 @@ function aggregateSyncOutcome(providerResult, { geofenceError = null, persistenc
   let error = null;
 
   if (!providerResult || !providerResult.ok) {
-    error =
-      errorMessage(
-        (providerResult && (providerResult.error || providerResult.message)) ||
-          'WheelsEye GPS request failed'
-      );
+    const saveFailure = persistence && persistence.errors && persistence.errors[0];
+    error = saveFailure
+      ? `Could not save GPS data${saveFailure.vehicleNumber ? ` for ${saveFailure.vehicleNumber}` : ''}: ${errorMessage(saveFailure.message)}`
+      : errorMessage(
+          (providerResult &&
+            (providerResult.error || providerResult.message || providerResult.reason)) ||
+            'WheelsEye GPS request failed'
+        );
   } else if (persistence) {
     const total = persistence.totalRecords || 0;
     const received = persistence.receivedNumbers ? persistence.receivedNumbers.size : 0;
